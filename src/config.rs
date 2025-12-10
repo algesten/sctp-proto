@@ -12,6 +12,14 @@ pub(crate) const COMMON_HEADER_SIZE: u32 = 12;
 pub(crate) const DATA_CHUNK_HEADER_SIZE: u32 = 16;
 pub(crate) const DEFAULT_MAX_MESSAGE_SIZE: u32 = 65536;
 
+// Default RTO values in milliseconds (RFC 4960)
+pub(crate) const RTO_INITIAL: u64 = 3000;
+pub(crate) const RTO_MIN: u64 = 1000;
+pub(crate) const RTO_MAX: u64 = 60000;
+
+// Default max retransmit value (RFC 4960 Section 15)
+const DEFAULT_MAX_INIT_RETRANS: usize = 8;
+
 /// Config collects the arguments to create_association construction into
 /// a single structure
 #[derive(Debug)]
@@ -20,6 +28,28 @@ pub struct TransportConfig {
     max_message_size: u32,
     max_num_outbound_streams: u16,
     max_num_inbound_streams: u16,
+
+    /// Maximum number of retransmissions for INIT chunks during handshake.
+    /// Set to `None` for unlimited retries (recommended for WebRTC).
+    /// Default: Some(8)
+    max_init_retransmits: Option<usize>,
+
+    /// Maximum number of retransmissions for DATA chunks.
+    /// Set to `None` for unlimited retries (recommended for WebRTC).
+    /// Default: None (unlimited)
+    max_data_retransmits: Option<usize>,
+
+    /// Initial retransmission timeout in milliseconds.
+    /// Default: 3000
+    rto_initial_ms: u64,
+
+    /// Minimum retransmission timeout in milliseconds.
+    /// Default: 1000
+    rto_min_ms: u64,
+
+    /// Maximum retransmission timeout in milliseconds.
+    /// Default: 60000
+    rto_max_ms: u64,
 }
 
 impl Default for TransportConfig {
@@ -29,6 +59,11 @@ impl Default for TransportConfig {
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             max_num_outbound_streams: u16::MAX,
             max_num_inbound_streams: u16::MAX,
+            max_init_retransmits: Some(DEFAULT_MAX_INIT_RETRANS),
+            max_data_retransmits: None,
+            rto_initial_ms: RTO_INITIAL,
+            rto_min_ms: RTO_MIN,
+            rto_max_ms: RTO_MAX,
         }
     }
 }
@@ -68,6 +103,56 @@ impl TransportConfig {
 
     pub(crate) fn max_num_inbound_streams(&self) -> u16 {
         self.max_num_inbound_streams
+    }
+
+    /// Set maximum INIT retransmissions. `None` means unlimited.
+    pub fn with_max_init_retransmits(mut self, value: Option<usize>) -> Self {
+        self.max_init_retransmits = value;
+        self
+    }
+
+    /// Set maximum DATA retransmissions. `None` means unlimited.
+    pub fn with_max_data_retransmits(mut self, value: Option<usize>) -> Self {
+        self.max_data_retransmits = value;
+        self
+    }
+
+    /// Set initial RTO in milliseconds.
+    pub fn with_rto_initial_ms(mut self, value: u64) -> Self {
+        self.rto_initial_ms = value;
+        self
+    }
+
+    /// Set minimum RTO in milliseconds.
+    pub fn with_rto_min_ms(mut self, value: u64) -> Self {
+        self.rto_min_ms = value;
+        self
+    }
+
+    /// Set maximum RTO in milliseconds.
+    pub fn with_rto_max_ms(mut self, value: u64) -> Self {
+        self.rto_max_ms = value;
+        self
+    }
+
+    pub(crate) fn max_init_retransmits(&self) -> Option<usize> {
+        self.max_init_retransmits
+    }
+
+    pub(crate) fn max_data_retransmits(&self) -> Option<usize> {
+        self.max_data_retransmits
+    }
+
+    pub(crate) fn rto_initial_ms(&self) -> u64 {
+        self.rto_initial_ms
+    }
+
+    pub(crate) fn rto_min_ms(&self) -> u64 {
+        self.rto_min_ms
+    }
+
+    pub(crate) fn rto_max_ms(&self) -> u64 {
+        self.rto_max_ms
     }
 }
 

@@ -328,8 +328,16 @@ impl Association {
             my_max_num_inbound_streams: config.max_num_inbound_streams(),
             max_payload_size,
 
-            rto_mgr: RtoManager::new(),
-            timers: TimerTable::new(),
+            rto_mgr: RtoManager::new(
+                config.rto_initial_ms(),
+                config.rto_min_ms(),
+                config.rto_max_ms(),
+            ),
+            timers: TimerTable::new(
+                config.max_init_retransmits(),
+                config.max_data_retransmits(),
+                config.rto_max_ms(),
+            ),
 
             mtu,
             cwnd,

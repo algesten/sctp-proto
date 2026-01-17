@@ -17,7 +17,10 @@ pub type StreamId = u16;
 #[derive(Debug, PartialEq, Eq)]
 pub enum StreamEvent {
     /// One or more new streams has been opened
-    Opened,
+    Opened {
+        /// Which stream was opened
+        id: StreamId,
+    },
     /// A currently open stream has data or errors waiting to be read
     Readable {
         /// Which stream is now readable
@@ -47,6 +50,11 @@ pub enum StreamEvent {
     /// The number of bytes of outgoing data buffered is lower than the threshold.
     BufferedAmountLow {
         /// Which stream is now readable
+        id: StreamId,
+    },
+    /// The number of bytes of outgoing data buffered is higher than the threshold.
+    BufferedAmountHigh {
+        /// Which stream has crossed the high threshold
         id: StreamId,
     },
 }
@@ -180,8 +188,19 @@ impl<'a> Stream<'a> {
         let (p, _) = source.pop_chunk(self.association.max_message_size() as usize);
 
         if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
-            let chunks = s.packetize(&p, ppi);
+            let (is_buffered_amount_high, chunks) = s.packetize(&p, ppi);
             self.association.send_payload_data(chunks)?;
+
+            if is_buffered_amount_high {
+                trace!("StreamEvent::BufferedAmountHigh");
+                self.association
+                    .events
+                    .push_back(crate::association::Event::Stream(
+                        StreamEvent::BufferedAmountHigh {
+                            id: self.stream_identifier,
+                        },
+                    ));
+            }
 
             Ok(p.len())
         } else {
@@ -233,6 +252,15 @@ impl<'a> Stream<'a> {
             s.state = ((s.state as u8) & 0x1).into();
         }
         Ok(())
+    }
+
+    /// close shuts down both the read and write halves of this stream.
+    ///
+    /// This is a convenience method that calls `finish()` followed by `stop()`.
+    /// Resets the stream when both halves are shutdown.
+    pub fn close(&mut self) -> Result<()> {
+        self.finish()?;
+        self.stop()
     }
 
     /// stream_identifier returns the Stream identifier associated to the stream.
@@ -312,6 +340,27 @@ impl<'a> Stream<'a> {
             Err(Error::ErrStreamClosed)
         }
     }
+
+    /// buffered_amount_high_threshold returns the number of bytes of buffered outgoing data that is
+    /// considered "high." Defaults to usize::MAX (effectively disabled).
+    pub fn buffered_amount_high_threshold(&self) -> Result<usize> {
+        if let Some(s) = self.association.streams.get(&self.stream_identifier) {
+            Ok(s.buffered_amount_high)
+        } else {
+            Err(Error::ErrStreamClosed)
+        }
+    }
+
+    /// set_buffered_amount_high_threshold is used to update the threshold.
+    /// See buffered_amount_high_threshold().
+    pub fn set_buffered_amount_high_threshold(&mut self, th: usize) -> Result<()> {
+        if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
+            s.buffered_amount_high = th;
+            Ok(())
+        } else {
+            Err(Error::ErrStreamClosed)
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
@@ -349,6 +398,7 @@ pub struct StreamState {
     pub(crate) reliability_value: u32,
     pub(crate) buffered_amount: usize,
     pub(crate) buffered_amount_low: usize,
+    pub(crate) buffered_amount_high: usize,
 }
 impl StreamState {
     pub(crate) fn new(
@@ -370,11 +420,12 @@ impl StreamState {
             reliability_value: 0,
             buffered_amount: 0,
             buffered_amount_low: 0,
+            buffered_amount_high: usize::MAX,
         }
     }
 
-    pub(crate) fn handle_data(&mut self, pd: &ChunkPayloadData) {
-        self.reassembly_queue.push(pd.clone());
+    pub(crate) fn handle_data(&mut self, pd: &ChunkPayloadData) -> bool {
+        self.reassembly_queue.push(pd.clone())
     }
 
     pub(crate) fn handle_forward_tsn_for_ordered(&mut self, ssn: u16) {
@@ -398,7 +449,11 @@ impl StreamState {
             .forward_tsn_for_unordered(new_cumulative_tsn);
     }
 
-    fn packetize(&mut self, raw: &Bytes, ppi: PayloadProtocolIdentifier) -> Vec<ChunkPayloadData> {
+    fn packetize(
+        &mut self,
+        raw: &Bytes,
+        ppi: PayloadProtocolIdentifier,
+    ) -> (bool, Vec<ChunkPayloadData>) {
         let mut i = 0;
         let mut remaining = raw.len();
 
@@ -446,11 +501,15 @@ impl StreamState {
             self.sequence_number = self.sequence_number.wrapping_add(1);
         }
 
-        //let old_value = self.buffered_amount;
+        let old_amount = self.buffered_amount;
         self.buffered_amount += raw.len();
-        //trace!("[{}] bufferedAmount = {}", self.side, old_value + raw.len());
+        let new_amount = self.buffered_amount;
 
-        chunks
+        // Check if we crossed the high threshold
+        let is_buffered_amount_high =
+            old_amount < self.buffered_amount_high && new_amount >= self.buffered_amount_high;
+
+        (is_buffered_amount_high, chunks)
     }
 
     /// This method is called by association's read_loop (go-)routine to notify this stream

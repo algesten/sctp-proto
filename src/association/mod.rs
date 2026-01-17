@@ -52,7 +52,7 @@ mod timer;
 mod association_test;
 
 /// Reasons why an association might be lost
-#[derive(Debug, Error, Eq, Clone, PartialEq)]
+#[derive(Debug, Error, Clone, PartialEq)]
 pub enum AssociationError {
     /// Handshake failed
     #[error("{0}")]
@@ -85,12 +85,21 @@ pub enum AssociationError {
 pub enum Event {
     /// The association was successfully established
     Connected,
-    /// The association was lost
+    /// The association handshake failed
     ///
-    /// Emitted if the peer closes the association or an error is encountered.
-    AssociationLost {
-        /// Reason that the association was closed
+    /// Emitted if the handshake (INIT/COOKIE exchange) fails.
+    HandshakeFailed {
+        /// Reason that the handshake failed
         reason: AssociationError,
+    },
+    /// A stream was lost
+    ///
+    /// Emitted if a stream is closed or an error is encountered on a stream.
+    AssociationLost {
+        /// Reason that the stream was closed
+        reason: AssociationError,
+        /// Which stream was lost
+        id: StreamId,
     },
     /// Stream events
     Stream(StreamEvent),
@@ -392,7 +401,7 @@ impl Association {
         }*/
 
         if let Some(err) = self.error.take() {
-            return Some(Event::AssociationLost { reason: err });
+            return Some(Event::HandshakeFailed { reason: err });
         }
 
         None
@@ -412,7 +421,7 @@ impl Association {
     /// - a call to `poll_transmit` returned `Some`
     /// - a call was made to `handle_timeout`
     #[must_use]
-    pub fn poll_timeout(&mut self) -> Option<Instant> {
+    pub fn poll_timeout(&self) -> Option<Instant> {
         self.timers.next_timeout()
     }
 
@@ -617,7 +626,7 @@ impl Association {
             self.close_all_timers();
 
             for si in self.streams.keys().cloned().collect::<Vec<u16>>() {
-                self.unregister_stream(si);
+                self.unregister_stream(si, AssociationError::LocallyClosed);
             }
 
             debug!("[{}] association closed", self.side);
@@ -690,6 +699,11 @@ impl Association {
         }
     }
 
+    /// stream_ids returns a list of all active stream identifiers
+    pub fn stream_ids(&self) -> Vec<StreamId> {
+        self.streams.keys().cloned().collect()
+    }
+
     /// bytes_sent returns the number of bytes sent
     pub(crate) fn bytes_sent(&self) -> usize {
         self.bytes_sent
@@ -712,10 +726,14 @@ impl Association {
 
     /// unregister_stream un-registers a stream from the association
     /// The caller should hold the association write lock.
-    fn unregister_stream(&mut self, stream_identifier: StreamId) {
+    fn unregister_stream(&mut self, stream_identifier: StreamId, reason: AssociationError) {
         if let Some(mut s) = self.streams.remove(&stream_identifier) {
             debug!("[{}] unregister_stream {}", self.side, stream_identifier);
             s.state = RecvSendState::Closed;
+            self.events.push_back(Event::AssociationLost {
+                reason,
+                id: stream_identifier,
+            });
         }
     }
 
@@ -1199,8 +1217,7 @@ impl Association {
         if stream_handle_data {
             if let Some(s) = self.streams.get_mut(&d.stream_identifier) {
                 self.events.push_back(Event::DatagramReceived);
-                s.handle_data(d);
-                if s.reassembly_queue.is_readable() {
+                if s.handle_data(d) && s.reassembly_queue.is_readable() {
                     self.events.push_back(Event::Stream(StreamEvent::Readable {
                         id: d.stream_identifier,
                     }))
@@ -1877,7 +1894,7 @@ impl Association {
                     if respond {
                         sis_to_reset.push(*id);
                     }
-                    self.unregister_stream(*id);
+                    self.unregister_stream(*id, AssociationError::Reset);
                 }
             }
             self.reconfig_requests
@@ -1956,7 +1973,9 @@ impl Association {
 
         if accept {
             self.stream_queue.push_back(stream_identifier);
-            self.events.push_back(Event::Stream(StreamEvent::Opened));
+            self.events.push_back(Event::Stream(StreamEvent::Opened {
+                id: stream_identifier,
+            }));
         }
 
         self.streams.insert(stream_identifier, s);

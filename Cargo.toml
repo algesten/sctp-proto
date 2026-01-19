@@ -1,15 +1,15 @@
 [package]
 name = "sctp-proto"
 version = "0.6.0"
-authors = ["Rain Liu <yliu@webrtc.rs>"]
+authors = ["Rain Liu <yliu@webrtc.rs>", "Martin Algesten<martin@algesten.se>"]
 edition = "2021"
 description = "A pure Rust implementation of SCTP in Sans-IO style"
 license = "MIT/Apache-2.0"
 documentation = "https://docs.rs/sctp-proto"
-homepage = "https://webrtc.rs"
-repository = "https://github.com/webrtc-rs/sctp-proto"
+homepage = "https://github.com/algesten/sctp-proto"
+repository = "https://github.com/algesten/sctp-proto"
 keywords = ["sctp"]
-categories = [ "network-programming", "asynchronous" ]
+categories = ["network-programming", "asynchronous"]
 
 rust-version = "1.76.0"
 

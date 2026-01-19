@@ -14,6 +14,7 @@ use std::fmt;
 pub type StreamId = u16;
 
 /// Application events about streams
+#[non_exhaustive]
 #[derive(Debug, PartialEq, Eq)]
 pub enum StreamEvent {
     /// One or more new streams has been opened

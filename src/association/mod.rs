@@ -52,6 +52,7 @@ mod timer;
 mod association_test;
 
 /// Reasons why an association might be lost
+#[non_exhaustive]
 #[derive(Debug, Error, Clone, PartialEq)]
 pub enum AssociationError {
     /// Handshake failed
@@ -81,6 +82,7 @@ pub enum AssociationError {
 }
 
 /// Events of interest to the application
+#[non_exhaustive]
 #[derive(Debug)]
 pub enum Event {
     /// The association was successfully established

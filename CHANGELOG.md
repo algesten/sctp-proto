@@ -1,0 +1,63 @@
+# Unreleased
+
+# 0.7.0
+
+  * Mark some types non_exhaustive (breaking) #26
+  * Sync sctp-proto with rtc-sctp (breaking) #25
+  * Changes to adopt sctp-proto #24
+
+# 0.6.0
+
+  * Configurable SCTP retransmission limits and RTO values #22
+
+# 0.5.0
+
+  * Switch to maintained version of rustc-hash #21
+
+# 0.4.0
+
+  * Update rand crate to 0.9.1 #19
+  * Clippy fixes #18
+  * Update thiserror to 2.0.16 #17
+  * Clippy fixes #16
+
+# 0.3.0
+
+  * Ignore unknown parameters (breaking) #14
+  * Port CRC optimizations from webrtc-rs/sctp made by #13
+
+# 0.2.2
+
+  * Move per packet log from debug to trace #12
+
+# 0.2.1
+
+  * Don't log user initiated abort as err #11
+
+# 0.2.0
+
+  * Wrap around ssn to 0 and avoid panic #9
+  * Clippy and rust analyzer warnings #10
+
+# 0.1.7
+
+  * Fix T3RTX timer starvation #7
+
+# 0.1.6
+
+  * Respond with ParamOutgoingResetRequest #6
+
+# 0.1.5
+
+  * Fix sequence_number.wrapping_add
+
+# 0.1.4
+
+  * Remove unused deps and update deps
+
+# 0.1.3
+
+  * Make API Sync (as well as Send) and write_with_ppi() #4
+  * Chores (clippy and deps) #3
+  * Configurable max_payload_size #2
+  * Fix build #1

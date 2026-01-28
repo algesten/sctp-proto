@@ -411,9 +411,9 @@ fn test_assoc_handle_init() -> Result<()> {
 }
 
 #[test]
-fn test_assoc_max_message_size_default() -> Result<()> {
+fn test_assoc_max_send_message_size_default() -> Result<()> {
     let mut a = create_association(TransportConfig::default());
-    assert_eq!(65536, a.max_message_size, "should match");
+    assert_eq!(65536, a.max_send_message_size, "should match");
 
     let ppi = PayloadProtocolIdentifier::Unknown;
     let stream = a.create_stream(1, false, ppi);
@@ -447,10 +447,9 @@ fn test_assoc_max_message_size_default() -> Result<()> {
 }
 
 #[test]
-fn test_assoc_max_message_size_explicit() -> Result<()> {
-    let mut a = create_association(TransportConfig::default().with_max_message_size(30000));
-
-    assert_eq!(30000, a.max_message_size, "should match");
+fn test_assoc_max_send_message_size_explicit() -> Result<()> {
+    let mut a = create_association(TransportConfig::default().with_max_send_message_size(30000));
+    assert_eq!(30000, a.max_send_message_size, "should match");
 
     let ppi = PayloadProtocolIdentifier::Unknown;
     let stream = a.create_stream(1, false, ppi);
@@ -478,6 +477,157 @@ fn test_assoc_max_message_size_explicit() -> Result<()> {
         } else {
             panic!("should be error");
         }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_assoc_max_receive_message_size_default() -> Result<()> {
+    let mut a = create_association(TransportConfig::default());
+    assert_eq!(65536, a.max_receive_message_size, "should match");
+
+    let p = Bytes::from(vec![0u8; 65537]);
+
+    let size_ok = ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn: a.peer_last_tsn + 1,
+        stream_identifier: 1,
+        user_data: p.slice(..65536),
+        ..Default::default()
+    };
+
+    assert!(a.handle_data(&size_ok).is_ok(), "should succeed");
+
+    let too_large = ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn: a.peer_last_tsn + 1,
+        stream_identifier: 1,
+        user_data: p,
+        ..Default::default()
+    };
+
+    if let Err(err) = a.handle_data(&too_large) {
+        assert_eq!(
+            Error::ErrInboundPacketTooLarge,
+            err,
+            "should be Error::ErrInboundPacketTooLarge"
+        );
+    } else {
+        panic!("should be error");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_assoc_max_receive_message_size_explicit() -> Result<()> {
+    let mut a = create_association(TransportConfig::default().with_max_receive_message_size(1024));
+    assert_eq!(1024, a.max_receive_message_size, "should match");
+
+    let first_chunk = ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn: a.peer_last_tsn + 1,
+        stream_identifier: 1,
+        user_data: Bytes::from(vec![0u8; 512]),
+        ..Default::default()
+    };
+
+    assert!(a.handle_data(&first_chunk).is_ok(), "should succeed");
+
+    let second_chunk = ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn: a.peer_last_tsn + 1,
+        stream_identifier: 1,
+        user_data: Bytes::from(vec![0u8; 513]),
+        ..Default::default()
+    };
+
+    if let Err(err) = a.handle_data(&second_chunk) {
+        assert_eq!(
+            Error::ErrInboundPacketTooLarge,
+            err,
+            "should be Error::ErrInboundPacketTooLarge"
+        );
+    } else {
+        panic!("should be error");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_assoc_max_message_size_asymmetric() -> Result<()> {
+    let config = TransportConfig::default()
+        .with_max_send_message_size(1024)
+        .with_max_receive_message_size(30000);
+
+    let mut a = create_association(config);
+    assert_eq!(1024, a.max_send_message_size, "should match");
+    assert_eq!(30000, a.max_receive_message_size, "should match");
+
+    let ppi = PayloadProtocolIdentifier::Unknown;
+    let stream = a.create_stream(1, false, ppi);
+    assert!(stream.is_some(), "should succeed");
+
+    if let Some(mut s) = stream {
+        let p = Bytes::from(vec![0u8; 1025]);
+
+        if let Err(err) = s.write_sctp(&p.slice(..1024), ppi) {
+            assert_ne!(
+                Error::ErrOutboundPacketTooLarge,
+                err,
+                "should be not Error::ErrOutboundPacketTooLarge"
+            );
+        } else {
+            panic!("should be error");
+        }
+
+        if let Err(err) = s.write_sctp(&p.slice(..1025), ppi) {
+            assert_eq!(
+                Error::ErrOutboundPacketTooLarge,
+                err,
+                "should be Error::ErrOutboundPacketTooLarge"
+            );
+        } else {
+            panic!("should be error");
+        }
+    }
+
+    let p = Bytes::from(vec![0u8; 30001]);
+
+    let size_ok = ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn: a.peer_last_tsn + 1,
+        stream_identifier: 1,
+        user_data: p.slice(..30000),
+        ..Default::default()
+    };
+
+    assert!(a.handle_data(&size_ok).is_ok(), "should succeed");
+
+    let too_large = ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn: a.peer_last_tsn + 1,
+        stream_identifier: 1,
+        user_data: p,
+        ..Default::default()
+    };
+
+    if let Err(err) = a.handle_data(&too_large) {
+        assert_eq!(
+            Error::ErrInboundPacketTooLarge,
+            err,
+            "should be Error::ErrInboundPacketTooLarge"
+        );
+    } else {
+        panic!("should be error");
     }
 
     Ok(())

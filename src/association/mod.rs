@@ -131,7 +131,8 @@ pub struct Association {
     side: Side,
     state: AssociationState,
     handshake_completed: bool,
-    max_message_size: u32,
+    max_send_message_size: u32,
+    max_receive_message_size: u32,
     inflight_queue_length: usize,
     will_send_shutdown: bool,
     bytes_received: usize,
@@ -218,7 +219,8 @@ impl Default for Association {
             side: Side::default(),
             state: AssociationState::default(),
             handshake_completed: false,
-            max_message_size: 0,
+            max_send_message_size: 0,
+            max_receive_message_size: 0,
             inflight_queue_length: 0,
             will_send_shutdown: false,
             bytes_received: 0,
@@ -334,7 +336,8 @@ impl Association {
             side,
             handshake_completed: false,
             max_receive_buffer_size: config.max_receive_buffer_size(),
-            max_message_size: config.max_message_size(),
+            max_send_message_size: config.max_send_message_size(),
+            max_receive_message_size: config.max_receive_message_size(),
             my_max_num_outbound_streams: config.max_num_outbound_streams(),
             my_max_num_inbound_streams: config.max_num_inbound_streams(),
             max_payload_size,
@@ -716,14 +719,31 @@ impl Association {
         self.bytes_received
     }
 
+    /// max_send_message_size returns the maximum message size you can send.
+    pub(crate) fn max_send_message_size(&self) -> u32 {
+        self.max_send_message_size
+    }
+
+    /// set_max_send_message_size sets the maximum message size you can send.
+    pub(crate) fn set_max_send_message_size(&mut self, value: u32) {
+        self.max_send_message_size = value;
+    }
+
+    /// max_receive_message_size returns the maximum message size accepted.
+    pub(crate) fn max_receive_message_size(&self) -> u32 {
+        self.max_receive_message_size
+    }
+
     /// max_message_size returns the maximum message size you can send.
+    #[deprecated(note = "Use max_send_message_size instead")]
     pub(crate) fn max_message_size(&self) -> u32 {
-        self.max_message_size
+        self.max_send_message_size()
     }
 
     /// set_max_message_size sets the maximum message size you can send.
-    pub(crate) fn set_max_message_size(&mut self, max_message_size: u32) {
-        self.max_message_size = max_message_size;
+    #[deprecated(note = "Use set_max_send_message_size instead")]
+    pub(crate) fn set_max_message_size(&mut self, value: u32) {
+        self.set_max_send_message_size(value)
     }
 
     /// unregister_stream un-registers a stream from the association
@@ -1239,7 +1259,8 @@ impl Association {
         if stream_handle_data {
             if let Some(s) = self.streams.get_mut(&d.stream_identifier) {
                 self.events.push_back(Event::DatagramReceived);
-                if s.handle_data(d) && s.reassembly_queue.is_readable() {
+                let queued = s.handle_data(d)?;
+                if queued && s.reassembly_queue.is_readable() {
                     self.events.push_back(Event::Stream(StreamEvent::Readable {
                         id: d.stream_identifier,
                     }))
@@ -1990,6 +2011,7 @@ impl Association {
             self.side,
             stream_identifier,
             self.max_payload_size,
+            self.max_receive_message_size,
             default_payload_type,
         );
 

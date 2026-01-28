@@ -25,9 +25,16 @@ const DEFAULT_MAX_INIT_RETRANS: usize = 8;
 #[derive(Debug)]
 pub struct TransportConfig {
     max_receive_buffer_size: u32,
-    max_message_size: u32,
     max_num_outbound_streams: u16,
     max_num_inbound_streams: u16,
+
+    /// Maximum message size we will SEND (respects remote's advertised limit)
+    /// Can be updated after association creation via set_max_send_message_size()
+    max_send_message_size: u32,
+
+    /// Maximum message size we will RECEIVE (what we advertise in SDP)
+    /// Enforced during reassembly - messages exceeding this are rejected
+    max_receive_message_size: u32,
 
     /// Maximum number of retransmissions for INIT chunks during handshake.
     /// Set to `None` for unlimited retries (recommended for WebRTC).
@@ -56,7 +63,8 @@ impl Default for TransportConfig {
     fn default() -> Self {
         TransportConfig {
             max_receive_buffer_size: INITIAL_RECV_BUF_SIZE,
-            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            max_send_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            max_receive_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             max_num_outbound_streams: u16::MAX,
             max_num_inbound_streams: u16::MAX,
             max_init_retransmits: Some(DEFAULT_MAX_INIT_RETRANS),
@@ -74,9 +82,20 @@ impl TransportConfig {
         self
     }
 
-    pub fn with_max_message_size(mut self, value: u32) -> Self {
-        self.max_message_size = value;
+    pub fn with_max_send_message_size(mut self, value: u32) -> Self {
+        self.max_send_message_size = value;
         self
+    }
+
+    /// Set maximum size of messages we will accept
+    pub fn with_max_receive_message_size(mut self, value: u32) -> Self {
+        self.max_receive_message_size = value;
+        self
+    }
+
+    #[deprecated(note = "Use with_max_send_message_size instead")]
+    pub fn with_max_message_size(self, value: u32) -> Self {
+        self.with_max_send_message_size(value)
     }
 
     pub fn with_max_num_outbound_streams(mut self, value: u16) -> Self {
@@ -93,8 +112,12 @@ impl TransportConfig {
         self.max_receive_buffer_size
     }
 
-    pub(crate) fn max_message_size(&self) -> u32 {
-        self.max_message_size
+    pub(crate) fn max_send_message_size(&self) -> u32 {
+        self.max_send_message_size
+    }
+
+    pub(crate) fn max_receive_message_size(&self) -> u32 {
+        self.max_receive_message_size
     }
 
     pub(crate) fn max_num_outbound_streams(&self) -> u16 {

@@ -185,6 +185,7 @@ pub(crate) struct ReassemblyQueue {
     pub(crate) unordered: Vec<Chunks>,
     pub(crate) unordered_chunks: Vec<ChunkPayloadData>,
     pub(crate) n_bytes: usize,
+    pub(crate) max_message_size: u32,
 }
 
 impl ReassemblyQueue {
@@ -193,7 +194,7 @@ impl ReassemblyQueue {
     ///   the association is Established.  Also, when the Stream Sequence
     ///   Number reaches the value 65535 the next Stream Sequence Number MUST
     ///   be set to 0.
-    pub(crate) fn new(si: StreamId) -> Self {
+    pub(crate) fn new(si: StreamId, max_message_size: u32) -> Self {
         ReassemblyQueue {
             si,
             next_ssn: 0, // From RFC 4960 Sec 6.5:
@@ -201,15 +202,22 @@ impl ReassemblyQueue {
             unordered: vec![],
             unordered_chunks: vec![],
             n_bytes: 0,
+            max_message_size,
         }
     }
 
-    pub(crate) fn push(&mut self, chunk: ChunkPayloadData) -> bool {
+    pub(crate) fn push(&mut self, chunk: ChunkPayloadData) -> Result<bool> {
         if chunk.stream_identifier != self.si {
-            return false;
+            return Ok(false);
         }
 
         if chunk.unordered {
+            // Check if adding this chunk would exceed limit for unordered
+            let projected_size = self.calculate_unordered_message_size(&chunk);
+            if projected_size > self.max_message_size as usize {
+                return Err(Error::ErrInboundPacketTooLarge);
+            }
+
             // First, insert into unordered_chunks array
             //atomic.AddUint64(&r.n_bytes, uint64(len(chunk.userData)))
             self.n_bytes += chunk.user_data.len();
@@ -220,14 +228,20 @@ impl ReassemblyQueue {
             // If found, append the complete set to the unordered array
             if let Some(cset) = self.find_complete_unordered_chunk_set() {
                 self.unordered.push(cset);
-                return true;
+                return Ok(true);
             }
 
-            false
+            Ok(false)
         } else {
+            // Check if adding this chunk would exceed limit for ordered
+            let projected_size = self.calculate_ordered_message_size(&chunk);
+            if projected_size > self.max_message_size as usize {
+                return Err(Error::ErrInboundPacketTooLarge);
+            }
+
             // This is an ordered chunk
             if sna16lt(chunk.stream_sequence_number, self.next_ssn) {
-                return false;
+                return Ok(false);
             }
 
             self.n_bytes += chunk.user_data.len();
@@ -235,7 +249,7 @@ impl ReassemblyQueue {
             // Check if a chunkSet with the SSN already exists
             for s in &mut self.ordered {
                 if s.ssn == chunk.stream_sequence_number {
-                    return s.push(chunk);
+                    return Ok(s.push(chunk));
                 }
             }
 
@@ -248,8 +262,30 @@ impl ReassemblyQueue {
                 sort_chunks_by_ssn(&mut self.ordered);
             }
 
-            ok
+            Ok(ok)
         }
+    }
+
+    fn calculate_ordered_message_size(&self, new_chunk: &ChunkPayloadData) -> usize {
+        let ssn = new_chunk.stream_sequence_number;
+        let existing: usize = self
+            .ordered
+            .iter()
+            .find(|s| s.ssn == ssn)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        existing + new_chunk.user_data.len()
+    }
+
+    fn calculate_unordered_message_size(&self, new_chunk: &ChunkPayloadData) -> usize {
+        // For unordered, calculate size of contiguous chunk set this belongs to
+        // This is more complex - need to find the message boundary
+        // Simplified: sum all unordered chunks + new chunk (conservative)
+        self.unordered_chunks
+            .iter()
+            .map(|c| c.user_data.len())
+            .sum::<usize>()
+            + new_chunk.user_data.len()
     }
 
     pub(crate) fn find_complete_unordered_chunk_set(&mut self) -> Option<Chunks> {

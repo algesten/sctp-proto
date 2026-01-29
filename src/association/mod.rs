@@ -734,6 +734,11 @@ impl Association {
         self.max_receive_message_size
     }
 
+    /// set_max_receive_message_size sets the maximum message size accepted.
+    pub(crate) fn set_max_receive_message_size(&mut self, value: u32) {
+        self.max_receive_message_size = value;
+    }
+
     /// max_message_size returns the maximum message size you can send.
     #[deprecated(note = "Use max_send_message_size instead")]
     pub(crate) fn max_message_size(&self) -> u32 {

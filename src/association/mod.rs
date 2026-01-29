@@ -725,7 +725,7 @@ impl Association {
     }
 
     /// set_max_send_message_size sets the maximum message size you can send.
-    pub(crate) fn set_max_send_message_size(&mut self, value: u32) {
+    pub fn set_max_send_message_size(&mut self, value: u32) {
         self.max_send_message_size = value;
     }
 

@@ -450,7 +450,7 @@ impl StreamState {
             .forward_tsn_for_unordered(new_cumulative_tsn);
     }
 
-    fn packetize(
+    pub(crate) fn packetize(
         &mut self,
         raw: &Bytes,
         ppi: PayloadProtocolIdentifier,
@@ -480,7 +480,11 @@ impl StreamState {
                 unordered,
                 beginning_fragment: i == 0,
                 ending_fragment: remaining - fragment_size == 0,
-                immediate_sack: false,
+                // RFC 7053: Set the I-bit (SACK-IMMEDIATELY) on the last
+                // fragment of each user message to prompt the receiver to
+                // SACK without waiting for the delayed ACK timer (~200ms).
+                // This matches Firefox's behavior.
+                immediate_sack: remaining - fragment_size == 0,
                 payload_type: ppi,
                 stream_sequence_number: self.sequence_number,
                 abandoned: head_abandoned, // all fragmented chunks use the same abandoned

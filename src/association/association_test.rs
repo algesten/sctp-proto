@@ -482,3 +482,58 @@ fn test_assoc_max_message_size_explicit() -> Result<()> {
 
     Ok(())
 }
+
+/// RFC 7053: The I-bit (SACK-IMMEDIATELY) should be set on the last DATA chunk
+/// of each user message (the one with the E-bit) to prompt the receiver to SACK
+/// without waiting for the delayed ACK timer.
+#[test]
+fn test_packetize_sets_immediate_sack_on_last_fragment() {
+    use crate::association::stream::StreamState;
+    use crate::chunk::chunk_payload_data::PayloadProtocolIdentifier;
+
+    let mut s = StreamState::new(Side::Client, 0, 1000, PayloadProtocolIdentifier::Binary);
+
+    // Single chunk (unfragmented) — should have I-bit set.
+    let data = bytes::Bytes::from_static(b"hello");
+    let (_, chunks) = s.packetize(&data, PayloadProtocolIdentifier::String);
+    assert_eq!(chunks.len(), 1);
+    assert!(
+        chunks[0].beginning_fragment && chunks[0].ending_fragment,
+        "single chunk should have both B and E bits"
+    );
+    assert!(
+        chunks[0].immediate_sack,
+        "single chunk should have I-bit (SACK-IMMEDIATELY) set"
+    );
+
+    // Multi-fragment message — only the last chunk should have I-bit.
+    // max_payload_size=10, so a 25-byte message should produce 3 chunks.
+    let mut s2 = StreamState::new(Side::Client, 1, 10, PayloadProtocolIdentifier::Binary);
+    let data2 = bytes::Bytes::from(vec![0u8; 25]);
+    let (_, chunks2) = s2.packetize(&data2, PayloadProtocolIdentifier::Binary);
+    assert_eq!(chunks2.len(), 3, "25 bytes / 10 byte max = 3 fragments");
+
+    // First fragment: B=true, E=false, I=false
+    assert!(chunks2[0].beginning_fragment);
+    assert!(!chunks2[0].ending_fragment);
+    assert!(
+        !chunks2[0].immediate_sack,
+        "non-last fragment should NOT have I-bit"
+    );
+
+    // Middle fragment: B=false, E=false, I=false
+    assert!(!chunks2[1].beginning_fragment);
+    assert!(!chunks2[1].ending_fragment);
+    assert!(
+        !chunks2[1].immediate_sack,
+        "middle fragment should NOT have I-bit"
+    );
+
+    // Last fragment: B=false, E=true, I=true
+    assert!(!chunks2[2].beginning_fragment);
+    assert!(chunks2[2].ending_fragment);
+    assert!(
+        chunks2[2].immediate_sack,
+        "last fragment MUST have I-bit (SACK-IMMEDIATELY) per RFC 7053"
+    );
+}

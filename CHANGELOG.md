@@ -1,5 +1,7 @@
 # Unreleased
 
+  * Fix server-side rwnd initialization from INIT #28 
+
 # 0.7.0
 
   * Mark some types non_exhaustive (breaking) #26

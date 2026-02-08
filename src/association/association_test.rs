@@ -360,6 +360,17 @@ fn handle_init_test(name: &str, initial_state: AssociationState, expect_err: boo
         name
     );
     assert!(a.use_forward_tsn, "{} should be set to true", name);
+    assert_eq!(
+        512 * 1024,
+        a.rwnd,
+        "{} rwnd should be initialized from peer's advertised_receiver_window_credit",
+        name
+    );
+    assert_eq!(
+        a.rwnd, a.ssthresh,
+        "{} ssthresh should be initialized to rwnd",
+        name
+    );
 }
 
 #[test]

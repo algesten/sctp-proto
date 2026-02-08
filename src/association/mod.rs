@@ -943,6 +943,26 @@ impl Association {
             i.initial_tsn - 1
         };
 
+        // Initialize rwnd from the peer's advertised receiver window credit.
+        // This mirrors what handle_init_ack does for the client side.
+        // Without this, rwnd stays at 0 (the default) until the first SACK
+        // is received, which blocks all DATA sending except zero-window probes.
+        self.rwnd = i.advertised_receiver_window_credit;
+        debug!("[{}] initial rwnd={}", self.side, self.rwnd);
+
+        // RFC 4960 Sec 7.2.1
+        //  o  The initial value of ssthresh MAY be arbitrarily high (for
+        //     example, implementations MAY use the size of the receiver
+        //     advertised window).
+        self.ssthresh = self.rwnd;
+        trace!(
+            "[{}] updated cwnd={} ssthresh={} inflight={} (INI)",
+            self.side,
+            self.cwnd,
+            self.ssthresh,
+            self.inflight_queue.get_num_bytes()
+        );
+
         for param in &i.params {
             if let Some(v) = param.as_any().downcast_ref::<ParamSupportedExtensions>() {
                 for t in &v.chunk_types {

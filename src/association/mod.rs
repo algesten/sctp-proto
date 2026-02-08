@@ -1234,15 +1234,13 @@ impl Association {
             if self.get_or_create_stream(d.stream_identifier).is_some() {
                 if self.get_my_receiver_window_credit() > 0 {
                     // Pass the new chunk to stream level as soon as it arrives
-                    self.payload_queue.push(d.clone(), self.peer_last_tsn);
                     stream_handle_data = true;
                 } else {
                     // Receive buffer is full
                     if let Some(last_tsn) = self.payload_queue.get_last_tsn_received() {
                         if sna32lt(d.tsn, *last_tsn) {
                             debug!("[{}] receive buffer full, but accepted as this is a missing chunk with tsn={} ssn={}", self.side, d.tsn, d.stream_sequence_number);
-                            self.payload_queue.push(d.clone(), self.peer_last_tsn);
-                            stream_handle_data = true; //s.handle_data(d.clone());
+                            stream_handle_data = true;
                         }
                     } else {
                         debug!(
@@ -1263,8 +1261,10 @@ impl Association {
 
         if stream_handle_data {
             if let Some(s) = self.streams.get_mut(&d.stream_identifier) {
-                self.events.push_back(Event::DatagramReceived);
                 let queued = s.handle_data(d)?;
+                // Only commit to payload_queue after reassembly accepts the chunk
+                self.payload_queue.push(d.clone(), self.peer_last_tsn);
+                self.events.push_back(Event::DatagramReceived);
                 if queued && s.reassembly_queue.is_readable() {
                     self.events.push_back(Event::Stream(StreamEvent::Readable {
                         id: d.stream_identifier,

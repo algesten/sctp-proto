@@ -1,6 +1,6 @@
 [package]
 name = "sctp-proto"
-version = "0.7.0"
+version = "0.7.1"
 authors = ["Rain Liu <yliu@webrtc.rs>", "Martin Algesten<martin@algesten.se>"]
 edition = "2021"
 description = "A pure Rust implementation of SCTP in Sans-IO style"

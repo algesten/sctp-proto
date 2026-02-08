@@ -173,7 +173,7 @@ impl<'a> Stream<'a> {
             return Err(Error::ErrStreamClosed);
         }
 
-        if source.remaining() > self.association.max_message_size() as usize {
+        if source.remaining() > self.association.max_send_message_size() as usize {
             return Err(Error::ErrOutboundPacketTooLarge);
         }
 
@@ -186,7 +186,7 @@ impl<'a> Stream<'a> {
             _ => {}
         };
 
-        let (p, _) = source.pop_chunk(self.association.max_message_size() as usize);
+        let (p, _) = source.pop_chunk(self.association.max_send_message_size() as usize);
 
         if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
             let (is_buffered_amount_high, chunks) = s.packetize(&p, ppi);
@@ -406,6 +406,7 @@ impl StreamState {
         side: Side,
         stream_identifier: StreamId,
         max_payload_size: u32,
+        max_receive_message_size: u32,
         default_payload_type: PayloadProtocolIdentifier,
     ) -> Self {
         StreamState {
@@ -413,7 +414,7 @@ impl StreamState {
             stream_identifier,
             max_payload_size,
             default_payload_type,
-            reassembly_queue: ReassemblyQueue::new(stream_identifier),
+            reassembly_queue: ReassemblyQueue::new(stream_identifier, max_receive_message_size),
             sequence_number: 0,
             state: RecvSendState::ReadWritable,
             unordered: false,
@@ -425,7 +426,7 @@ impl StreamState {
         }
     }
 
-    pub(crate) fn handle_data(&mut self, pd: &ChunkPayloadData) -> bool {
+    pub(crate) fn handle_data(&mut self, pd: &ChunkPayloadData) -> Result<bool> {
         self.reassembly_queue.push(pd.clone())
     }
 

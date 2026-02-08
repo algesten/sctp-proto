@@ -432,7 +432,7 @@ use super::reassembly_queue::*;
 
 #[test]
 fn test_reassembly_queue_ordered_fragments() -> Result<()> {
-    let mut rq = ReassemblyQueue::new(0);
+    let mut rq = ReassemblyQueue::new(0, 65536);
 
     let org_ppi = PayloadProtocolIdentifier::Binary;
 
@@ -445,7 +445,7 @@ fn test_reassembly_queue_ordered_fragments() -> Result<()> {
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(!complete, "chunk set should not be complete yet");
     assert_eq!(3, rq.get_num_bytes(), "num bytes mismatch");
 
@@ -458,7 +458,7 @@ fn test_reassembly_queue_ordered_fragments() -> Result<()> {
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(complete, "chunk set should be complete");
     assert_eq!(7, rq.get_num_bytes(), "num bytes mismatch");
 
@@ -479,7 +479,7 @@ fn test_reassembly_queue_ordered_fragments() -> Result<()> {
 
 #[test]
 fn test_reassembly_queue_unordered_fragments() -> Result<()> {
-    let mut rq = ReassemblyQueue::new(0);
+    let mut rq = ReassemblyQueue::new(0, 65536);
 
     let org_ppi = PayloadProtocolIdentifier::Binary;
 
@@ -493,7 +493,7 @@ fn test_reassembly_queue_unordered_fragments() -> Result<()> {
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(!complete, "chunk set should not be complete yet");
     assert_eq!(3, rq.get_num_bytes(), "num bytes mismatch");
 
@@ -506,7 +506,7 @@ fn test_reassembly_queue_unordered_fragments() -> Result<()> {
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(!complete, "chunk set should not be complete yet");
     assert_eq!(7, rq.get_num_bytes(), "num bytes mismatch");
 
@@ -520,7 +520,7 @@ fn test_reassembly_queue_unordered_fragments() -> Result<()> {
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(complete, "chunk set should be complete");
     assert_eq!(8, rq.get_num_bytes(), "num bytes mismatch");
 
@@ -541,7 +541,7 @@ fn test_reassembly_queue_unordered_fragments() -> Result<()> {
 
 #[test]
 fn test_reassembly_queue_ordered_and_unordered_fragments() -> Result<()> {
-    let mut rq = ReassemblyQueue::new(0);
+    let mut rq = ReassemblyQueue::new(0, 65536);
     let org_ppi = PayloadProtocolIdentifier::Binary;
     let chunk = ChunkPayloadData {
         payload_type: org_ppi,
@@ -553,7 +553,7 @@ fn test_reassembly_queue_ordered_and_unordered_fragments() -> Result<()> {
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(complete, "chunk set should be complete");
     assert_eq!(3, rq.get_num_bytes(), "num bytes mismatch");
 
@@ -568,7 +568,7 @@ fn test_reassembly_queue_ordered_and_unordered_fragments() -> Result<()> {
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(complete, "chunk set should be complete");
     assert_eq!(6, rq.get_num_bytes(), "num bytes mismatch");
 
@@ -605,7 +605,7 @@ fn test_reassembly_queue_ordered_and_unordered_fragments() -> Result<()> {
 
 #[test]
 fn test_reassembly_queue_unordered_complete_skips_incomplete() -> Result<()> {
-    let mut rq = ReassemblyQueue::new(0);
+    let mut rq = ReassemblyQueue::new(0, 65536);
 
     let org_ppi = PayloadProtocolIdentifier::Binary;
 
@@ -619,7 +619,7 @@ fn test_reassembly_queue_unordered_complete_skips_incomplete() -> Result<()> {
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(!complete, "chunk set should not be complete yet");
     assert_eq!(2, rq.get_num_bytes(), "num bytes mismatch");
 
@@ -633,7 +633,7 @@ fn test_reassembly_queue_unordered_complete_skips_incomplete() -> Result<()> {
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(!complete, "chunk set should not be complete yet");
     assert_eq!(10, rq.get_num_bytes(), "num bytes mismatch");
 
@@ -648,7 +648,7 @@ fn test_reassembly_queue_unordered_complete_skips_incomplete() -> Result<()> {
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(complete, "chunk set should be complete");
     assert_eq!(14, rq.get_num_bytes(), "num bytes mismatch");
 
@@ -674,7 +674,7 @@ fn test_reassembly_queue_unordered_complete_skips_incomplete() -> Result<()> {
 
 #[test]
 fn test_reassembly_queue_ignores_chunk_with_wrong_si() -> Result<()> {
-    let mut rq = ReassemblyQueue::new(123);
+    let mut rq = ReassemblyQueue::new(123, 65536);
 
     let org_ppi = PayloadProtocolIdentifier::Binary;
 
@@ -689,7 +689,7 @@ fn test_reassembly_queue_ignores_chunk_with_wrong_si() -> Result<()> {
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(!complete, "chunk should be ignored");
     assert_eq!(0, rq.get_num_bytes(), "num bytes mismatch");
     Ok(())
@@ -697,7 +697,7 @@ fn test_reassembly_queue_ignores_chunk_with_wrong_si() -> Result<()> {
 
 #[test]
 fn test_reassembly_queue_ignores_chunk_with_stale_ssn() -> Result<()> {
-    let mut rq = ReassemblyQueue::new(0);
+    let mut rq = ReassemblyQueue::new(0, 65536);
     rq.next_ssn = 7; // forcibly set expected SSN to 7
 
     let org_ppi = PayloadProtocolIdentifier::Binary;
@@ -712,7 +712,7 @@ fn test_reassembly_queue_ignores_chunk_with_stale_ssn() -> Result<()> {
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(!complete, "chunk should not be ignored");
     assert_eq!(0, rq.get_num_bytes(), "num bytes mismatch");
 
@@ -721,7 +721,7 @@ fn test_reassembly_queue_ignores_chunk_with_stale_ssn() -> Result<()> {
 
 #[test]
 fn test_reassembly_queue_should_fail_to_read_incomplete_chunk() -> Result<()> {
-    let mut rq = ReassemblyQueue::new(0);
+    let mut rq = ReassemblyQueue::new(0, 65536);
 
     let org_ppi = PayloadProtocolIdentifier::Binary;
 
@@ -734,7 +734,7 @@ fn test_reassembly_queue_should_fail_to_read_incomplete_chunk() -> Result<()> {
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(!complete, "the set should not be complete");
     assert_eq!(2, rq.get_num_bytes(), "num bytes mismatch");
 
@@ -747,7 +747,7 @@ fn test_reassembly_queue_should_fail_to_read_incomplete_chunk() -> Result<()> {
 
 #[test]
 fn test_reassembly_queue_should_fail_to_read_if_the_nex_ssn_is_not_ready() -> Result<()> {
-    let mut rq = ReassemblyQueue::new(0);
+    let mut rq = ReassemblyQueue::new(0, 65536);
 
     let org_ppi = PayloadProtocolIdentifier::Binary;
 
@@ -761,7 +761,7 @@ fn test_reassembly_queue_should_fail_to_read_if_the_nex_ssn_is_not_ready() -> Re
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(complete, "the set should be complete");
     assert_eq!(2, rq.get_num_bytes(), "num bytes mismatch");
 
@@ -774,7 +774,7 @@ fn test_reassembly_queue_should_fail_to_read_if_the_nex_ssn_is_not_ready() -> Re
 
 #[test]
 fn test_reassembly_queue_detect_buffer_too_short() -> Result<()> {
-    let mut rq = ReassemblyQueue::new(0);
+    let mut rq = ReassemblyQueue::new(0, 65536);
 
     let org_ppi = PayloadProtocolIdentifier::Binary;
 
@@ -788,7 +788,7 @@ fn test_reassembly_queue_detect_buffer_too_short() -> Result<()> {
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(complete, "the set should be complete");
     assert_eq!(10, rq.get_num_bytes(), "num bytes mismatch");
 
@@ -809,7 +809,7 @@ fn test_reassembly_queue_detect_buffer_too_short() -> Result<()> {
 
 #[test]
 fn test_reassembly_queue_forward_tsn_for_ordered_framents() -> Result<()> {
-    let mut rq = ReassemblyQueue::new(0);
+    let mut rq = ReassemblyQueue::new(0, 65536);
 
     let org_ppi = PayloadProtocolIdentifier::Binary;
 
@@ -826,7 +826,7 @@ fn test_reassembly_queue_forward_tsn_for_ordered_framents() -> Result<()> {
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(complete, "chunk set should be complete");
     assert_eq!(3, rq.get_num_bytes(), "num bytes mismatch");
 
@@ -839,7 +839,7 @@ fn test_reassembly_queue_forward_tsn_for_ordered_framents() -> Result<()> {
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(!complete, "chunk set should not be complete yet");
     assert_eq!(6, rq.get_num_bytes(), "num bytes mismatch");
 
@@ -851,7 +851,7 @@ fn test_reassembly_queue_forward_tsn_for_ordered_framents() -> Result<()> {
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(!complete, "chunk set should not be complete yet");
     assert_eq!(9, rq.get_num_bytes(), "num bytes mismatch");
 
@@ -865,7 +865,7 @@ fn test_reassembly_queue_forward_tsn_for_ordered_framents() -> Result<()> {
 
 #[test]
 fn test_reassembly_queue_forward_tsn_for_unordered_framents() -> Result<()> {
-    let mut rq = ReassemblyQueue::new(0);
+    let mut rq = ReassemblyQueue::new(0, 65536);
 
     let org_ppi = PayloadProtocolIdentifier::Binary;
 
@@ -882,7 +882,7 @@ fn test_reassembly_queue_forward_tsn_for_unordered_framents() -> Result<()> {
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(!complete, "chunk set should not be complete yet");
     assert_eq!(3, rq.get_num_bytes(), "num bytes mismatch");
 
@@ -895,7 +895,7 @@ fn test_reassembly_queue_forward_tsn_for_unordered_framents() -> Result<()> {
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(!complete, "chunk set should not be complete yet");
     assert_eq!(6, rq.get_num_bytes(), "num bytes mismatch");
 
@@ -909,7 +909,7 @@ fn test_reassembly_queue_forward_tsn_for_unordered_framents() -> Result<()> {
         ..Default::default()
     };
 
-    let complete = rq.push(chunk);
+    let complete = rq.push(chunk).expect("chunk to be queued");
     assert!(!complete, "chunk set should not be complete yet");
     assert_eq!(9, rq.get_num_bytes(), "num bytes mismatch");
 
@@ -994,7 +994,7 @@ fn test_chunk_set_incomplete_chunk_set_no_contiguous_tsn() -> Result<()> {
 
 #[test]
 fn test_reassembly_queue_ssn_overflow() -> Result<()> {
-    let mut rq = ReassemblyQueue::new(0);
+    let mut rq = ReassemblyQueue::new(0, 65536);
     let org_ppi = PayloadProtocolIdentifier::Binary;
 
     for stream_sequence_number in 0..=u16::MAX {
@@ -1007,7 +1007,7 @@ fn test_reassembly_queue_ssn_overflow() -> Result<()> {
             user_data: Bytes::from_static(b"123"),
             ..Default::default()
         };
-        assert!(rq.push(chunk));
+        assert!(rq.push(chunk).expect("chunk to be queued"));
         assert!(rq.read().is_some());
     }
 
@@ -1016,7 +1016,7 @@ fn test_reassembly_queue_ssn_overflow() -> Result<()> {
 
 #[test]
 fn test_reassembly_queue_ssn_overflow_in_forward_tsn_for_ordered() -> Result<()> {
-    let mut rq = ReassemblyQueue::new(0);
+    let mut rq = ReassemblyQueue::new(0, 65536);
     let org_ppi = PayloadProtocolIdentifier::Binary;
 
     for stream_sequence_number in 0..u16::MAX {
@@ -1029,7 +1029,7 @@ fn test_reassembly_queue_ssn_overflow_in_forward_tsn_for_ordered() -> Result<()>
             user_data: Bytes::from_static(b"123"),
             ..Default::default()
         };
-        assert!(rq.push(chunk));
+        assert!(rq.push(chunk).expect("chunk to be queued"));
         assert!(rq.read().is_some());
     }
     rq.forward_tsn_for_ordered(u16::MAX);

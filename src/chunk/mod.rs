@@ -6,6 +6,7 @@ pub(crate) mod chunk_cookie_ack;
 pub(crate) mod chunk_cookie_echo;
 pub(crate) mod chunk_error;
 pub(crate) mod chunk_forward_tsn;
+pub(crate) mod chunk_i_forward_tsn;
 pub(crate) mod chunk_header;
 pub(crate) mod chunk_heartbeat;
 pub(crate) mod chunk_heartbeat_ack;

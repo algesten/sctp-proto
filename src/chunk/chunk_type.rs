@@ -22,6 +22,7 @@ pub(crate) const CT_CWR: ChunkType = ChunkType(13);
 pub(crate) const CT_SHUTDOWN_COMPLETE: ChunkType = ChunkType(14);
 pub(crate) const CT_RECONFIG: ChunkType = ChunkType(130);
 pub(crate) const CT_FORWARD_TSN: ChunkType = ChunkType(192);
+pub(crate) const CT_I_FORWARD_TSN: ChunkType = ChunkType(194);
 
 impl fmt::Display for ChunkType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -43,6 +44,7 @@ impl fmt::Display for ChunkType {
             CT_SHUTDOWN_COMPLETE => "SHUTDOWN-COMPLETE",
             CT_RECONFIG => "RECONFIG", // Re-configuration
             CT_FORWARD_TSN => "FORWARD-TSN",
+            CT_I_FORWARD_TSN => "I-FORWARD-TSN",
             _ => others.as_str(),
         };
         write!(f, "{}", s)
@@ -72,6 +74,7 @@ mod test {
             (CT_SHUTDOWN_COMPLETE, "SHUTDOWN-COMPLETE"),
             (CT_RECONFIG, "RECONFIG"),
             (CT_FORWARD_TSN, "FORWARD-TSN"),
+            (CT_I_FORWARD_TSN, "I-FORWARD-TSN"),
             (ChunkType(255), "Unknown ChunkType: 255"),
         ];
 

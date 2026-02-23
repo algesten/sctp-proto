@@ -5,7 +5,8 @@ use crate::association::{
 use crate::chunk::{
     chunk_abort::ChunkAbort, chunk_cookie_ack::ChunkCookieAck, chunk_cookie_echo::ChunkCookieEcho,
     chunk_error::ChunkError, chunk_forward_tsn::ChunkForwardTsn,
-    chunk_forward_tsn::ChunkForwardTsnStream, chunk_heartbeat::ChunkHeartbeat,
+    chunk_forward_tsn::ChunkForwardTsnStream, chunk_i_forward_tsn::ChunkIForwardTsn,
+    chunk_heartbeat::ChunkHeartbeat,
     chunk_heartbeat_ack::ChunkHeartbeatAck, chunk_init::ChunkInit, chunk_init::ChunkInitAck,
     chunk_payload_data::ChunkPayloadData, chunk_payload_data::PayloadProtocolIdentifier,
     chunk_reconfig::ChunkReconfig, chunk_selective_ack::ChunkSelectiveAck,
@@ -910,6 +911,8 @@ impl Association {
             self.handle_reconfig(c)?
         } else if let Some(c) = chunk_any.downcast_ref::<ChunkForwardTsn>() {
             self.handle_forward_tsn(c)?
+        } else if let Some(c) = chunk_any.downcast_ref::<ChunkIForwardTsn>() {
+            self.handle_i_forward_tsn(c)?
         } else if let Some(c) = chunk_any.downcast_ref::<ChunkShutdown>() {
             self.handle_shutdown(c)?
         } else if let Some(c) = chunk_any.downcast_ref::<ChunkShutdownAck>() {
@@ -1489,6 +1492,64 @@ impl Association {
         // Therefore, we need to broadcast this event to all existing streams for
         // unordered chunks.
         // See https://github.com/pion/sctp/issues/106
+        for s in self.streams.values_mut() {
+            s.handle_forward_tsn_for_unordered(c.new_cumulative_tsn);
+        }
+
+        self.handle_peer_last_tsn_and_acknowledgement(false)
+    }
+
+    /// Handle I-FORWARD-TSN (RFC 8260) — identical to FORWARD-TSN but with
+    /// 32-bit MID and explicit per-entry unordered flag.
+    fn handle_i_forward_tsn(&mut self, c: &ChunkIForwardTsn) -> Result<Vec<Packet>> {
+        trace!("[{}] I-FwdTSN: {}", self.side, c);
+
+        if !self.use_forward_tsn {
+            warn!("[{}] received I-FwdTSN but not enabled", self.side);
+            let cerr = ChunkError {
+                error_causes: vec![ErrorCauseUnrecognizedChunkType::default()],
+            };
+
+            let outbound = Packet {
+                common_header: CommonHeader {
+                    verification_tag: self.peer_verification_tag,
+                    source_port: self.source_port,
+                    destination_port: self.destination_port,
+                },
+                chunks: vec![Box::new(cerr)],
+            };
+            return Ok(vec![outbound]);
+        }
+
+        if sna32lte(c.new_cumulative_tsn, self.peer_last_tsn) {
+            trace!("[{}] sending ack on I-Forward TSN", self.side);
+            self.ack_state = AckState::Immediate;
+            self.timers.stop(Timer::Ack);
+            self.awake_write_loop();
+            return Ok(vec![]);
+        }
+
+        // Advance peer_last_tsn
+        while sna32lt(self.peer_last_tsn, c.new_cumulative_tsn) {
+            self.payload_queue.pop(self.peer_last_tsn + 1);
+            self.peer_last_tsn += 1;
+        }
+
+        // Handle per-stream entries using the explicit unordered flag
+        for forwarded in &c.streams {
+            if forwarded.unordered {
+                if let Some(s) = self.streams.get_mut(&forwarded.identifier) {
+                    s.handle_forward_tsn_for_unordered(c.new_cumulative_tsn);
+                }
+            } else {
+                // MID maps to SSN for ordered streams; truncate to u16
+                if let Some(s) = self.streams.get_mut(&forwarded.identifier) {
+                    s.handle_forward_tsn_for_ordered(forwarded.mid as u16);
+                }
+            }
+        }
+
+        // Broadcast to all unordered streams
         for s in self.streams.values_mut() {
             s.handle_forward_tsn_for_unordered(c.new_cumulative_tsn);
         }

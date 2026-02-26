@@ -2601,3 +2601,55 @@ fn test_association_shutdown_during_write() -> Result<()> {
 
     Ok(())
 }*/
+
+#[test]
+fn test_assoc_reset_duplicate_reconfig_request() -> Result<()> {
+    let si: u16 = 1;
+
+    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+
+    // Client initiates reset of stream 1
+    pair.client_stream(client_ch, si)?.stop()?;
+
+    // Drive client to generate the reconfig packet, which lands in server's inbound
+    pair.drive_client();
+
+    // Capture the raw packet bytes before the server processes them.
+    // These contain the ChunkReconfig with the ParamOutgoingResetRequest.
+    let captured_packets: Vec<_> = pair.server.inbound.iter().cloned().collect();
+
+    // Let the entire reset flow complete
+    pair.drive();
+
+    // Verify stream 1 is gone on the server
+    assert!(
+        pair.server_stream(server_ch, si).is_err(),
+        "stream 1 should be removed after reset"
+    );
+
+    // Server opens a new stream 1
+    let _ = pair
+        .server_conn_mut(server_ch)
+        .open_stream(si, PayloadProtocolIdentifier::Binary)?;
+    assert!(
+        pair.server_stream(server_ch, si).is_ok(),
+        "new stream 1 should exist"
+    );
+
+    // Inject the captured reconfig packets again (simulating retransmission)
+    for packet in captured_packets {
+        pair.server.inbound.push_back(packet);
+    }
+
+    // Process the injected packets
+    pair.drive();
+
+    // The new stream 1 must NOT be destroyed by the duplicate reconfig request
+    assert!(
+        pair.server_stream(server_ch, si).is_ok(),
+        "new stream 1 should NOT be destroyed by duplicate reconfig request"
+    );
+
+    Ok(())
+}

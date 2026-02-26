@@ -35,7 +35,7 @@ use crate::association::stream::RecvSendState;
 use bytes::Bytes;
 use log::{debug, error, trace, warn};
 use rand::random;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
@@ -155,6 +155,7 @@ pub struct Association {
     my_next_rsn: u32,
     reconfigs: FxHashMap<u32, ChunkReconfig>,
     reconfig_requests: FxHashMap<u32, ParamOutgoingResetRequest>,
+    reconfig_requests_seen: FxHashSet<u32>,
 
     // Non-RFC internal data
     remote_addr: SocketAddr,
@@ -243,6 +244,7 @@ impl Default for Association {
             my_next_rsn: 0,
             reconfigs: FxHashMap::default(),
             reconfig_requests: FxHashMap::default(),
+            reconfig_requests_seen: FxHashSet::default(),
 
             // Non-RFC internal data
             remote_addr: SocketAddr::from_str("0.0.0.0:0").unwrap(),
@@ -1604,6 +1606,19 @@ impl Association {
         reply: &mut Vec<Packet>,
     ) -> Result<()> {
         if let Some(p) = raw.as_any().downcast_ref::<ParamOutgoingResetRequest>() {
+            if !self.reconfig_requests_seen.insert(p.reconfig_request_sequence_number) {
+                // Retransmission of an already-seen request. Resend the response
+                // but do NOT reprocess stream resets (stream IDs may have been reused).
+                let packet = self.create_packet(vec![Box::new(ChunkReconfig {
+                    param_a: Some(Box::new(ParamReconfigResponse {
+                        reconfig_response_sequence_number: p.reconfig_request_sequence_number,
+                        result: ReconfigResult::SuccessPerformed,
+                    })),
+                    param_b: None,
+                })]);
+                reply.push(packet);
+                return Ok(());
+            }
             self.reconfig_requests
                 .insert(p.reconfig_request_sequence_number, p.clone());
             self.reset_streams_if_any(p, true, reply)?;

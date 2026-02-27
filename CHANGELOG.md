@@ -1,5 +1,5 @@
 # Unreleased
-
+  * Deduplicate incoming RE-CONFIG requests to prevent new stream destruction #30
   * Enforce receive-side max message size #27
 
 # 0.7.1

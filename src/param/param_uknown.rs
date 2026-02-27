@@ -1,5 +1,6 @@
-use std::any::Any;
-use std::fmt::{Debug, Display, Formatter};
+use alloc::boxed::Box;
+use core::any::Any;
+use core::fmt::{Debug, Display, Formatter};
 
 use bytes::{Bytes, BytesMut};
 
@@ -18,7 +19,7 @@ pub struct ParamUnknown {
 }
 
 impl Display for ParamUnknown {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
         write!(f, "ParamUnknown( {} {:?} )", self.header(), self.value)
     }
 }

@@ -1,4 +1,4 @@
-use std::fmt;
+use core::fmt;
 
 // chunkType is an enum for SCTP Chunk Type field
 // This field identifies the type of information contained in the
@@ -53,6 +53,9 @@ impl fmt::Display for ChunkType {
 
 #[cfg(test)]
 mod test {
+    use alloc::string::ToString;
+    use alloc::vec;
+
     use super::*;
 
     #[test]

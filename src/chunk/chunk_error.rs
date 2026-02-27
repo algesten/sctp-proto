@@ -1,5 +1,7 @@
 use super::{chunk_header::*, chunk_type::*, *};
 
+use alloc::string::ToString;
+
 ///Operation Error (ERROR) (9)
 ///
 ///An endpoint sends this chunk to its peer endpoint to notify it of

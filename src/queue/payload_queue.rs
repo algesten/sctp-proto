@@ -4,7 +4,7 @@ use crate::util::*;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 #[derive(Default, Debug)]
 pub(crate) struct PayloadQueue {

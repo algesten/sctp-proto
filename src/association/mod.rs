@@ -42,10 +42,10 @@ use bytes::Bytes;
 use core::net::{IpAddr, SocketAddr};
 use core::str::FromStr;
 use core::time::Duration;
+use hashbrown::HashMap;
 use log::{debug, error, trace, warn};
 use rand::random;
 use rustc_hash::FxHashMap;
-use std::collections::HashMap;
 use std::time::Instant;
 use thiserror::Error;
 

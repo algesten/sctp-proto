@@ -10,7 +10,7 @@ use core::{
     net::{IpAddr, SocketAddr},
     ops::{Index, IndexMut},
 };
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::time::Instant;
 
 use crate::association::Association;

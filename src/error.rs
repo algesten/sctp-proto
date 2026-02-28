@@ -188,6 +188,8 @@ pub enum Error {
     ErrInitAckNoCookie,
     #[error("there already exists a stream with identifier")]
     ErrStreamAlreadyExist,
+    #[error("stream ID has a pending RE-CONFIG and cannot be reused yet")]
+    ErrStreamResetPending,
     #[error("Failed to create a stream with identifier")]
     ErrStreamCreateFailed,
     #[error("unable to be popped from inflight queue TSN")]

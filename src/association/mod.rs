@@ -677,6 +677,10 @@ impl Association {
             return Err(Error::ErrStreamAlreadyExist);
         }
 
+        if self.has_pending_reset_for_stream(stream_identifier) {
+            return Err(Error::ErrStreamResetPending);
+        }
+
         if let Some(s) = self.create_stream(stream_identifier, false, default_payload_type) {
             Ok(s)
         } else {
@@ -751,6 +755,17 @@ impl Association {
     #[deprecated(note = "Use set_max_send_message_size instead")]
     pub(crate) fn set_max_message_size(&mut self, value: u32) {
         self.set_max_send_message_size(value)
+    }
+
+    /// Returns true if the given stream ID appears in any pending outgoing
+    /// RE-CONFIG that has not yet been acknowledged by the remote peer.
+    fn has_pending_reset_for_stream(&self, stream_id: StreamId) -> bool {
+        self.reconfigs.values().any(|c| {
+            c.param_a
+                .as_ref()
+                .and_then(|p| p.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+                .is_some_and(|p| p.stream_identifiers.contains(&stream_id))
+        })
     }
 
     /// unregister_stream un-registers a stream from the association

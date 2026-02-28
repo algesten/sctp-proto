@@ -2653,3 +2653,54 @@ fn test_assoc_reset_duplicate_reconfig_request() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn test_assoc_open_stream_rejects_pending_reset_id() -> Result<()> {
+    let si: u16 = 1;
+
+    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+
+    // SERVER initiates reset of stream 1. When the client processes the server's
+    // incoming RE-CONFIG, it removes stream 1 from self.streams and generates its
+    // own outgoing RE-CONFIG (stored in self.reconfigs) awaiting acknowledgment.
+    pair.server_stream(server_ch, si)?.stop()?;
+
+    // Drive server to generate and deliver the RE-CONFIG to the client's inbound
+    pair.drive_server();
+
+    // Drive client to process the server's RE-CONFIG. This removes stream 1 from
+    // the client's stream table and creates a pending outgoing RE-CONFIG.
+    pair.drive_client();
+
+    // Client's stream 1 is removed, but the outgoing RE-CONFIG is still pending.
+    // open_stream should reject this stream ID.
+    assert!(
+        pair.client_stream(client_ch, si).is_err(),
+        "stream 1 should be removed from client"
+    );
+    match pair
+        .client_conn_mut(client_ch)
+        .open_stream(si, PayloadProtocolIdentifier::Binary)
+    {
+        Err(Error::ErrStreamResetPending) => {}
+        other => panic!(
+            "expected ErrStreamResetPending, got {:?}",
+            other.err()
+        ),
+    }
+
+    // Let the full RE-CONFIG exchange complete
+    pair.drive();
+
+    // Now the RE-CONFIG is acknowledged, stream 1 should be available for reuse
+    let _ = pair
+        .client_conn_mut(client_ch)
+        .open_stream(si, PayloadProtocolIdentifier::Binary)?;
+    assert!(
+        pair.client_stream(client_ch, si).is_ok(),
+        "stream 1 should be available after RE-CONFIG is acknowledged"
+    );
+
+    Ok(())
+}

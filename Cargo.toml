@@ -11,7 +11,7 @@ repository = "https://github.com/algesten/sctp-proto"
 keywords = ["sctp"]
 categories = ["network-programming", "asynchronous"]
 
-rust-version = "1.76.0"
+rust-version = "1.85.0"
 
 [dependencies]
 bytes = "1.5.0"
@@ -20,8 +20,7 @@ rustc-hash = "2.1.1"
 slab = "0.4.9"
 thiserror = "2.0.18"
 log = "0.4.21"
-# Pinned for MSRV 1.76.0
-crc = "=3.2.1"
+crc = "3.4"
 
 [dev-dependencies]
 assert_matches = "1.5.0"

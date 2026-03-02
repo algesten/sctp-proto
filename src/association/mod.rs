@@ -476,7 +476,6 @@ impl Association {
                 continue;
             }
             self.timers.set(timer, None);
-            //trace!("{:?} timeout", timer);
 
             if timer == Timer::Ack {
                 self.on_ack_timeout();
@@ -2236,6 +2235,15 @@ impl Association {
             }
         }
 
+        // Ensure the Reconfig timer is running whenever reconfigs are pending.
+        // Reconfigs can be inserted via reset_streams_if_any (incoming reset
+        // response path) without going through the sis_to_reset / retransmit
+        // block above.
+        if !self.reconfigs.is_empty() {
+            self.timers
+                .restart_if_stale(Timer::Reconfig, now, self.rto_mgr.get_rto());
+        }
+
         raw_packets
     }
 
@@ -2954,6 +2962,15 @@ impl Association {
                 //  * ICE would fail if the connectivity is lost
                 //  * WebRTC spec is not clear how this incident should be reported to ULP
                 error!("[{}] retransmission failure: T3-rtx (DATA)", self.side);
+            }
+
+            Timer::Reconfig => {
+                error!(
+                    "[{}] retransmission failure: Reconfig (clearing {} pending reconfigs)",
+                    self.side,
+                    self.reconfigs.len()
+                );
+                self.reconfigs.clear();
             }
 
             _ => {}

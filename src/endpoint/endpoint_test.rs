@@ -2684,10 +2684,7 @@ fn test_assoc_open_stream_rejects_pending_reset_id() -> Result<()> {
         .open_stream(si, PayloadProtocolIdentifier::Binary)
     {
         Err(Error::ErrStreamResetPending) => {}
-        other => panic!(
-            "expected ErrStreamResetPending, got {:?}",
-            other.err()
-        ),
+        other => panic!("expected ErrStreamResetPending, got {:?}", other.err()),
     }
 
     // Let the full RE-CONFIG exchange complete

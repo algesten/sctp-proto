@@ -1606,7 +1606,10 @@ impl Association {
         reply: &mut Vec<Packet>,
     ) -> Result<()> {
         if let Some(p) = raw.as_any().downcast_ref::<ParamOutgoingResetRequest>() {
-            if !self.reconfig_requests_seen.insert(p.reconfig_request_sequence_number) {
+            if !self
+                .reconfig_requests_seen
+                .insert(p.reconfig_request_sequence_number)
+            {
                 // Retransmission of an already-seen request. Resend the response
                 // but do NOT reprocess stream resets (stream IDs may have been reused).
                 let packet = self.create_packet(vec![Box::new(ChunkReconfig {

@@ -2601,3 +2601,158 @@ fn test_association_shutdown_during_write() -> Result<()> {
 
     Ok(())
 }*/
+
+#[test]
+fn test_assoc_reset_duplicate_reconfig_request() -> Result<()> {
+    let si: u16 = 1;
+
+    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+
+    // Client initiates reset of stream 1
+    pair.client_stream(client_ch, si)?.stop()?;
+
+    // Drive client to generate the reconfig packet, which lands in server's inbound
+    pair.drive_client();
+
+    // Capture the raw packet bytes before the server processes them.
+    // These contain the ChunkReconfig with the ParamOutgoingResetRequest.
+    let captured_packets: Vec<_> = pair.server.inbound.iter().cloned().collect();
+
+    // Let the entire reset flow complete
+    pair.drive();
+
+    // Verify stream 1 is gone on the server
+    assert!(
+        pair.server_stream(server_ch, si).is_err(),
+        "stream 1 should be removed after reset"
+    );
+
+    // Server opens a new stream 1
+    let _ = pair
+        .server_conn_mut(server_ch)
+        .open_stream(si, PayloadProtocolIdentifier::Binary)?;
+    assert!(
+        pair.server_stream(server_ch, si).is_ok(),
+        "new stream 1 should exist"
+    );
+
+    // Inject the captured reconfig packets again (simulating retransmission)
+    for packet in captured_packets {
+        pair.server.inbound.push_back(packet);
+    }
+
+    // Process the injected packets
+    pair.drive();
+
+    // The new stream 1 must NOT be destroyed by the duplicate reconfig request
+    assert!(
+        pair.server_stream(server_ch, si).is_ok(),
+        "new stream 1 should NOT be destroyed by duplicate reconfig request"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_assoc_open_stream_rejects_pending_reset_id() -> Result<()> {
+    let si: u16 = 1;
+
+    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+
+    // SERVER initiates reset of stream 1. When the client processes the server's
+    // incoming RE-CONFIG, it removes stream 1 from self.streams and generates its
+    // own outgoing RE-CONFIG (stored in self.reconfigs) awaiting acknowledgment.
+    pair.server_stream(server_ch, si)?.stop()?;
+
+    // Drive server to generate and deliver the RE-CONFIG to the client's inbound
+    pair.drive_server();
+
+    // Drive client to process the server's RE-CONFIG. This removes stream 1 from
+    // the client's stream table and creates a pending outgoing RE-CONFIG.
+    pair.drive_client();
+
+    // Client's stream 1 is removed, but the outgoing RE-CONFIG is still pending.
+    // open_stream should reject this stream ID.
+    assert!(
+        pair.client_stream(client_ch, si).is_err(),
+        "stream 1 should be removed from client"
+    );
+    match pair
+        .client_conn_mut(client_ch)
+        .open_stream(si, PayloadProtocolIdentifier::Binary)
+    {
+        Err(Error::ErrStreamResetPending) => {}
+        other => panic!("expected ErrStreamResetPending, got {:?}", other.err()),
+    }
+
+    // Let the full RE-CONFIG exchange complete
+    pair.drive();
+
+    // Now the RE-CONFIG is acknowledged, stream 1 should be available for reuse
+    let _ = pair
+        .client_conn_mut(client_ch)
+        .open_stream(si, PayloadProtocolIdentifier::Binary)?;
+    assert!(
+        pair.client_stream(client_ch, si).is_ok(),
+        "stream 1 should be available after RE-CONFIG is acknowledged"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_assoc_reconfig_failure_clears_pending() -> Result<()> {
+    let si: u16 = 1;
+
+    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+
+    // SERVER initiates reset of stream 1. When the client processes the incoming
+    // RE-CONFIG it removes stream 1 from self.streams and generates its own
+    // outgoing RE-CONFIG (stored in self.reconfigs).
+    pair.server_stream(server_ch, si)?.stop()?;
+
+    // Drive server to send the RE-CONFIG to client
+    pair.drive_server();
+
+    // Drive client to process the incoming RE-CONFIG
+    pair.drive_client();
+
+    // Drop any packets the client sent so the server never ACKs the client's
+    // outgoing RE-CONFIG.
+    pair.server.inbound.clear();
+
+    // Verify open_stream is blocked by the pending outgoing RE-CONFIG
+    match pair
+        .client_conn_mut(client_ch)
+        .open_stream(si, PayloadProtocolIdentifier::Binary)
+    {
+        Err(Error::ErrStreamResetPending) => {}
+        Err(e) => panic!("expected ErrStreamResetPending, got Err({:?})", e),
+        Ok(_) => panic!("expected ErrStreamResetPending, got Ok"),
+    }
+
+    // Advance time through MAX_INIT_RETRANS (8) retransmissions + 1 to trigger
+    // failure. Each iteration jumps 61 seconds (> RTO_MAX of 60s) to guarantee
+    // the Reconfig timer fires every time. We discard all outbound packets so
+    // the Reconfig is never acknowledged.
+    for _ in 0..10 {
+        pair.time += Duration::from_secs(61);
+        pair.drive_client();
+        pair.server.inbound.clear();
+    }
+
+    // After retransmission failure, reconfigs should be cleared and the stream
+    // ID should be available for reuse.
+    let _ = pair
+        .client_conn_mut(client_ch)
+        .open_stream(si, PayloadProtocolIdentifier::Binary)?;
+    assert!(
+        pair.client_stream(client_ch, si).is_ok(),
+        "stream 1 should be available after reconfig retransmission failure"
+    );
+
+    Ok(())
+}

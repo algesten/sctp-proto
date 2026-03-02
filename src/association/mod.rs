@@ -35,7 +35,7 @@ use crate::association::stream::RecvSendState;
 use bytes::Bytes;
 use log::{debug, error, trace, warn};
 use rand::random;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
@@ -155,6 +155,7 @@ pub struct Association {
     my_next_rsn: u32,
     reconfigs: FxHashMap<u32, ChunkReconfig>,
     reconfig_requests: FxHashMap<u32, ParamOutgoingResetRequest>,
+    reconfig_requests_seen: FxHashSet<u32>,
 
     // Non-RFC internal data
     remote_addr: SocketAddr,
@@ -243,6 +244,7 @@ impl Default for Association {
             my_next_rsn: 0,
             reconfigs: FxHashMap::default(),
             reconfig_requests: FxHashMap::default(),
+            reconfig_requests_seen: FxHashSet::default(),
 
             // Non-RFC internal data
             remote_addr: SocketAddr::from_str("0.0.0.0:0").unwrap(),
@@ -474,7 +476,6 @@ impl Association {
                 continue;
             }
             self.timers.set(timer, None);
-            //trace!("{:?} timeout", timer);
 
             if timer == Timer::Ack {
                 self.on_ack_timeout();
@@ -675,6 +676,10 @@ impl Association {
             return Err(Error::ErrStreamAlreadyExist);
         }
 
+        if self.has_pending_reset_for_stream(stream_identifier) {
+            return Err(Error::ErrStreamResetPending);
+        }
+
         if let Some(s) = self.create_stream(stream_identifier, false, default_payload_type) {
             Ok(s)
         } else {
@@ -749,6 +754,17 @@ impl Association {
     #[deprecated(note = "Use set_max_send_message_size instead")]
     pub(crate) fn set_max_message_size(&mut self, value: u32) {
         self.set_max_send_message_size(value)
+    }
+
+    /// Returns true if the given stream ID appears in any pending outgoing
+    /// RE-CONFIG that has not yet been acknowledged by the remote peer.
+    fn has_pending_reset_for_stream(&self, stream_id: StreamId) -> bool {
+        self.reconfigs.values().any(|c| {
+            c.param_a
+                .as_ref()
+                .and_then(|p| p.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+                .is_some_and(|p| p.stream_identifiers.contains(&stream_id))
+        })
     }
 
     /// unregister_stream un-registers a stream from the association
@@ -1604,6 +1620,22 @@ impl Association {
         reply: &mut Vec<Packet>,
     ) -> Result<()> {
         if let Some(p) = raw.as_any().downcast_ref::<ParamOutgoingResetRequest>() {
+            if !self
+                .reconfig_requests_seen
+                .insert(p.reconfig_request_sequence_number)
+            {
+                // Retransmission of an already-seen request. Resend the response
+                // but do NOT reprocess stream resets (stream IDs may have been reused).
+                let packet = self.create_packet(vec![Box::new(ChunkReconfig {
+                    param_a: Some(Box::new(ParamReconfigResponse {
+                        reconfig_response_sequence_number: p.reconfig_request_sequence_number,
+                        result: ReconfigResult::SuccessPerformed,
+                    })),
+                    param_b: None,
+                })]);
+                reply.push(packet);
+                return Ok(());
+            }
             self.reconfig_requests
                 .insert(p.reconfig_request_sequence_number, p.clone());
             self.reset_streams_if_any(p, true, reply)?;
@@ -2201,6 +2233,15 @@ impl Association {
                 self.timers
                     .start(Timer::Reconfig, now, self.rto_mgr.get_rto());
             }
+        }
+
+        // Ensure the Reconfig timer is running whenever reconfigs are pending.
+        // Reconfigs can be inserted via reset_streams_if_any (incoming reset
+        // response path) without going through the sis_to_reset / retransmit
+        // block above.
+        if !self.reconfigs.is_empty() {
+            self.timers
+                .restart_if_stale(Timer::Reconfig, now, self.rto_mgr.get_rto());
         }
 
         raw_packets
@@ -2921,6 +2962,15 @@ impl Association {
                 //  * ICE would fail if the connectivity is lost
                 //  * WebRTC spec is not clear how this incident should be reported to ULP
                 error!("[{}] retransmission failure: T3-rtx (DATA)", self.side);
+            }
+
+            Timer::Reconfig => {
+                error!(
+                    "[{}] retransmission failure: Reconfig (clearing {} pending reconfigs)",
+                    self.side,
+                    self.reconfigs.len()
+                );
+                self.reconfigs.clear();
             }
 
             _ => {}

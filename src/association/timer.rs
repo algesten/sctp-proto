@@ -61,7 +61,7 @@ impl TimerTable {
                 max_init_retransmits, //T1Cookie
                 None,                 //T2Shutdown (unlimited)
                 max_data_retransmits, //T3RTX
-                None,                 //Reconfig (unlimited)
+                max_init_retransmits, //Reconfig
                 None,                 //Ack (unlimited)
             ],
             rto_max,

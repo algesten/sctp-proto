@@ -1567,7 +1567,11 @@ impl Association {
             let rst_reqs: Vec<ParamOutgoingResetRequest> =
                 self.reconfig_requests.values().cloned().collect();
             for rst_req in rst_reqs {
+                let seq = rst_req.reconfig_request_sequence_number;
                 self.reset_streams_if_any(&rst_req, false, &mut reply)?;
+                if !self.reconfig_requests.contains_key(&seq) {
+                    self.max_completed_reconfig_rsn = Some(seq);
+                }
             }
         }
 

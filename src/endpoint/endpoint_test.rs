@@ -2666,12 +2666,10 @@ fn test_assoc_reset_inprogress_reconfig_retransmission() -> Result<()> {
 
     // Write data so my_next_tsn advances on the client; the RECONFIG
     // sender_last_tsn will include this TSN.
-    let _ = pair
-        .client_stream(client_ch, si)?
-        .write_sctp(
-            &Bytes::from_static(b"payload"),
-            PayloadProtocolIdentifier::Binary,
-        )?;
+    let _ = pair.client_stream(client_ch, si)?.write_sctp(
+        &Bytes::from_static(b"payload"),
+        PayloadProtocolIdentifier::Binary,
+    )?;
 
     // Drive client to generate the DATA packet(s).
     pair.drive_client();

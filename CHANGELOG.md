@@ -1,5 +1,6 @@
 # Unreleased
 
+  * MSRV 1.85, Edition 2024, bump deps #38
   * Enforce receive-side max message size #27
 
 # 0.7.1

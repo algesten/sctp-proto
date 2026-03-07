@@ -6,6 +6,7 @@ use crate::chunk::chunk_error::ChunkError;
 use crate::chunk::chunk_forward_tsn::ChunkForwardTsn;
 use crate::chunk::chunk_header::*;
 use crate::chunk::chunk_heartbeat::ChunkHeartbeat;
+use crate::chunk::chunk_i_forward_tsn::ChunkIForwardTsn;
 use crate::chunk::chunk_init::ChunkInit;
 use crate::chunk::chunk_payload_data::ChunkPayloadData;
 use crate::chunk::chunk_reconfig::ChunkReconfig;
@@ -156,6 +157,9 @@ impl PartialDecode {
                 CT_FORWARD_TSN => {
                     Box::new(ChunkForwardTsn::unmarshal(&self.remaining.slice(offset..))?)
                 }
+                CT_I_FORWARD_TSN => Box::new(ChunkIForwardTsn::unmarshal(
+                    &self.remaining.slice(offset..),
+                )?),
                 CT_ERROR => Box::new(ChunkError::unmarshal(&self.remaining.slice(offset..))?),
                 CT_SHUTDOWN => Box::new(ChunkShutdown::unmarshal(&self.remaining.slice(offset..))?),
                 CT_SHUTDOWN_ACK => Box::new(ChunkShutdownAck::unmarshal(
@@ -245,6 +249,7 @@ impl Packet {
                 CT_SACK => Box::new(ChunkSelectiveAck::unmarshal(&raw.slice(offset..))?),
                 CT_RECONFIG => Box::new(ChunkReconfig::unmarshal(&raw.slice(offset..))?),
                 CT_FORWARD_TSN => Box::new(ChunkForwardTsn::unmarshal(&raw.slice(offset..))?),
+                CT_I_FORWARD_TSN => Box::new(ChunkIForwardTsn::unmarshal(&raw.slice(offset..))?),
                 CT_ERROR => Box::new(ChunkError::unmarshal(&raw.slice(offset..))?),
                 CT_SHUTDOWN => Box::new(ChunkShutdown::unmarshal(&raw.slice(offset..))?),
                 CT_SHUTDOWN_ACK => Box::new(ChunkShutdownAck::unmarshal(&raw.slice(offset..))?),

@@ -1,5 +1,6 @@
 # Unreleased
-
+  
+  * Add I-FORWARD-TSN (RFC 8260) chunk support #29
   * MSRV 1.85, Edition 2024, bump deps #38
   * Enforce receive-side max message size #27
 

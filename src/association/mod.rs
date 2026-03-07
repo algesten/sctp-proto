@@ -1607,11 +1607,15 @@ impl Association {
     ) -> Result<()> {
         if let Some(p) = raw.as_any().downcast_ref::<ParamOutgoingResetRequest>() {
             let seq = p.reconfig_request_sequence_number;
-            if self
-                .max_completed_reconfig_rsn
-                .map_or(false, |w| sna32lte(seq, w))
+            // Detect retransmission of a completed request. An InProgress request
+            // is still in reconfig_requests, so we must let those through for
+            // re-evaluation (the TSN may have advanced).
+            if !self.reconfig_requests.contains_key(&seq)
+                && self
+                    .max_completed_reconfig_rsn
+                    .map_or(false, |w| sna32lte(seq, w))
             {
-                // Retransmission of an already-seen request. Resend the response
+                // Retransmission of an already-completed request. Resend the response
                 // but do NOT reprocess stream resets (stream IDs may have been reused).
                 let packet = self.create_packet(vec![Box::new(ChunkReconfig {
                     param_a: Some(Box::new(ParamReconfigResponse {
@@ -1623,10 +1627,14 @@ impl Association {
                 reply.push(packet);
                 return Ok(());
             }
-            self.max_completed_reconfig_rsn = Some(seq);
             self.reconfig_requests
                 .insert(p.reconfig_request_sequence_number, p.clone());
             self.reset_streams_if_any(p, true, reply)?;
+            // Update watermark only after successful completion (request
+            // removed from reconfig_requests by reset_streams_if_any).
+            if !self.reconfig_requests.contains_key(&seq) {
+                self.max_completed_reconfig_rsn = Some(seq);
+            }
             Ok(())
         } else if let Some(p) = raw.as_any().downcast_ref::<ParamReconfigResponse>() {
             self.reconfigs.remove(&p.reconfig_response_sequence_number);

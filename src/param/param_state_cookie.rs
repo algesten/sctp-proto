@@ -1,6 +1,6 @@
 use super::{param_header::*, param_type::*, *};
 
-use rand::RngExt;
+use rand::Rng;
 
 #[derive(Default, Debug, Clone, PartialEq)]
 pub(crate) struct ParamStateCookie {

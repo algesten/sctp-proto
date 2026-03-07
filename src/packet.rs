@@ -4,9 +4,9 @@ use crate::chunk::chunk_cookie_ack::ChunkCookieAck;
 use crate::chunk::chunk_cookie_echo::ChunkCookieEcho;
 use crate::chunk::chunk_error::ChunkError;
 use crate::chunk::chunk_forward_tsn::ChunkForwardTsn;
-use crate::chunk::chunk_i_forward_tsn::ChunkIForwardTsn;
 use crate::chunk::chunk_header::*;
 use crate::chunk::chunk_heartbeat::ChunkHeartbeat;
+use crate::chunk::chunk_i_forward_tsn::ChunkIForwardTsn;
 use crate::chunk::chunk_init::ChunkInit;
 use crate::chunk::chunk_payload_data::ChunkPayloadData;
 use crate::chunk::chunk_reconfig::ChunkReconfig;
@@ -157,9 +157,9 @@ impl PartialDecode {
                 CT_FORWARD_TSN => {
                     Box::new(ChunkForwardTsn::unmarshal(&self.remaining.slice(offset..))?)
                 }
-                CT_I_FORWARD_TSN => {
-                    Box::new(ChunkIForwardTsn::unmarshal(&self.remaining.slice(offset..))?)
-                }
+                CT_I_FORWARD_TSN => Box::new(ChunkIForwardTsn::unmarshal(
+                    &self.remaining.slice(offset..),
+                )?),
                 CT_ERROR => Box::new(ChunkError::unmarshal(&self.remaining.slice(offset..))?),
                 CT_SHUTDOWN => Box::new(ChunkShutdown::unmarshal(&self.remaining.slice(offset..))?),
                 CT_SHUTDOWN_ACK => Box::new(ChunkShutdownAck::unmarshal(

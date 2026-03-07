@@ -3,33 +3,33 @@ use crate::association::{
     stats::AssociationStats,
 };
 use crate::chunk::{
-    chunk_abort::ChunkAbort, chunk_cookie_ack::ChunkCookieAck, chunk_cookie_echo::ChunkCookieEcho,
-    chunk_error::ChunkError, chunk_forward_tsn::ChunkForwardTsn,
-    chunk_forward_tsn::ChunkForwardTsnStream, chunk_heartbeat::ChunkHeartbeat,
-    chunk_heartbeat_ack::ChunkHeartbeatAck, chunk_init::ChunkInit, chunk_init::ChunkInitAck,
-    chunk_payload_data::ChunkPayloadData, chunk_payload_data::PayloadProtocolIdentifier,
-    chunk_reconfig::ChunkReconfig, chunk_selective_ack::ChunkSelectiveAck,
-    chunk_shutdown::ChunkShutdown, chunk_shutdown_ack::ChunkShutdownAck,
-    chunk_shutdown_complete::ChunkShutdownComplete, chunk_type::CT_FORWARD_TSN, Chunk,
-    ErrorCauseUnrecognizedChunkType, USER_INITIATED_ABORT,
+    Chunk, ErrorCauseUnrecognizedChunkType, USER_INITIATED_ABORT, chunk_abort::ChunkAbort,
+    chunk_cookie_ack::ChunkCookieAck, chunk_cookie_echo::ChunkCookieEcho, chunk_error::ChunkError,
+    chunk_forward_tsn::ChunkForwardTsn, chunk_forward_tsn::ChunkForwardTsnStream,
+    chunk_heartbeat::ChunkHeartbeat, chunk_heartbeat_ack::ChunkHeartbeatAck, chunk_init::ChunkInit,
+    chunk_init::ChunkInitAck, chunk_payload_data::ChunkPayloadData,
+    chunk_payload_data::PayloadProtocolIdentifier, chunk_reconfig::ChunkReconfig,
+    chunk_selective_ack::ChunkSelectiveAck, chunk_shutdown::ChunkShutdown,
+    chunk_shutdown_ack::ChunkShutdownAck, chunk_shutdown_complete::ChunkShutdownComplete,
+    chunk_type::CT_FORWARD_TSN,
 };
-use crate::config::{ServerConfig, TransportConfig, COMMON_HEADER_SIZE, DATA_CHUNK_HEADER_SIZE};
+use crate::config::{COMMON_HEADER_SIZE, DATA_CHUNK_HEADER_SIZE, ServerConfig, TransportConfig};
 use crate::error::{Error, Result};
 use crate::packet::{CommonHeader, Packet};
 use crate::param::{
+    Param,
     param_heartbeat_info::ParamHeartbeatInfo,
     param_outgoing_reset_request::ParamOutgoingResetRequest,
     param_reconfig_response::{ParamReconfigResponse, ReconfigResult},
     param_state_cookie::ParamStateCookie,
     param_supported_extensions::ParamSupportedExtensions,
-    Param,
 };
 use crate::queue::{payload_queue::PayloadQueue, pending_queue::PendingQueue};
 use crate::shared::{AssociationEventInner, AssociationId, EndpointEvent, EndpointEventInner};
 use crate::util::{sna16lt, sna32gt, sna32gte, sna32lt, sna32lte};
 use crate::{AssociationEvent, Payload, Side, Transmit};
 use stream::{ReliabilityType, Stream, StreamEvent, StreamId, StreamState};
-use timer::{RtoManager, Timer, TimerTable, ACK_INTERVAL};
+use timer::{ACK_INTERVAL, RtoManager, Timer, TimerTable};
 
 use crate::association::stream::RecvSendState;
 use bytes::Bytes;
@@ -1239,7 +1239,10 @@ impl Association {
                     // Receive buffer is full
                     if let Some(last_tsn) = self.payload_queue.get_last_tsn_received() {
                         if sna32lt(d.tsn, *last_tsn) {
-                            debug!("[{}] receive buffer full, but accepted as this is a missing chunk with tsn={} ssn={}", self.side, d.tsn, d.stream_sequence_number);
+                            debug!(
+                                "[{}] receive buffer full, but accepted as this is a missing chunk with tsn={} ssn={}",
+                                self.side, d.tsn, d.stream_sequence_number
+                            );
                             stream_handle_data = true;
                         }
                     } else {
@@ -1323,9 +1326,7 @@ impl Association {
         if sna32lt(self.cumulative_tsn_ack_point, d.cumulative_tsn_ack) {
             trace!(
                 "[{}] SACK: cumTSN advanced: {} -> {}",
-                self.side,
-                self.cumulative_tsn_ack_point,
-                d.cumulative_tsn_ack
+                self.side, self.cumulative_tsn_ack_point, d.cumulative_tsn_ack
             );
 
             self.cumulative_tsn_ack_point = d.cumulative_tsn_ack;
@@ -1447,9 +1448,7 @@ impl Association {
 
         trace!(
             "[{}] should send ack? newCumTSN={} peer_last_tsn={}",
-            self.side,
-            c.new_cumulative_tsn,
-            self.peer_last_tsn
+            self.side, c.new_cumulative_tsn, self.peer_last_tsn
         );
         if sna32lte(c.new_cumulative_tsn, self.peer_last_tsn) {
             trace!("[{}] sending ack on Forward TSN", self.side);
@@ -1782,13 +1781,10 @@ impl Association {
             //      path MTU.
             if !self.in_fast_recovery && !self.pending_queue.is_empty() {
                 self.cwnd += std::cmp::min(total_bytes_acked as u32, self.cwnd); // TCP way
-                                                                                 // self.cwnd += min32(uint32(total_bytes_acked), self.mtu) // SCTP way (slow)
+                // self.cwnd += min32(uint32(total_bytes_acked), self.mtu) // SCTP way (slow)
                 trace!(
                     "[{}] updated cwnd={} ssthresh={} acked={} (SS)",
-                    self.side,
-                    self.cwnd,
-                    self.ssthresh,
-                    total_bytes_acked
+                    self.side, self.cwnd, self.ssthresh, total_bytes_acked
                 );
             } else {
                 trace!(
@@ -1820,10 +1816,7 @@ impl Association {
                 self.cwnd += self.mtu;
                 trace!(
                     "[{}] updated cwnd={} ssthresh={} acked={} (CA)",
-                    self.side,
-                    self.cwnd,
-                    self.ssthresh,
-                    total_bytes_acked
+                    self.side, self.cwnd, self.ssthresh, total_bytes_acked
                 );
             }
         }
@@ -2259,10 +2252,7 @@ impl Association {
                     to_fast_retrans.push(Box::new(c.clone()));
                     trace!(
                         "[{}] fast-retransmit: tsn={} sent={} htna={}",
-                        self.side,
-                        c.tsn,
-                        c.nsent,
-                        self.fast_recover_exit_point
+                        self.side, c.tsn, c.nsent, self.fast_recover_exit_point
                     );
                 }
                 i += 1;
@@ -2421,10 +2411,7 @@ impl Association {
 
                 trace!(
                     "[{}] retransmitting tsn={} ssn={} sent={}",
-                    self.side,
-                    c.tsn,
-                    c.stream_sequence_number,
-                    c.nsent
+                    self.side, c.tsn, c.stream_sequence_number, c.nsent
                 );
 
                 chunks.push(c.clone());
@@ -2586,10 +2573,7 @@ impl Association {
                     c.set_abandoned(true);
                     trace!(
                         "[{}] marked as abandoned: tsn={} ppi={} (remix: {})",
-                        side,
-                        c.tsn,
-                        c.payload_type,
-                        c.nsent
+                        side, c.tsn, c.payload_type, c.nsent
                     );
                 }
             } else if reliability_type == ReliabilityType::Timed {
@@ -2599,10 +2583,7 @@ impl Association {
                         c.set_abandoned(true);
                         trace!(
                             "[{}] marked as abandoned: tsn={} ppi={} (timed: {:?})",
-                            side,
-                            c.tsn,
-                            c.payload_type,
-                            elapsed
+                            side, c.tsn, c.payload_type, elapsed
                         );
                     }
                 } else {
@@ -2661,10 +2642,7 @@ impl Association {
         }
         trace!(
             "[{}] building fwd_tsn: newCumulativeTSN={} cumTSN={} - {}",
-            self.side,
-            fwd_tsn.new_cumulative_tsn,
-            self.cumulative_tsn_ack_point,
-            stream_str
+            self.side, fwd_tsn.new_cumulative_tsn, self.cumulative_tsn_ack_point, stream_str
         );
 
         fwd_tsn
@@ -2776,8 +2754,7 @@ impl Association {
     fn on_ack_timeout(&mut self) {
         trace!(
             "[{}] ack timed out (ack_state: {})",
-            self.side,
-            self.ack_state
+            self.side, self.ack_state
         );
         self.stats.inc_ack_timeouts();
         self.ack_state = AckState::Immediate;

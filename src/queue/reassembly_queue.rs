@@ -1,7 +1,7 @@
+use crate::StreamId;
 use crate::chunk::chunk_payload_data::{ChunkPayloadData, PayloadProtocolIdentifier};
 use crate::error::{Error, Result};
 use crate::util::*;
-use crate::StreamId;
 
 use bytes::{Bytes, BytesMut};
 use std::cmp::Ordering;

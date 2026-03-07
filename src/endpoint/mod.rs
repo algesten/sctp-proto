@@ -22,7 +22,7 @@ use crate::{EcnCodepoint, Payload, Transmit};
 
 use bytes::Bytes;
 use log::{debug, trace};
-use rand::{rngs::StdRng, SeedableRng};
+use rand::{SeedableRng, rngs::StdRng};
 use rustc_hash::FxHashMap;
 use slab::Slab;
 use thiserror::Error;

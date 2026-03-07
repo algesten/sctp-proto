@@ -1,3 +1,4 @@
+use crate::chunk::Chunk;
 use crate::chunk::chunk_abort::ChunkAbort;
 use crate::chunk::chunk_cookie_ack::ChunkCookieAck;
 use crate::chunk::chunk_cookie_echo::ChunkCookieEcho;
@@ -13,7 +14,6 @@ use crate::chunk::chunk_shutdown::ChunkShutdown;
 use crate::chunk::chunk_shutdown_ack::ChunkShutdownAck;
 use crate::chunk::chunk_shutdown_complete::ChunkShutdownComplete;
 use crate::chunk::chunk_type::*;
-use crate::chunk::Chunk;
 use crate::error::{Error, Result};
 use crate::util::*;
 
@@ -411,7 +411,11 @@ mod test {
         ]);
         let pkt = Packet::unmarshal(&header_only)?;
         let header_only_marshaled = pkt.marshal()?;
-        assert_eq!(header_only, header_only_marshaled, "Unmarshal/Marshaled header only packet did not match \nheaderOnly: {:?} \nheader_only_marshaled {:?}", header_only, header_only_marshaled);
+        assert_eq!(
+            header_only, header_only_marshaled,
+            "Unmarshal/Marshaled header only packet did not match \nheaderOnly: {:?} \nheader_only_marshaled {:?}",
+            header_only, header_only_marshaled
+        );
 
         Ok(())
     }

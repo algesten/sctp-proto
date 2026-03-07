@@ -1,5 +1,5 @@
-use crate::association::state::AssociationState;
 use crate::association::Association;
+use crate::association::state::AssociationState;
 use crate::chunk::chunk_payload_data::{ChunkPayloadData, PayloadProtocolIdentifier};
 use crate::error::{Error, Result};
 use crate::queue::reassembly_queue::{Chunks, ReassemblyQueue};
@@ -539,10 +539,7 @@ impl StreamState {
 
         trace!(
             "[{}] bufferedAmount = {}, from_amount = {}, buffered_amount_low = {}",
-            self.side,
-            new_amount,
-            from_amount,
-            buffered_amount_low,
+            self.side, new_amount, from_amount, buffered_amount_low,
         );
 
         from_amount > buffered_amount_low && new_amount <= buffered_amount_low

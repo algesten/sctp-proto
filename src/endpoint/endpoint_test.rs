@@ -2653,3 +2653,92 @@ fn test_assoc_reset_duplicate_reconfig_request() -> Result<()> {
 
     Ok(())
 }
+
+/// Verify that a retransmission of an InProgress RE-CONFIG request is
+/// re-evaluated (not falsely deduplicated) so the reset completes once
+/// the outstanding TSN is finally received.
+#[test]
+fn test_assoc_reset_inprogress_reconfig_retransmission() -> Result<()> {
+    let si: u16 = 1;
+
+    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+
+    // Write data so my_next_tsn advances on the client; the RECONFIG
+    // sender_last_tsn will include this TSN.
+    let _ = pair
+        .client_stream(client_ch, si)?
+        .write_sctp(
+            &Bytes::from_static(b"payload"),
+            PayloadProtocolIdentifier::Binary,
+        )?;
+
+    // Drive client to generate the DATA packet(s).
+    pair.drive_client();
+
+    // Withhold the DATA packets from the server (simulate loss).
+    let withheld: Vec<_> = pair.server.inbound.drain(..).collect();
+
+    // Client initiates reset of stream 1.
+    pair.client_stream(client_ch, si)?.stop()?;
+
+    // Drive client to generate EOS data + RECONFIG packets.
+    pair.drive_client();
+
+    // Separate RECONFIG-bearing packets from DATA-only packets.
+    // Chunk type is the first byte after the 12-byte common header.
+    let (reconfig_packets, data_packets): (Vec<_>, Vec<_>) =
+        pair.server.inbound.drain(..).partition(|(_, _, raw)| {
+            // Scan all chunks in the packet for CT_RECONFIG (130).
+            let mut offset = 12usize;
+            while offset + 4 <= raw.len() {
+                if raw[offset] == 130 {
+                    return true;
+                }
+                let chunk_len = u16::from_be_bytes([raw[offset + 2], raw[offset + 3]]) as usize;
+                if chunk_len < 4 {
+                    break;
+                }
+                offset += (chunk_len + 3) & !3; // pad to 4-byte boundary
+            }
+            false
+        });
+
+    assert!(!reconfig_packets.is_empty(), "expected a RECONFIG packet");
+
+    // Deliver only the RECONFIG packets. The server hasn't seen the withheld
+    // DATA so peer_last_tsn < sender_last_tsn → InProgress.
+    for pkt in &reconfig_packets {
+        pair.server.inbound.push_back(pkt.clone());
+    }
+    pair.drive_server();
+
+    // Stream should still exist (reset is InProgress, not completed).
+    assert!(
+        pair.server_stream(server_ch, si).is_ok(),
+        "stream should survive InProgress reset"
+    );
+
+    // Inject the RECONFIG again (simulating retransmission) together with
+    // the withheld DATA so the TSN can finally advance.
+    for pkt in reconfig_packets {
+        pair.server.inbound.push_back(pkt);
+    }
+    for pkt in withheld {
+        pair.server.inbound.push_back(pkt);
+    }
+    for pkt in data_packets {
+        pair.server.inbound.push_back(pkt);
+    }
+
+    // Let everything settle.
+    pair.drive();
+
+    // The reset should have completed — stream 1 should be gone.
+    assert!(
+        pair.server_stream(server_ch, si).is_err(),
+        "stream should be reset after InProgress retransmission completes"
+    );
+
+    Ok(())
+}

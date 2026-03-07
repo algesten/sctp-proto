@@ -1,4 +1,6 @@
 # Unreleased
+
+# 0.8.0
   
   * Add I-FORWARD-TSN (RFC 8260) chunk support #29
   * MSRV 1.85, Edition 2024, bump deps #38

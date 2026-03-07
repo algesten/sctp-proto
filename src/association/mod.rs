@@ -1613,7 +1613,7 @@ impl Association {
             if !self.reconfig_requests.contains_key(&seq)
                 && self
                     .max_completed_reconfig_rsn
-                    .map_or(false, |w| sna32lte(seq, w))
+                    .is_some_and(|w| sna32lte(seq, w))
             {
                 // Retransmission of an already-completed request. Resend the response
                 // but do NOT reprocess stream resets (stream IDs may have been reused).

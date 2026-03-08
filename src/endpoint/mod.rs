@@ -10,14 +10,14 @@ use std::{
     time::Instant,
 };
 
-use crate::association::Association;
-use crate::chunk::chunk_type::CT_INIT;
+use crate::chunk::{chunk_init::ChunkInit, chunk_type::CT_INIT};
 use crate::config::{ClientConfig, EndpointConfig, ServerConfig, TransportConfig};
 use crate::packet::PartialDecode;
 use crate::shared::{
     AssociationEvent, AssociationEventInner, AssociationId, EndpointEvent, EndpointEventInner,
 };
 use crate::util::{AssociationIdGenerator, RandomAssociationIdGenerator};
+use crate::{association::Association, chunk::Chunk};
 use crate::{EcnCodepoint, Payload, Transmit};
 
 use bytes::Bytes;
@@ -149,7 +149,7 @@ impl Endpoint {
             //TODO: improve INIT handling for DoS attack
             if partial_decode.first_chunk_type == CT_INIT {
                 if let Some(dst_cid) = partial_decode.initiate_tag {
-                    self.association_ids.get(&dst_cid).cloned()
+                    self.association_ids_init.get(&dst_cid).cloned()
                 } else {
                     None
                 }
@@ -180,7 +180,27 @@ impl Endpoint {
             .map(|(ch, a)| (ch, DatagramEvent::NewAssociation(a)))
     }
 
-    /// Initiate an Association
+    /// Initiate an association.
+    ///
+    /// If SNAP (SCTP Negotiation Acceleration Protocol) init bytes are provided
+    /// via [`ClientConfig::with_snap`], the association will skip the SCTP 4-way
+    /// handshake (RFC 4960 Section 5.1) and immediately transition to the
+    /// ESTABLISHED state.
+    ///
+    /// Both `local_sctp_init` and `remote_sctp_init` must be provided for SNAP;
+    /// use [`generate_snap_init`](crate::generate_snap_init) to create the local
+    /// init bytes.
+    ///
+    /// If only one side is set (e.g. the peer does not support SNAP), the
+    /// association falls back to the normal SCTP handshake.
+    ///
+    /// **Note:** When using SNAP, **both** peers must call [`Endpoint::connect`]
+    /// (there is no server-side SNAP via [`Endpoint::handle`]). Each peer
+    /// generates its own INIT via [`generate_snap_init`](crate::generate_snap_init),
+    /// exchanges it with the remote peer through a signaling channel (e.g.,
+    /// SDP `a=sctp-init`), and then calls `connect` with `with_snap(local, remote)`.
+    ///
+    /// See [draft-hancke-tsvwg-snap](https://datatracker.ietf.org/doc/draft-hancke-tsvwg-snap/).
     pub fn connect(
         &mut self,
         config: ClientConfig,
@@ -193,18 +213,128 @@ impl Endpoint {
             return Err(ConnectError::InvalidRemoteAddress(remote));
         }
 
-        let remote_aid = RandomAssociationIdGenerator::new().generate_aid();
-        let local_aid = self.new_aid();
+        match (&config.local_sctp_init, &config.remote_sctp_init) {
+            (Some(_), Some(_)) => self.connect_with_snap(config, remote),
+            _ => {
+                // Normal handshake — either both are None, or only one side
+                // provided SNAP init (fallback when peer doesn't support SNAP).
+                let remote_aid = RandomAssociationIdGenerator::new().generate_aid();
+                let local_aid = self.new_aid();
 
-        let (ch, conn) = self.add_association(
-            remote_aid,
-            local_aid,
+                Ok(self.add_association(
+                    remote_aid,
+                    local_aid,
+                    remote,
+                    None,
+                    Instant::now(),
+                    None,
+                    config.transport,
+                ))
+            }
+        }
+    }
+
+    /// Create an association using SNAP (out-of-band exchanged INIT chunks).
+    fn connect_with_snap(
+        &mut self,
+        client_config: ClientConfig,
+        remote: SocketAddr,
+    ) -> Result<(AssociationHandle, Association), ConnectError> {
+        // Parse both INIT chunks from bytes
+        let local_snap_bytes = client_config.local_sctp_init.as_ref().unwrap();
+        let remote_snap_bytes = client_config.remote_sctp_init.as_ref().unwrap();
+
+        let local_init = ChunkInit::unmarshal(local_snap_bytes).map_err(|err| {
+            ConnectError::OutOfBandInitError(format!("Failed to parse local SNAP INIT: {err}"))
+        })?;
+        let remote_init = ChunkInit::unmarshal(remote_snap_bytes).map_err(|err| {
+            ConnectError::OutOfBandInitError(format!("Failed to parse remote SNAP INIT: {err}"))
+        })?;
+
+        // Validate both chunks are INIT (not INIT-ACK)
+        if local_init.is_ack {
+            return Err(ConnectError::OutOfBandInitError(
+                "Invalid local SNAP INIT: expected INIT, got INIT-ACK".to_string(),
+            ));
+        }
+        if remote_init.is_ack {
+            return Err(ConnectError::OutOfBandInitError(
+                "Invalid remote SNAP INIT: expected INIT, got INIT-ACK".to_string(),
+            ));
+        }
+
+        let local_aid = local_init.initiate_tag;
+        let remote_aid = remote_init.initiate_tag;
+
+        // RFC 4960 Section 3.3.2: The Initiate Tag MUST NOT take the value 0.
+        if local_aid == 0 {
+            return Err(ConnectError::OutOfBandInitError(
+                "Local SNAP INIT has zero initiate_tag".to_string(),
+            ));
+        }
+        if remote_aid == 0 {
+            return Err(ConnectError::OutOfBandInitError(
+                "Remote SNAP INIT has zero initiate_tag".to_string(),
+            ));
+        }
+
+        // RFC 4960 Section 3.3.2: The valid range of Initial TSN is 0 to 4294967295.
+        // However, a zero initial_tsn from the remote is suspicious — validate
+        // that the remote INIT has a non-zero initial_tsn to avoid degenerate
+        // sequence number arithmetic.
+        if remote_init.initial_tsn == 0 {
+            return Err(ConnectError::OutOfBandInitError(
+                "Remote SNAP INIT has zero initial_tsn".to_string(),
+            ));
+        }
+        if local_init.initial_tsn == 0 {
+            return Err(ConnectError::OutOfBandInitError(
+                "Local SNAP INIT has zero initial_tsn".to_string(),
+            ));
+        }
+
+        // Check for collision BEFORE allocating any resources.
+        if self.association_ids.contains_key(&local_aid) {
+            return Err(ConnectError::OutOfBandInitError(format!(
+                "SNAP collision: local_aid {:#x} already in use",
+                local_aid
+            )));
+        }
+        if self.association_ids.contains_key(&remote_aid) {
+            return Err(ConnectError::OutOfBandInitError(format!(
+                "SNAP collision: remote_aid {:#x} already in use",
+                remote_aid
+            )));
+        }
+
+        let conn = Association::new_with_out_of_band_init(
+            client_config.transport,
+            self.config.get_max_payload_size(),
             remote,
             None,
-            Instant::now(),
-            None,
-            config.transport,
+            local_init,
+            remote_init,
+        )
+        .map_err(|err| {
+            ConnectError::OutOfBandInitError(format!("Failed to create SNAP association: {err}"))
+        })?;
+
+        let id = self.associations.insert(AssociationMeta {
+            init_cid: remote_aid,
+            cids_issued: 0,
+            loc_cids: iter::once((0, local_aid)).collect(),
+            initial_remote: remote,
+        });
+
+        let ch = AssociationHandle(id);
+        self.association_ids.insert(local_aid, ch);
+        self.association_ids_init.insert(remote_aid, ch);
+
+        debug!(
+            "Created SNAP association: local_aid={:#x} remote_aid={:#x}",
+            local_aid, remote_aid
         );
+
         Ok((ch, conn))
     }
 
@@ -258,6 +388,10 @@ impl Endpoint {
             Some(server_config),
             transport_config,
         );
+
+        // Map the peer's INIT Initiate Tag so that retransmitted INITs (which use
+        // verification_tag=0) can be routed to the association created for the first INIT.
+        self.association_ids_init.insert(remote_aid, ch);
 
         conn.handle_event(AssociationEvent(AssociationEventInner::Datagram(
             Transmit {
@@ -396,4 +530,7 @@ pub enum ConnectError {
     /// Use `Endpoint::connect_with` to specify a client configuration.
     #[error("no default client config")]
     NoDefaultClientConfig,
+    /// Out-of-band init setup error.
+    #[error("out-of-band init error: {0}")]
+    OutOfBandInitError(String),
 }

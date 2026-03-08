@@ -65,7 +65,9 @@ pub use crate::chunk::{
 };
 
 mod config;
-pub use crate::config::{ClientConfig, EndpointConfig, ServerConfig, TransportConfig};
+pub use crate::config::{
+    generate_snap_init, ClientConfig, EndpointConfig, ServerConfig, TransportConfig,
+};
 
 mod endpoint;
 pub use crate::endpoint::{AssociationHandle, ConnectError, DatagramEvent, Endpoint};

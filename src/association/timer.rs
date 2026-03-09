@@ -1,4 +1,5 @@
-use std::time::{Duration, Instant};
+use core::time::Duration;
+use std::time::Instant;
 
 use crate::config::{RTO_INITIAL, RTO_MAX, RTO_MIN};
 
@@ -222,7 +223,7 @@ fn calculate_next_timeout(rto: u64, n_rtos: usize, rto_max: u64) -> u64 {
     //        in rule C7 above (RTO.max) may be used to provide an upper bound
     //        to this doubling operation.
     if n_rtos < 31 {
-        std::cmp::min(rto << n_rtos, rto_max)
+        core::cmp::min(rto << n_rtos, rto_max)
     } else {
         rto_max
     }

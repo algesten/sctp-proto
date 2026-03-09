@@ -22,8 +22,12 @@ pub(crate) mod chunk_type;
 use crate::error::{Error, Result};
 use chunk_header::*;
 
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::{any::Any, fmt};
+use core::{any::Any, fmt};
 
 pub(crate) trait Chunk: fmt::Display + fmt::Debug {
     fn header(&self) -> ChunkHeader;

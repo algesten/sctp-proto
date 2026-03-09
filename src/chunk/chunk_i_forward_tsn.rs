@@ -1,4 +1,5 @@
 use super::{chunk_header::*, chunk_type::*, *};
+use alloc::string::ToString;
 
 /// I-FORWARD-TSN chunk (RFC 8260).
 ///

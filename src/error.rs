@@ -1,6 +1,8 @@
 use thiserror::Error;
 
-pub type Result<T> = std::result::Result<T, Error>;
+use alloc::string::String;
+
+pub type Result<T> = core::result::Result<T, Error>;
 
 /// Errors triggered during SCTP association operation
 #[derive(Debug, Error, Eq, Clone, PartialEq)]

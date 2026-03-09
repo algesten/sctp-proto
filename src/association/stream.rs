@@ -6,9 +6,11 @@ use crate::queue::reassembly_queue::{Chunks, ReassemblyQueue};
 use crate::{ErrorCauseCode, Side};
 
 use crate::util::{ByteSlice, BytesArray, BytesSource};
+use alloc::vec;
+use alloc::vec::Vec;
 use bytes::Bytes;
+use core::fmt;
 use log::{debug, error, trace};
-use std::fmt;
 
 /// Identifier for a stream within a particular association
 pub type StreamId = u16;
@@ -469,7 +471,7 @@ impl StreamState {
         let head_abandoned = false;
         let head_all_inflight = false;
         while remaining != 0 {
-            let fragment_size = std::cmp::min(self.max_payload_size as usize, remaining); //self.association.max_payload_size
+            let fragment_size = core::cmp::min(self.max_payload_size as usize, remaining); //self.association.max_payload_size
 
             // Copy the userdata since we'll have to store it until acked
             // and the caller may re-use the buffer in the mean time

@@ -18,8 +18,11 @@ use crate::chunk::chunk_type::*;
 use crate::error::{Error, Result};
 use crate::util::*;
 
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::fmt;
+use core::fmt;
 
 ///Packet represents an SCTP packet, defined in https://tools.ietf.org/html/rfc4960#section-3
 ///An SCTP packet is composed of a common header and chunks.  A chunk

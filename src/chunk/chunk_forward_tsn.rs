@@ -1,5 +1,7 @@
 use super::{chunk_header::*, chunk_type::*, *};
 
+use alloc::string::ToString;
+
 ///This chunk shall be used by the data sender to inform the data
 ///receiver to adjust its cumulative received TSN point forward because
 ///some missing TSNs are associated with data chunks that SHOULD NOT be

@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Replace lazy_static with std::sync::LazyLock #41
   * Preparation for no_std + alloc #36
 
 # 0.8.1

@@ -1,3 +1,8 @@
+use alloc::borrow::ToOwned;
+use alloc::vec;
+use alloc::vec::Vec;
+use std::println;
+
 use super::*;
 use crate::association::Event;
 use crate::error::{Error, Result};
@@ -21,13 +26,15 @@ use crate::packet::{CommonHeader, Packet};
 use crate::param::param_outgoing_reset_request::ParamOutgoingResetRequest;
 use crate::param::param_reconfig_response::ParamReconfigResponse;
 use assert_matches::assert_matches;
+use core::net::Ipv6Addr;
+use core::ops::RangeFrom;
+use core::str::FromStr;
+use core::time::Duration;
+use core::{cmp, mem};
 use lazy_static::lazy_static;
 use log::{info, trace};
-use std::net::Ipv6Addr;
-use std::ops::RangeFrom;
-use std::str::FromStr;
+use std::net::UdpSocket;
 use std::sync::Mutex;
-use std::{cmp, mem, net::UdpSocket, time::Duration};
 
 lazy_static! {
     pub static ref SERVER_PORTS: Mutex<RangeFrom<u16>> = Mutex::new(4433..);
@@ -189,14 +196,14 @@ impl TestEndpoint {
     }
 }
 
-impl ::std::ops::Deref for TestEndpoint {
+impl ::core::ops::Deref for TestEndpoint {
     type Target = Endpoint;
     fn deref(&self) -> &Endpoint {
         &self.endpoint
     }
 }
 
-impl ::std::ops::DerefMut for TestEndpoint {
+impl ::core::ops::DerefMut for TestEndpoint {
     fn deref_mut(&mut self) -> &mut Endpoint {
         &mut self.endpoint
     }

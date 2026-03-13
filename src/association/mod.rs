@@ -32,15 +32,21 @@ use stream::{ReliabilityType, Stream, StreamEvent, StreamId, StreamState};
 use timer::{ACK_INTERVAL, RtoManager, Timer, TimerTable};
 
 use crate::association::stream::RecvSendState;
+use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
 use bytes::Bytes;
+use core::net::{IpAddr, SocketAddr};
+use core::str::FromStr;
+use core::time::Duration;
 use log::{debug, error, trace, warn};
 use rand::random;
 use rustc_hash::FxHashMap;
-use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, SocketAddr};
-use std::str::FromStr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
+use std::time::Instant;
 use thiserror::Error;
 
 pub(crate) mod state;
@@ -953,9 +959,9 @@ impl Association {
 
         // Should we be setting any of these permanently until we've ACKed further?
         self.my_max_num_inbound_streams =
-            std::cmp::min(i.num_inbound_streams, self.my_max_num_inbound_streams);
+            core::cmp::min(i.num_inbound_streams, self.my_max_num_inbound_streams);
         self.my_max_num_outbound_streams =
-            std::cmp::min(i.num_outbound_streams, self.my_max_num_outbound_streams);
+            core::cmp::min(i.num_outbound_streams, self.my_max_num_outbound_streams);
         self.peer_verification_tag = i.initiate_tag;
         self.source_port = p.common_header.destination_port;
         self.destination_port = p.common_header.source_port;
@@ -1057,9 +1063,9 @@ impl Association {
         }
 
         self.my_max_num_inbound_streams =
-            std::cmp::min(i.num_inbound_streams, self.my_max_num_inbound_streams);
+            core::cmp::min(i.num_inbound_streams, self.my_max_num_inbound_streams);
         self.my_max_num_outbound_streams =
-            std::cmp::min(i.num_outbound_streams, self.my_max_num_outbound_streams);
+            core::cmp::min(i.num_outbound_streams, self.my_max_num_outbound_streams);
         self.peer_verification_tag = i.initiate_tag;
         self.peer_last_tsn = if i.initial_tsn == 0 {
             u32::MAX
@@ -1840,7 +1846,7 @@ impl Association {
             //      outstanding DATA chunk(s) acknowledged, and 2) the destination's
             //      path MTU.
             if !self.in_fast_recovery && !self.pending_queue.is_empty() {
-                self.cwnd += std::cmp::min(total_bytes_acked as u32, self.cwnd); // TCP way
+                self.cwnd += core::cmp::min(total_bytes_acked as u32, self.cwnd); // TCP way
                 // self.cwnd += min32(uint32(total_bytes_acked), self.mtu) // SCTP way (slow)
                 trace!(
                     "[{}] updated cwnd={} ssthresh={} acked={} (SS)",
@@ -1917,7 +1923,7 @@ impl Association {
                             //     last sent, according to the formula described in Section 7.2.3.
                             self.in_fast_recovery = true;
                             self.fast_recover_exit_point = htna;
-                            self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu);
+                            self.ssthresh = core::cmp::max(self.cwnd / 2, 4 * self.mtu);
                             self.cwnd = self.ssthresh;
                             self.partial_bytes_acked = 0;
                             self.will_retransmit_fast = true;
@@ -2430,7 +2436,7 @@ impl Association {
     /// get_data_packets_to_retransmit is called when T3-rtx is timed out and retransmit outstanding data chunks
     /// that are not acked or abandoned yet.
     fn get_data_packets_to_retransmit(&mut self, now: Instant) -> Vec<Packet> {
-        let awnd = std::cmp::min(self.cwnd, self.rwnd);
+        let awnd = core::cmp::min(self.cwnd, self.rwnd);
         let mut chunks = vec![];
         let mut bytes_to_send = 0;
         let mut done = false;
@@ -2873,7 +2879,7 @@ impl Association {
                 //      ssthresh = max(cwnd/2, 4*MTU)
                 //      cwnd = 1*MTU
 
-                self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu);
+                self.ssthresh = core::cmp::max(self.cwnd / 2, 4 * self.mtu);
                 self.cwnd = self.mtu;
                 trace!(
                     "[{}] updated cwnd={} ssthresh={} inflight={} (RTO)",

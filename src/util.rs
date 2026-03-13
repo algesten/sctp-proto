@@ -1,8 +1,9 @@
 use crate::shared::AssociationId;
 
+use alloc::borrow::ToOwned;
 use bytes::Bytes;
+use core::time::Duration;
 use crc::{CRC_32_ISCSI, Crc, Table};
-use std::time::Duration;
 
 /// This function is non-inline to prevent the optimizer from looking inside it.
 #[inline(never)]
@@ -129,7 +130,7 @@ impl<'a> BytesSource for BytesArray<'a> {
             let chunk = &mut self.chunks[self.consumed];
 
             if chunk.len() <= limit {
-                let chunk = std::mem::take(chunk);
+                let chunk = core::mem::take(chunk);
                 self.consumed += 1;
                 chunks_consumed += 1;
                 if chunk.is_empty() {

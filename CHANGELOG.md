@@ -1,5 +1,7 @@
 # Unreleased
 
+  * Preparation for no_std + alloc #36
+
 # 0.8.1
 
   * Downgrade rand to 0.9 to avoid double chacha20 dep #39

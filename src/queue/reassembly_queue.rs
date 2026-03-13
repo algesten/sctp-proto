@@ -3,8 +3,9 @@ use crate::chunk::chunk_payload_data::{ChunkPayloadData, PayloadProtocolIdentifi
 use crate::error::{Error, Result};
 use crate::util::*;
 
+use alloc::vec::Vec;
 use bytes::{Bytes, BytesMut};
-use std::cmp::Ordering;
+use core::cmp::Ordering;
 
 fn sort_chunks_by_tsn(c: &mut [ChunkPayloadData]) {
     c.sort_by(|a, b| {
@@ -62,7 +63,7 @@ impl Chunks {
         let mut n_written = 0;
         for c in &self.chunks {
             let to_copy = c.user_data.len();
-            let n = std::cmp::min(to_copy, buf.len() - n_written);
+            let n = core::cmp::min(to_copy, buf.len() - n_written);
             buf[n_written..n_written + n].copy_from_slice(&c.user_data[..n]);
             n_written += n;
             if n < to_copy {
@@ -82,7 +83,7 @@ impl Chunks {
         let mut n_written = 0;
         while self.index < self.chunks.len() {
             let to_copy = self.chunks[self.index].user_data[self.offset..].len();
-            let n = std::cmp::min(to_copy, max_length - n_written);
+            let n = core::cmp::min(to_copy, max_length - n_written);
             buf.extend_from_slice(&self.chunks[self.index].user_data[self.offset..self.offset + n]);
             n_written += n;
             if n < to_copy {

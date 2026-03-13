@@ -1,4 +1,4 @@
-use std::fmt;
+use core::fmt;
 
 /// paramType represents a SCTP INIT/INITACK parameter
 #[derive(Debug, Copy, Clone, PartialEq)]

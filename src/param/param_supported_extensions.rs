@@ -1,6 +1,8 @@
 use super::{param_header::*, param_type::*, *};
 use crate::chunk::chunk_type::*;
 
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use bytes::BufMut;
 
 #[derive(Default, Debug, Clone, PartialEq)]

@@ -31,15 +31,12 @@ use core::ops::RangeFrom;
 use core::str::FromStr;
 use core::time::Duration;
 use core::{cmp, mem};
-use lazy_static::lazy_static;
 use log::{info, trace};
 use std::net::UdpSocket;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
-lazy_static! {
-    pub static ref SERVER_PORTS: Mutex<RangeFrom<u16>> = Mutex::new(4433..);
-    pub static ref CLIENT_PORTS: Mutex<RangeFrom<u16>> = Mutex::new(44433..);
-}
+pub static SERVER_PORTS: LazyLock<Mutex<RangeFrom<u16>>> = LazyLock::new(|| Mutex::new(4433..));
+pub static CLIENT_PORTS: LazyLock<Mutex<RangeFrom<u16>>> = LazyLock::new(|| Mutex::new(44433..));
 
 fn min_opt<T: Ord>(x: Option<T>, y: Option<T>) -> Option<T> {
     match (x, y) {

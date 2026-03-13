@@ -108,22 +108,20 @@ fn test_abort_chunk_many_error_causes() -> Result<()> {
 //chunk_error_test
 ///////////////////////////////////////////////////////////////////
 use super::chunk_error::*;
-use lazy_static::lazy_static;
+use std::sync::LazyLock;
 
 const CHUNK_FLAGS: u8 = 0x00;
 static ORG_UNRECOGNIZED_CHUNK: Bytes =
     Bytes::from_static(&[0xc0, 0x0, 0x0, 0x8, 0x0, 0x0, 0x0, 0x3]);
 
-lazy_static! {
-    static ref RAW_IN: Bytes = {
-        let mut raw = BytesMut::new();
-        raw.put_u8(CT_ERROR.0);
-        raw.put_u8(CHUNK_FLAGS);
-        raw.extend(vec![0x00, 0x10, 0x00, 0x06, 0x00, 0x0c]);
-        raw.extend(ORG_UNRECOGNIZED_CHUNK.clone());
-        raw.freeze()
-    };
-}
+static RAW_IN: LazyLock<Bytes> = LazyLock::new(|| {
+    let mut raw = BytesMut::new();
+    raw.put_u8(CT_ERROR.0);
+    raw.put_u8(CHUNK_FLAGS);
+    raw.extend(vec![0x00, 0x10, 0x00, 0x06, 0x00, 0x0c]);
+    raw.extend(ORG_UNRECOGNIZED_CHUNK.clone());
+    raw.freeze()
+});
 
 #[test]
 fn test_chunk_error_unrecognized_chunk_type_unmarshal() -> Result<()> {
@@ -249,46 +247,44 @@ static TEST_CHUNK_RECONFIG_PARAM_B: Bytes = Bytes::from_static(&[
 static TEST_CHUNK_RECONFIG_RESPONCE: Bytes =
     Bytes::from_static(&[0x0, 0x10, 0x0, 0xc, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x1]);
 
-lazy_static! {
-    static ref TEST_CHUNK_RECONFIG_BYTES: Vec<Bytes> = {
-        let mut tests = vec![];
-        {
-            let mut test = BytesMut::new();
-            test.extend(vec![0x82, 0x0, 0x0, 0x1a]);
-            test.extend(TEST_CHUNK_RECONFIG_PARAM_A.clone());
-            tests.push(test.freeze());
-        }
-        {
-            let mut test = BytesMut::new();
-            test.extend(vec![0x82, 0x0, 0x0, 0x14]);
-            test.extend(TEST_CHUNK_RECONFIG_PARAM_B.clone());
-            tests.push(test.freeze());
-        }
-        {
-            let mut test = BytesMut::new();
-            test.extend(vec![0x82, 0x0, 0x0, 0x10]);
-            test.extend(TEST_CHUNK_RECONFIG_RESPONCE.clone());
-            tests.push(test.freeze());
-        }
-        {
-            let mut test = BytesMut::new();
-            test.extend(vec![0x82, 0x0, 0x0, 0x2c]);
-            test.extend(TEST_CHUNK_RECONFIG_PARAM_A.clone());
-            test.extend(vec![0u8; 2]);
-            test.extend(TEST_CHUNK_RECONFIG_PARAM_B.clone());
-            tests.push(test.freeze());
-        }
-        {
-            let mut test = BytesMut::new();
-            test.extend(vec![0x82, 0x0, 0x0, 0x2a]);
-            test.extend(TEST_CHUNK_RECONFIG_PARAM_B.clone());
-            test.extend(TEST_CHUNK_RECONFIG_PARAM_A.clone());
-            tests.push(test.freeze());
-        }
+static TEST_CHUNK_RECONFIG_BYTES: LazyLock<Vec<Bytes>> = LazyLock::new(|| {
+    let mut tests = vec![];
+    {
+        let mut test = BytesMut::new();
+        test.extend(vec![0x82, 0x0, 0x0, 0x1a]);
+        test.extend(TEST_CHUNK_RECONFIG_PARAM_A.clone());
+        tests.push(test.freeze());
+    }
+    {
+        let mut test = BytesMut::new();
+        test.extend(vec![0x82, 0x0, 0x0, 0x14]);
+        test.extend(TEST_CHUNK_RECONFIG_PARAM_B.clone());
+        tests.push(test.freeze());
+    }
+    {
+        let mut test = BytesMut::new();
+        test.extend(vec![0x82, 0x0, 0x0, 0x10]);
+        test.extend(TEST_CHUNK_RECONFIG_RESPONCE.clone());
+        tests.push(test.freeze());
+    }
+    {
+        let mut test = BytesMut::new();
+        test.extend(vec![0x82, 0x0, 0x0, 0x2c]);
+        test.extend(TEST_CHUNK_RECONFIG_PARAM_A.clone());
+        test.extend(vec![0u8; 2]);
+        test.extend(TEST_CHUNK_RECONFIG_PARAM_B.clone());
+        tests.push(test.freeze());
+    }
+    {
+        let mut test = BytesMut::new();
+        test.extend(vec![0x82, 0x0, 0x0, 0x2a]);
+        test.extend(TEST_CHUNK_RECONFIG_PARAM_B.clone());
+        test.extend(TEST_CHUNK_RECONFIG_PARAM_A.clone());
+        tests.push(test.freeze());
+    }
 
-        tests
-    };
-}
+    tests
+});
 
 #[test]
 fn test_chunk_reconfig_success() -> Result<()> {

@@ -1,4 +1,4 @@
-use std::fmt;
+use core::fmt;
 
 /// association state enums
 #[derive(Debug, Copy, Clone, PartialEq, Default)]

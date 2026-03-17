@@ -2,6 +2,8 @@ use crate::chunk::chunk_payload_data::ChunkPayloadData;
 use crate::chunk::chunk_selective_ack::GapAckBlock;
 use crate::util::*;
 
+use alloc::string::String;
+use alloc::vec::Vec;
 use std::collections::HashMap;
 
 #[derive(Default, Debug)]
@@ -21,9 +23,9 @@ impl PayloadQueue {
     pub(crate) fn update_sorted_keys(&mut self) {
         self.sorted.sort_by(|a, b| {
             if sna32lt(*a, *b) {
-                std::cmp::Ordering::Less
+                core::cmp::Ordering::Less
             } else {
-                std::cmp::Ordering::Greater
+                core::cmp::Ordering::Greater
             }
         });
     }

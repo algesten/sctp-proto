@@ -1,14 +1,17 @@
 #[cfg(test)]
 mod endpoint_test;
 
-use std::{
-    collections::{HashMap, VecDeque},
+use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use alloc::string::String;
+use alloc::sync::Arc;
+use core::{
     fmt, iter,
     net::{IpAddr, SocketAddr},
     ops::{Index, IndexMut},
-    sync::Arc,
-    time::Instant,
 };
+use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::association::Association;
 use crate::chunk::chunk_type::CT_INIT;
@@ -22,7 +25,7 @@ use crate::{EcnCodepoint, Payload, Transmit};
 
 use bytes::Bytes;
 use log::{debug, trace};
-use rand::{rngs::StdRng, SeedableRng};
+use rand::{SeedableRng, rngs::StdRng};
 use rustc_hash::FxHashMap;
 use slab::Slab;
 use thiserror::Error;

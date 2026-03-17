@@ -1,3 +1,4 @@
+use crate::chunk::Chunk;
 use crate::chunk::chunk_abort::ChunkAbort;
 use crate::chunk::chunk_cookie_ack::ChunkCookieAck;
 use crate::chunk::chunk_cookie_echo::ChunkCookieEcho;
@@ -5,6 +6,7 @@ use crate::chunk::chunk_error::ChunkError;
 use crate::chunk::chunk_forward_tsn::ChunkForwardTsn;
 use crate::chunk::chunk_header::*;
 use crate::chunk::chunk_heartbeat::ChunkHeartbeat;
+use crate::chunk::chunk_i_forward_tsn::ChunkIForwardTsn;
 use crate::chunk::chunk_init::ChunkInit;
 use crate::chunk::chunk_payload_data::ChunkPayloadData;
 use crate::chunk::chunk_reconfig::ChunkReconfig;
@@ -13,12 +15,14 @@ use crate::chunk::chunk_shutdown::ChunkShutdown;
 use crate::chunk::chunk_shutdown_ack::ChunkShutdownAck;
 use crate::chunk::chunk_shutdown_complete::ChunkShutdownComplete;
 use crate::chunk::chunk_type::*;
-use crate::chunk::Chunk;
 use crate::error::{Error, Result};
 use crate::util::*;
 
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::fmt;
+use core::fmt;
 
 ///Packet represents an SCTP packet, defined in https://tools.ietf.org/html/rfc4960#section-3
 ///An SCTP packet is composed of a common header and chunks.  A chunk
@@ -156,6 +160,9 @@ impl PartialDecode {
                 CT_FORWARD_TSN => {
                     Box::new(ChunkForwardTsn::unmarshal(&self.remaining.slice(offset..))?)
                 }
+                CT_I_FORWARD_TSN => Box::new(ChunkIForwardTsn::unmarshal(
+                    &self.remaining.slice(offset..),
+                )?),
                 CT_ERROR => Box::new(ChunkError::unmarshal(&self.remaining.slice(offset..))?),
                 CT_SHUTDOWN => Box::new(ChunkShutdown::unmarshal(&self.remaining.slice(offset..))?),
                 CT_SHUTDOWN_ACK => Box::new(ChunkShutdownAck::unmarshal(
@@ -245,6 +252,7 @@ impl Packet {
                 CT_SACK => Box::new(ChunkSelectiveAck::unmarshal(&raw.slice(offset..))?),
                 CT_RECONFIG => Box::new(ChunkReconfig::unmarshal(&raw.slice(offset..))?),
                 CT_FORWARD_TSN => Box::new(ChunkForwardTsn::unmarshal(&raw.slice(offset..))?),
+                CT_I_FORWARD_TSN => Box::new(ChunkIForwardTsn::unmarshal(&raw.slice(offset..))?),
                 CT_ERROR => Box::new(ChunkError::unmarshal(&raw.slice(offset..))?),
                 CT_SHUTDOWN => Box::new(ChunkShutdown::unmarshal(&raw.slice(offset..))?),
                 CT_SHUTDOWN_ACK => Box::new(ChunkShutdownAck::unmarshal(&raw.slice(offset..))?),
@@ -411,7 +419,11 @@ mod test {
         ]);
         let pkt = Packet::unmarshal(&header_only)?;
         let header_only_marshaled = pkt.marshal()?;
-        assert_eq!(header_only, header_only_marshaled, "Unmarshal/Marshaled header only packet did not match \nheaderOnly: {:?} \nheader_only_marshaled {:?}", header_only, header_only_marshaled);
+        assert_eq!(
+            header_only, header_only_marshaled,
+            "Unmarshal/Marshaled header only packet did not match \nheaderOnly: {:?} \nheader_only_marshaled {:?}",
+            header_only, header_only_marshaled
+        );
 
         Ok(())
     }

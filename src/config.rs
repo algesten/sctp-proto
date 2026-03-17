@@ -1,7 +1,8 @@
 use crate::util::{AssociationIdGenerator, RandomAssociationIdGenerator};
 
-use std::fmt;
-use std::sync::Arc;
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::fmt;
 
 /// MTU for inbound packet (from DTLS)
 pub(crate) const RECEIVE_MTU: usize = 8192;

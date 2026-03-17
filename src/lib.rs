@@ -39,29 +39,38 @@
 //! [ex_sctp]: https://github.com/elixir-webrtc/ex_sctp
 //! [rtc-sctp]: https://github.com/webrtc-rs/rtc/tree/master/rtc-sctp
 
+#![no_std]
 #![warn(rust_2018_idioms)]
+#![deny(clippy::std_instead_of_core)]
+#![deny(clippy::std_instead_of_alloc)]
 #![allow(dead_code)]
 #![allow(clippy::bool_to_int_with_if)]
 
+#[macro_use]
+extern crate alloc;
+
+extern crate std;
+
+use alloc::vec::Vec;
 use bytes::Bytes;
-use std::time::Instant;
-use std::{
+use core::{
     fmt,
     net::{IpAddr, SocketAddr},
     ops,
 };
+use std::time::Instant;
 
 mod association;
 pub use crate::association::{
+    Association, AssociationError, Event,
     stats::AssociationStats,
     stream::{ReliabilityType, Stream, StreamEvent, StreamId, StreamState},
-    Association, AssociationError, Event,
 };
 
 pub(crate) mod chunk;
 pub use crate::chunk::{
-    chunk_payload_data::{ChunkPayloadData, PayloadProtocolIdentifier},
     ErrorCauseCode,
+    chunk_payload_data::{ChunkPayloadData, PayloadProtocolIdentifier},
 };
 
 mod config;
@@ -155,7 +164,7 @@ pub struct Transmit {
 
 #[cfg(test)]
 mod test {
-    use std::sync::Arc;
+    use alloc::sync::Arc;
 
     use super::*;
 

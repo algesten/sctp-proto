@@ -3,44 +3,50 @@ use crate::association::{
     stats::AssociationStats,
 };
 use crate::chunk::{
-    chunk_abort::ChunkAbort, chunk_cookie_ack::ChunkCookieAck, chunk_cookie_echo::ChunkCookieEcho,
-    chunk_error::ChunkError, chunk_forward_tsn::ChunkForwardTsn,
-    chunk_forward_tsn::ChunkForwardTsnStream, chunk_heartbeat::ChunkHeartbeat,
-    chunk_heartbeat_ack::ChunkHeartbeatAck, chunk_init::ChunkInit, chunk_init::ChunkInitAck,
+    Chunk, ErrorCauseUnrecognizedChunkType, USER_INITIATED_ABORT, chunk_abort::ChunkAbort,
+    chunk_cookie_ack::ChunkCookieAck, chunk_cookie_echo::ChunkCookieEcho, chunk_error::ChunkError,
+    chunk_forward_tsn::ChunkForwardTsn, chunk_forward_tsn::ChunkForwardTsnStream,
+    chunk_heartbeat::ChunkHeartbeat, chunk_heartbeat_ack::ChunkHeartbeatAck,
+    chunk_i_forward_tsn::ChunkIForwardTsn, chunk_init::ChunkInit, chunk_init::ChunkInitAck,
     chunk_payload_data::ChunkPayloadData, chunk_payload_data::PayloadProtocolIdentifier,
     chunk_reconfig::ChunkReconfig, chunk_selective_ack::ChunkSelectiveAck,
     chunk_shutdown::ChunkShutdown, chunk_shutdown_ack::ChunkShutdownAck,
-    chunk_shutdown_complete::ChunkShutdownComplete, chunk_type::CT_FORWARD_TSN, Chunk,
-    ErrorCauseUnrecognizedChunkType, USER_INITIATED_ABORT,
+    chunk_shutdown_complete::ChunkShutdownComplete, chunk_type::CT_FORWARD_TSN,
 };
-use crate::config::{ServerConfig, TransportConfig, COMMON_HEADER_SIZE, DATA_CHUNK_HEADER_SIZE};
+use crate::config::{COMMON_HEADER_SIZE, DATA_CHUNK_HEADER_SIZE, ServerConfig, TransportConfig};
 use crate::error::{Error, Result};
 use crate::packet::{CommonHeader, Packet};
 use crate::param::{
+    Param,
     param_heartbeat_info::ParamHeartbeatInfo,
     param_outgoing_reset_request::ParamOutgoingResetRequest,
     param_reconfig_response::{ParamReconfigResponse, ReconfigResult},
     param_state_cookie::ParamStateCookie,
     param_supported_extensions::ParamSupportedExtensions,
-    Param,
 };
 use crate::queue::{payload_queue::PayloadQueue, pending_queue::PendingQueue};
 use crate::shared::{AssociationEventInner, AssociationId, EndpointEvent, EndpointEventInner};
 use crate::util::{sna16lt, sna32gt, sna32gte, sna32lt, sna32lte};
 use crate::{AssociationEvent, Payload, Side, Transmit};
 use stream::{ReliabilityType, Stream, StreamEvent, StreamId, StreamState};
-use timer::{RtoManager, Timer, TimerTable, ACK_INTERVAL};
+use timer::{ACK_INTERVAL, RtoManager, Timer, TimerTable};
 
 use crate::association::stream::RecvSendState;
+use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
 use bytes::Bytes;
+use core::net::{IpAddr, SocketAddr};
+use core::str::FromStr;
+use core::time::Duration;
 use log::{debug, error, trace, warn};
 use rand::random;
 use rustc_hash::FxHashMap;
-use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, SocketAddr};
-use std::str::FromStr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
+use std::time::Instant;
 use thiserror::Error;
 
 pub(crate) mod state;
@@ -912,6 +918,8 @@ impl Association {
             self.handle_reconfig(c)?
         } else if let Some(c) = chunk_any.downcast_ref::<ChunkForwardTsn>() {
             self.handle_forward_tsn(c)?
+        } else if let Some(c) = chunk_any.downcast_ref::<ChunkIForwardTsn>() {
+            self.handle_i_forward_tsn(c)?
         } else if let Some(c) = chunk_any.downcast_ref::<ChunkShutdown>() {
             self.handle_shutdown(c)?
         } else if let Some(c) = chunk_any.downcast_ref::<ChunkShutdownAck>() {
@@ -953,9 +961,9 @@ impl Association {
 
         // Should we be setting any of these permanently until we've ACKed further?
         self.my_max_num_inbound_streams =
-            std::cmp::min(i.num_inbound_streams, self.my_max_num_inbound_streams);
+            core::cmp::min(i.num_inbound_streams, self.my_max_num_inbound_streams);
         self.my_max_num_outbound_streams =
-            std::cmp::min(i.num_outbound_streams, self.my_max_num_outbound_streams);
+            core::cmp::min(i.num_outbound_streams, self.my_max_num_outbound_streams);
         self.peer_verification_tag = i.initiate_tag;
         self.source_port = p.common_header.destination_port;
         self.destination_port = p.common_header.source_port;
@@ -1057,9 +1065,9 @@ impl Association {
         }
 
         self.my_max_num_inbound_streams =
-            std::cmp::min(i.num_inbound_streams, self.my_max_num_inbound_streams);
+            core::cmp::min(i.num_inbound_streams, self.my_max_num_inbound_streams);
         self.my_max_num_outbound_streams =
-            std::cmp::min(i.num_outbound_streams, self.my_max_num_outbound_streams);
+            core::cmp::min(i.num_outbound_streams, self.my_max_num_outbound_streams);
         self.peer_verification_tag = i.initiate_tag;
         self.peer_last_tsn = if i.initial_tsn == 0 {
             u32::MAX
@@ -1241,7 +1249,10 @@ impl Association {
                     // Receive buffer is full
                     if let Some(last_tsn) = self.payload_queue.get_last_tsn_received() {
                         if sna32lt(d.tsn, *last_tsn) {
-                            debug!("[{}] receive buffer full, but accepted as this is a missing chunk with tsn={} ssn={}", self.side, d.tsn, d.stream_sequence_number);
+                            debug!(
+                                "[{}] receive buffer full, but accepted as this is a missing chunk with tsn={} ssn={}",
+                                self.side, d.tsn, d.stream_sequence_number
+                            );
                             stream_handle_data = true;
                         }
                     } else {
@@ -1325,9 +1336,7 @@ impl Association {
         if sna32lt(self.cumulative_tsn_ack_point, d.cumulative_tsn_ack) {
             trace!(
                 "[{}] SACK: cumTSN advanced: {} -> {}",
-                self.side,
-                self.cumulative_tsn_ack_point,
-                d.cumulative_tsn_ack
+                self.side, self.cumulative_tsn_ack_point, d.cumulative_tsn_ack
             );
 
             self.cumulative_tsn_ack_point = d.cumulative_tsn_ack;
@@ -1449,9 +1458,7 @@ impl Association {
 
         trace!(
             "[{}] should send ack? newCumTSN={} peer_last_tsn={}",
-            self.side,
-            c.new_cumulative_tsn,
-            self.peer_last_tsn
+            self.side, c.new_cumulative_tsn, self.peer_last_tsn
         );
         if sna32lte(c.new_cumulative_tsn, self.peer_last_tsn) {
             trace!("[{}] sending ack on Forward TSN", self.side);
@@ -1491,6 +1498,64 @@ impl Association {
         // Therefore, we need to broadcast this event to all existing streams for
         // unordered chunks.
         // See https://github.com/pion/sctp/issues/106
+        for s in self.streams.values_mut() {
+            s.handle_forward_tsn_for_unordered(c.new_cumulative_tsn);
+        }
+
+        self.handle_peer_last_tsn_and_acknowledgement(false)
+    }
+
+    /// Handle I-FORWARD-TSN (RFC 8260) — identical to FORWARD-TSN but with
+    /// 32-bit MID and explicit per-entry unordered flag.
+    fn handle_i_forward_tsn(&mut self, c: &ChunkIForwardTsn) -> Result<Vec<Packet>> {
+        trace!("[{}] I-FwdTSN: {}", self.side, c);
+
+        if !self.use_forward_tsn {
+            warn!("[{}] received I-FwdTSN but not enabled", self.side);
+            let cerr = ChunkError {
+                error_causes: vec![ErrorCauseUnrecognizedChunkType::default()],
+            };
+
+            let outbound = Packet {
+                common_header: CommonHeader {
+                    verification_tag: self.peer_verification_tag,
+                    source_port: self.source_port,
+                    destination_port: self.destination_port,
+                },
+                chunks: vec![Box::new(cerr)],
+            };
+            return Ok(vec![outbound]);
+        }
+
+        if sna32lte(c.new_cumulative_tsn, self.peer_last_tsn) {
+            trace!("[{}] sending ack on I-Forward TSN", self.side);
+            self.ack_state = AckState::Immediate;
+            self.timers.stop(Timer::Ack);
+            self.awake_write_loop();
+            return Ok(vec![]);
+        }
+
+        // Advance peer_last_tsn
+        while sna32lt(self.peer_last_tsn, c.new_cumulative_tsn) {
+            self.payload_queue.pop(self.peer_last_tsn + 1);
+            self.peer_last_tsn += 1;
+        }
+
+        // Handle per-stream entries using the explicit unordered flag
+        for forwarded in &c.streams {
+            if forwarded.unordered {
+                if let Some(s) = self.streams.get_mut(&forwarded.identifier) {
+                    s.handle_forward_tsn_for_unordered(c.new_cumulative_tsn);
+                }
+            } else {
+                // MID maps to SSN for ordered streams; truncate to u16
+                if let Some(s) = self.streams.get_mut(&forwarded.identifier) {
+                    s.handle_forward_tsn_for_ordered(forwarded.mid as u16);
+                }
+            }
+        }
+
+        // Broadcast to all unordered streams
         for s in self.streams.values_mut() {
             s.handle_forward_tsn_for_unordered(c.new_cumulative_tsn);
         }
@@ -1813,14 +1878,11 @@ impl Association {
             //      outstanding DATA chunk(s) acknowledged, and 2) the destination's
             //      path MTU.
             if !self.in_fast_recovery && !self.pending_queue.is_empty() {
-                self.cwnd += std::cmp::min(total_bytes_acked as u32, self.cwnd); // TCP way
-                                                                                 // self.cwnd += min32(uint32(total_bytes_acked), self.mtu) // SCTP way (slow)
+                self.cwnd += core::cmp::min(total_bytes_acked as u32, self.cwnd); // TCP way
+                // self.cwnd += min32(uint32(total_bytes_acked), self.mtu) // SCTP way (slow)
                 trace!(
                     "[{}] updated cwnd={} ssthresh={} acked={} (SS)",
-                    self.side,
-                    self.cwnd,
-                    self.ssthresh,
-                    total_bytes_acked
+                    self.side, self.cwnd, self.ssthresh, total_bytes_acked
                 );
             } else {
                 trace!(
@@ -1852,10 +1914,7 @@ impl Association {
                 self.cwnd += self.mtu;
                 trace!(
                     "[{}] updated cwnd={} ssthresh={} acked={} (CA)",
-                    self.side,
-                    self.cwnd,
-                    self.ssthresh,
-                    total_bytes_acked
+                    self.side, self.cwnd, self.ssthresh, total_bytes_acked
                 );
             }
         }
@@ -1896,7 +1955,7 @@ impl Association {
                             //     last sent, according to the formula described in Section 7.2.3.
                             self.in_fast_recovery = true;
                             self.fast_recover_exit_point = htna;
-                            self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu);
+                            self.ssthresh = core::cmp::max(self.cwnd / 2, 4 * self.mtu);
                             self.cwnd = self.ssthresh;
                             self.partial_bytes_acked = 0;
                             self.will_retransmit_fast = true;
@@ -2291,10 +2350,7 @@ impl Association {
                     to_fast_retrans.push(Box::new(c.clone()));
                     trace!(
                         "[{}] fast-retransmit: tsn={} sent={} htna={}",
-                        self.side,
-                        c.tsn,
-                        c.nsent,
-                        self.fast_recover_exit_point
+                        self.side, c.tsn, c.nsent, self.fast_recover_exit_point
                     );
                 }
                 i += 1;
@@ -2412,7 +2468,7 @@ impl Association {
     /// get_data_packets_to_retransmit is called when T3-rtx is timed out and retransmit outstanding data chunks
     /// that are not acked or abandoned yet.
     fn get_data_packets_to_retransmit(&mut self, now: Instant) -> Vec<Packet> {
-        let awnd = std::cmp::min(self.cwnd, self.rwnd);
+        let awnd = core::cmp::min(self.cwnd, self.rwnd);
         let mut chunks = vec![];
         let mut bytes_to_send = 0;
         let mut done = false;
@@ -2453,10 +2509,7 @@ impl Association {
 
                 trace!(
                     "[{}] retransmitting tsn={} ssn={} sent={}",
-                    self.side,
-                    c.tsn,
-                    c.stream_sequence_number,
-                    c.nsent
+                    self.side, c.tsn, c.stream_sequence_number, c.nsent
                 );
 
                 chunks.push(c.clone());
@@ -2618,10 +2671,7 @@ impl Association {
                     c.set_abandoned(true);
                     trace!(
                         "[{}] marked as abandoned: tsn={} ppi={} (remix: {})",
-                        side,
-                        c.tsn,
-                        c.payload_type,
-                        c.nsent
+                        side, c.tsn, c.payload_type, c.nsent
                     );
                 }
             } else if reliability_type == ReliabilityType::Timed {
@@ -2631,10 +2681,7 @@ impl Association {
                         c.set_abandoned(true);
                         trace!(
                             "[{}] marked as abandoned: tsn={} ppi={} (timed: {:?})",
-                            side,
-                            c.tsn,
-                            c.payload_type,
-                            elapsed
+                            side, c.tsn, c.payload_type, elapsed
                         );
                     }
                 } else {
@@ -2693,10 +2740,7 @@ impl Association {
         }
         trace!(
             "[{}] building fwd_tsn: newCumulativeTSN={} cumTSN={} - {}",
-            self.side,
-            fwd_tsn.new_cumulative_tsn,
-            self.cumulative_tsn_ack_point,
-            stream_str
+            self.side, fwd_tsn.new_cumulative_tsn, self.cumulative_tsn_ack_point, stream_str
         );
 
         fwd_tsn
@@ -2808,8 +2852,7 @@ impl Association {
     fn on_ack_timeout(&mut self) {
         trace!(
             "[{}] ack timed out (ack_state: {})",
-            self.side,
-            self.ack_state
+            self.side, self.ack_state
         );
         self.stats.inc_ack_timeouts();
         self.ack_state = AckState::Immediate;
@@ -2868,7 +2911,7 @@ impl Association {
                 //      ssthresh = max(cwnd/2, 4*MTU)
                 //      cwnd = 1*MTU
 
-                self.ssthresh = std::cmp::max(self.cwnd / 2, 4 * self.mtu);
+                self.ssthresh = core::cmp::max(self.cwnd / 2, 4 * self.mtu);
                 self.cwnd = self.mtu;
                 trace!(
                     "[{}] updated cwnd={} ssthresh={} inflight={} (RTO)",

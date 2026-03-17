@@ -1,6 +1,6 @@
 use crate::chunk::chunk_payload_data::ChunkPayloadData;
 
-use std::collections::VecDeque;
+use alloc::collections::VecDeque;
 
 /// pendingBaseQueue
 pub(crate) type PendingBaseQueue = VecDeque<ChunkPayloadData>;

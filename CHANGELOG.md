@@ -1,5 +1,16 @@
 # Unreleased
   * Deduplicate incoming RE-CONFIG requests to prevent new stream destruction #30
+  * Replace lazy_static with std::sync::LazyLock in tests #41
+  * Preparation for no_std + alloc #36
+
+# 0.8.1
+
+  * Downgrade rand to 0.9 to avoid double chacha20 dep #39
+
+# 0.8.0 (yanked)
+  
+  * Add I-FORWARD-TSN (RFC 8260) chunk support #29
+  * MSRV 1.85, Edition 2024, bump deps #38
   * Enforce receive-side max message size #27
 
 # 0.7.1

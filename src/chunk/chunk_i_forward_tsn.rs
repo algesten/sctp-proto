@@ -1,4 +1,4 @@
-use super::{chunk_header::*, chunk_type::*, *};
+use super::{chunk_forward_tsn::NEW_CUMULATIVE_TSN_LENGTH, chunk_header::*, chunk_type::*, *};
 use alloc::string::ToString;
 
 /// I-FORWARD-TSN chunk (RFC 8260).
@@ -58,7 +58,7 @@ impl Chunk for ChunkIForwardTsn {
         }
 
         let value_end = CHUNK_HEADER_SIZE + header.value_length();
-        if buf.len() < CHUNK_HEADER_SIZE + 4 {
+        if header.value_length() < NEW_CUMULATIVE_TSN_LENGTH {
             return Err(Error::ErrChunkTooShort);
         }
 
@@ -66,7 +66,7 @@ impl Chunk for ChunkIForwardTsn {
         let new_cumulative_tsn = reader.get_u32();
 
         let mut streams = vec![];
-        let mut offset = CHUNK_HEADER_SIZE + 4;
+        let mut offset = CHUNK_HEADER_SIZE + NEW_CUMULATIVE_TSN_LENGTH;
         while offset + I_FORWARD_TSN_STREAM_ENTRY_LENGTH <= value_end {
             let entry_buf = &mut buf.slice(offset..value_end);
             let identifier = entry_buf.get_u16();

@@ -55,12 +55,11 @@ impl Chunk for ChunkAbort {
             return Err(Error::ErrChunkTypeNotAbort);
         }
 
+        let value_end = CHUNK_HEADER_SIZE + header.value_length();
         let mut error_causes = vec![];
         let mut offset = CHUNK_HEADER_SIZE;
-        while offset + 4 <= raw.len() {
-            let e = ErrorCause::unmarshal(
-                &raw.slice(offset..CHUNK_HEADER_SIZE + header.value_length()),
-            )?;
+        while offset + ERROR_CAUSE_HEADER_LENGTH <= value_end {
+            let e = ErrorCause::unmarshal(&raw.slice(offset..value_end))?;
             offset += e.length();
             error_causes.push(e);
         }

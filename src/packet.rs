@@ -55,6 +55,7 @@ use core::fmt;
 ///|                           Checksum                            |
 ///+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 pub(crate) const PACKET_HEADER_SIZE: usize = 12;
+const INITIATE_TAG_LENGTH: usize = 4;
 
 #[derive(Default, Debug)]
 pub(crate) struct CommonHeader {
@@ -101,13 +102,17 @@ impl PartialDecode {
         let mut cookie = None;
         match header.typ {
             CT_INIT | CT_INIT_ACK => {
+                if header.value_length() < INITIATE_TAG_LENGTH {
+                    return Err(Error::ErrChunkValueNotLongEnough);
+                }
                 initiate_tag = Some(reader.get_u32());
             }
             CT_COOKIE_ECHO => {
-                cookie = Some(raw.slice(
-                    PACKET_HEADER_SIZE + CHUNK_HEADER_SIZE
-                        ..PACKET_HEADER_SIZE + CHUNK_HEADER_SIZE + header.value_length(),
-                ));
+                let end = PACKET_HEADER_SIZE + CHUNK_HEADER_SIZE + header.value_length();
+                if end > raw.len() {
+                    return Err(Error::ErrChunkValueNotLongEnough);
+                }
+                cookie = Some(raw.slice(PACKET_HEADER_SIZE + CHUNK_HEADER_SIZE..end));
             }
             _ => {}
         }

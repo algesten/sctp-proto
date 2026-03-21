@@ -63,6 +63,10 @@ impl Chunk for ChunkReconfig {
             return Err(Error::ErrChunkTypeNotReconfig);
         }
 
+        if header.value_length() < PARAM_HEADER_LENGTH {
+            return Err(Error::ErrChunkTooShort);
+        }
+
         let param_a =
             build_param(&raw.slice(CHUNK_HEADER_SIZE..CHUNK_HEADER_SIZE + header.value_length()))?;
 

@@ -131,7 +131,7 @@ impl Chunk for ChunkInit {
 
         if !(header.typ == CT_INIT || header.typ == CT_INIT_ACK) {
             return Err(Error::ErrChunkTypeNotTypeInit);
-        } else if raw.len() < CHUNK_HEADER_SIZE + INIT_CHUNK_MIN_LENGTH {
+        } else if header.value_length() < INIT_CHUNK_MIN_LENGTH {
             return Err(Error::ErrChunkValueNotLongEnough);
         }
 
@@ -152,7 +152,8 @@ impl Chunk for ChunkInit {
 
         let mut params = vec![];
         let mut offset = CHUNK_HEADER_SIZE + INIT_CHUNK_MIN_LENGTH;
-        let mut remaining = raw.len() as isize - offset as isize;
+        let value_end = CHUNK_HEADER_SIZE + header.value_length();
+        let mut remaining = value_end as isize - offset as isize;
         while remaining > INIT_OPTIONAL_VAR_HEADER_LENGTH as isize {
             let p = build_param(&raw.slice(offset..CHUNK_HEADER_SIZE + header.value_length()))?;
             let p_len = PARAM_HEADER_LENGTH + p.value_length();

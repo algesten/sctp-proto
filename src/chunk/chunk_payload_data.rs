@@ -182,7 +182,7 @@ impl Chunk for ChunkPayloadData {
         let beginning_fragment = (header.flags & PAYLOAD_DATA_BEGINING_FRAGMENT_BITMASK) != 0;
         let ending_fragment = (header.flags & PAYLOAD_DATA_ENDING_FRAGMENT_BITMASK) != 0;
 
-        if raw.len() < PAYLOAD_DATA_HEADER_SIZE {
+        if header.value_length() < PAYLOAD_DATA_HEADER_SIZE {
             return Err(Error::ErrChunkPayloadSmall);
         }
 

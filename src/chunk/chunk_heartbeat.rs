@@ -55,7 +55,7 @@ impl Chunk for ChunkHeartbeat {
             return Err(Error::ErrChunkTypeNotHeartbeat);
         }
 
-        if raw.len() <= CHUNK_HEADER_SIZE {
+        if header.value_length() < PARAM_HEADER_LENGTH {
             return Err(Error::ErrHeartbeatNotLongEnoughInfo);
         }
 

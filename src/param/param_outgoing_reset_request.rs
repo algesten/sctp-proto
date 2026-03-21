@@ -71,8 +71,7 @@ impl Param for ParamOutgoingResetRequest {
 
     fn unmarshal(raw: &Bytes) -> Result<Self> {
         let header = ParamHeader::unmarshal(raw)?;
-        if raw.len() < PARAM_HEADER_LENGTH + PARAM_OUTGOING_RESET_REQUEST_STREAM_IDENTIFIERS_OFFSET
-        {
+        if header.value_length() < PARAM_OUTGOING_RESET_REQUEST_STREAM_IDENTIFIERS_OFFSET {
             return Err(Error::ErrSsnResetRequestParamTooShort);
         }
 

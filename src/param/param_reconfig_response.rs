@@ -98,7 +98,7 @@ impl Param for ParamReconfigResponse {
 
     fn unmarshal(raw: &Bytes) -> Result<Self> {
         let header = ParamHeader::unmarshal(raw)?;
-        if raw.len() < 8 + PARAM_HEADER_LENGTH {
+        if header.value_length() < 8 {
             return Err(Error::ErrReconfigRespParamTooShort);
         }
 

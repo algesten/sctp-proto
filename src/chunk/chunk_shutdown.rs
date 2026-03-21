@@ -39,7 +39,7 @@ impl Chunk for ChunkShutdown {
             return Err(Error::ErrChunkTypeNotShutdown);
         }
 
-        if raw.len() != CHUNK_HEADER_SIZE + CUMULATIVE_TSN_ACK_LENGTH {
+        if header.value_length() != CUMULATIVE_TSN_ACK_LENGTH {
             return Err(Error::ErrInvalidChunkSize);
         }
 

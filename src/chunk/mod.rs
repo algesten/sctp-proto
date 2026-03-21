@@ -152,6 +152,9 @@ impl ErrorCause {
         }
 
         let value_length = len as usize - ERROR_CAUSE_HEADER_LENGTH;
+        if buf.len() < ERROR_CAUSE_HEADER_LENGTH + value_length {
+            return Err(Error::ErrErrorCauseTooSmall);
+        }
         let raw = buf.slice(ERROR_CAUSE_HEADER_LENGTH..ERROR_CAUSE_HEADER_LENGTH + value_length);
 
         Ok(ErrorCause { code, raw })

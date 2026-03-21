@@ -20,7 +20,8 @@
 //! [ServerConfig]: https://docs.rs/sctp-proto/latest/sctp_proto/struct.ServerConfig.html
 //! [Association]: https://docs.rs/sctp-proto/latest/sctp_proto/struct.Association.html
 //! [Association::poll]: https://docs.rs/sctp-proto/latest/sctp_proto/struct.Association.html#method.poll
-//! [Association::poll_transmit]: https://docs.rs/sctp-proto/latest/sctp_proto/struct.Association.html#method.poll_transmit
+//! [Association::poll_transmit]:
+//!     https://docs.rs/sctp-proto/latest/sctp_proto/struct.Association.html#method.poll_transmit
 //! [Event]: https://docs.rs/sctp-proto/latest/sctp_proto/enum.Event.html
 //! [Stream]: https://docs.rs/sctp-proto/latest/sctp_proto/struct.Stream.html
 //!
@@ -45,6 +46,7 @@
 #![deny(clippy::std_instead_of_alloc)]
 #![allow(dead_code)]
 #![allow(clippy::bool_to_int_with_if)]
+#![forbid(unsafe_code)]
 
 #[macro_use]
 extern crate alloc;
@@ -53,25 +55,21 @@ extern crate std;
 
 use alloc::vec::Vec;
 use bytes::Bytes;
-use core::{
-    fmt,
-    net::{IpAddr, SocketAddr},
-    ops,
-};
+use core::fmt;
+use core::net::{IpAddr, SocketAddr};
+use core::ops;
 use std::time::Instant;
 
 mod association;
-pub use crate::association::{
-    Association, AssociationError, Event,
-    stats::AssociationStats,
-    stream::{ReliabilityType, Stream, StreamEvent, StreamId, StreamState},
-};
+pub use crate::association::Association;
+pub use crate::association::AssociationError;
+pub use crate::association::Event;
+pub use crate::association::stats::AssociationStats;
+pub use crate::association::stream::{ReliabilityType, Stream, StreamEvent, StreamId, StreamState};
 
 pub(crate) mod chunk;
-pub use crate::chunk::{
-    ErrorCauseCode,
-    chunk_payload_data::{ChunkPayloadData, PayloadProtocolIdentifier},
-};
+pub use crate::chunk::ErrorCauseCode;
+pub use crate::chunk::chunk_payload_data::{ChunkPayloadData, PayloadProtocolIdentifier};
 
 mod config;
 pub use crate::config::{ClientConfig, EndpointConfig, ServerConfig, TransportConfig};

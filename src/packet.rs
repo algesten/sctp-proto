@@ -421,7 +421,8 @@ mod test {
         let header_only_marshaled = pkt.marshal()?;
         assert_eq!(
             header_only, header_only_marshaled,
-            "Unmarshal/Marshaled header only packet did not match \nheaderOnly: {:?} \nheader_only_marshaled {:?}",
+            "Unmarshal/Marshaled header only packet did not match \
+            \nheaderOnly: {:?} \nheader_only_marshaled {:?}",
             header_only, header_only_marshaled
         );
 

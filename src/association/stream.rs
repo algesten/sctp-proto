@@ -471,7 +471,8 @@ impl StreamState {
         let head_abandoned = false;
         let head_all_inflight = false;
         while remaining != 0 {
-            let fragment_size = core::cmp::min(self.max_payload_size as usize, remaining); //self.association.max_payload_size
+            // self.association.max_payload_size
+            let fragment_size = core::cmp::min(self.max_payload_size as usize, remaining);
 
             // Copy the userdata since we'll have to store it until acked
             // and the caller may re-use the buffer in the mean time

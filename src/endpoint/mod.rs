@@ -5,11 +5,10 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
-use core::{
-    fmt, iter,
-    net::{IpAddr, SocketAddr},
-    ops::{Index, IndexMut},
-};
+use core::fmt;
+use core::iter;
+use core::net::{IpAddr, SocketAddr};
+use core::ops::{Index, IndexMut};
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -17,9 +16,9 @@ use crate::association::Association;
 use crate::chunk::chunk_type::CT_INIT;
 use crate::config::{ClientConfig, EndpointConfig, ServerConfig, TransportConfig};
 use crate::packet::PartialDecode;
-use crate::shared::{
-    AssociationEvent, AssociationEventInner, AssociationId, EndpointEvent, EndpointEventInner,
-};
+use crate::shared::AssociationEvent;
+use crate::shared::{AssociationEventInner, AssociationId};
+use crate::shared::{EndpointEvent, EndpointEventInner};
 use crate::util::{AssociationIdGenerator, RandomAssociationIdGenerator};
 use crate::{EcnCodepoint, Payload, Transmit};
 
@@ -53,7 +52,8 @@ pub struct Endpoint {
     server_config: Option<Arc<ServerConfig>>,
     /// Whether incoming associations should be unconditionally rejected by a server
     ///
-    /// Equivalent to a `ServerConfig.accept_buffer` of `0`, but can be changed after the endpoint is constructed.
+    /// Equivalent to a `ServerConfig.accept_buffer` of `0`, but can
+    /// be changed after the endpoint is constructed.
     reject_new_associations: bool,
 }
 

@@ -8,10 +8,13 @@ use crate::param::Param;
 use crate::param::param_header::{PARAM_HEADER_LENGTH, ParamHeader};
 use crate::param::param_type::ParamType;
 
-/// This type is meant to represent ANY parameter for un/remarshaling purposes, where we do not have a more specific type for it.
-/// This means we do not really understand the semantics of the param but can represent it.
+/// This type is meant to represent ANY parameter for
+/// un/remarshaling purposes, where we do not have a more specific
+/// type for it. This means we do not really understand the semantics
+/// of the param but can represent it.
 ///
-/// This is useful for usage in e.g.`ParamUnrecognized` where we want to report some unrecognized params back to the sender.
+/// This is useful for usage in e.g.`ParamUnrecognized` where we want
+/// to report some unrecognized params back to the sender.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParamUnknown {
     typ: u16,

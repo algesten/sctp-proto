@@ -488,7 +488,8 @@ fn test_init_chunk() -> Result<()> {
         );
         assert_eq!(
             c.advertised_receiver_window_credit, 131072,
-            "Unmarshal passed for SCTP packet, but got incorrect advertisedReceiverWindowCredit exp: {} act: {}",
+            "Unmarshal passed for SCTP packet, but got incorrect \
+            advertisedReceiverWindowCredit exp: {} act: {}",
             131072, c.advertised_receiver_window_credit
         );
         assert_eq!(
@@ -623,7 +624,8 @@ fn test_init_marshal_unmarshal() -> Result<()> {
         );
         assert_eq!(
             c.advertised_receiver_window_credit, 1024,
-            "Unmarshal passed for SCTP packet, but got incorrect advertisedReceiverWindowCredit exp: {} act: {}",
+            "Unmarshal passed for SCTP packet, but got incorrect \
+            advertisedReceiverWindowCredit exp: {} act: {}",
             1024, c.advertised_receiver_window_credit
         );
         assert_eq!(

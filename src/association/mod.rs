@@ -1,29 +1,33 @@
-use crate::association::{
-    state::{AckMode, AckState, AssociationState},
-    stats::AssociationStats,
-};
-use crate::chunk::{
-    Chunk, ErrorCauseUnrecognizedChunkType, USER_INITIATED_ABORT, chunk_abort::ChunkAbort,
-    chunk_cookie_ack::ChunkCookieAck, chunk_cookie_echo::ChunkCookieEcho, chunk_error::ChunkError,
-    chunk_forward_tsn::ChunkForwardTsn, chunk_forward_tsn::ChunkForwardTsnStream,
-    chunk_heartbeat::ChunkHeartbeat, chunk_heartbeat_ack::ChunkHeartbeatAck,
-    chunk_i_forward_tsn::ChunkIForwardTsn, chunk_init::ChunkInit, chunk_init::ChunkInitAck,
-    chunk_payload_data::ChunkPayloadData, chunk_payload_data::PayloadProtocolIdentifier,
-    chunk_reconfig::ChunkReconfig, chunk_selective_ack::ChunkSelectiveAck,
-    chunk_shutdown::ChunkShutdown, chunk_shutdown_ack::ChunkShutdownAck,
-    chunk_shutdown_complete::ChunkShutdownComplete, chunk_type::CT_FORWARD_TSN,
-};
+use crate::association::state::{AckMode, AckState, AssociationState};
+use crate::association::stats::AssociationStats;
+use crate::chunk::Chunk;
+use crate::chunk::ErrorCauseUnrecognizedChunkType;
+use crate::chunk::USER_INITIATED_ABORT;
+use crate::chunk::chunk_abort::ChunkAbort;
+use crate::chunk::chunk_cookie_ack::ChunkCookieAck;
+use crate::chunk::chunk_cookie_echo::ChunkCookieEcho;
+use crate::chunk::chunk_error::ChunkError;
+use crate::chunk::chunk_forward_tsn::{ChunkForwardTsn, ChunkForwardTsnStream};
+use crate::chunk::chunk_heartbeat::ChunkHeartbeat;
+use crate::chunk::chunk_heartbeat_ack::ChunkHeartbeatAck;
+use crate::chunk::chunk_i_forward_tsn::ChunkIForwardTsn;
+use crate::chunk::chunk_init::{ChunkInit, ChunkInitAck};
+use crate::chunk::chunk_payload_data::{ChunkPayloadData, PayloadProtocolIdentifier};
+use crate::chunk::chunk_reconfig::ChunkReconfig;
+use crate::chunk::chunk_selective_ack::ChunkSelectiveAck;
+use crate::chunk::chunk_shutdown::ChunkShutdown;
+use crate::chunk::chunk_shutdown_ack::ChunkShutdownAck;
+use crate::chunk::chunk_shutdown_complete::ChunkShutdownComplete;
+use crate::chunk::chunk_type::CT_FORWARD_TSN;
 use crate::config::{COMMON_HEADER_SIZE, DATA_CHUNK_HEADER_SIZE, ServerConfig, TransportConfig};
 use crate::error::{Error, Result};
 use crate::packet::{CommonHeader, Packet};
-use crate::param::{
-    Param,
-    param_heartbeat_info::ParamHeartbeatInfo,
-    param_outgoing_reset_request::ParamOutgoingResetRequest,
-    param_reconfig_response::{ParamReconfigResponse, ReconfigResult},
-    param_state_cookie::ParamStateCookie,
-    param_supported_extensions::ParamSupportedExtensions,
-};
+use crate::param::Param;
+use crate::param::param_heartbeat_info::ParamHeartbeatInfo;
+use crate::param::param_outgoing_reset_request::ParamOutgoingResetRequest;
+use crate::param::param_reconfig_response::{ParamReconfigResponse, ReconfigResult};
+use crate::param::param_state_cookie::ParamStateCookie;
+use crate::param::param_supported_extensions::ParamSupportedExtensions;
 use crate::queue::{payload_queue::PayloadQueue, pending_queue::PendingQueue};
 use crate::shared::{AssociationEventInner, AssociationId, EndpointEvent, EndpointEventInner};
 use crate::util::{sna16lt, sna32gt, sna32gte, sna32lt, sna32lte};
@@ -1250,7 +1254,8 @@ impl Association {
                     if let Some(last_tsn) = self.payload_queue.get_last_tsn_received() {
                         if sna32lt(d.tsn, *last_tsn) {
                             debug!(
-                                "[{}] receive buffer full, but accepted as this is a missing chunk with tsn={} ssn={}",
+                                "[{}] receive buffer full, but accepted \
+                                as missing chunk tsn={} ssn={}",
                                 self.side, d.tsn, d.stream_sequence_number
                             );
                             stream_handle_data = true;
@@ -2096,7 +2101,8 @@ impl Association {
         }
     }
 
-    /// create_stream creates a stream. The caller should hold the lock and check no stream exists for this id.
+    /// create_stream creates a stream. The caller should hold the lock
+    /// and check no stream exists for this id.
     fn create_stream(
         &mut self,
         stream_identifier: StreamId,
@@ -2465,8 +2471,9 @@ impl Association {
         (raw_packets, ok)
     }
 
-    /// get_data_packets_to_retransmit is called when T3-rtx is timed out and retransmit outstanding data chunks
-    /// that are not acked or abandoned yet.
+    /// get_data_packets_to_retransmit is called when T3-rtx is timed
+    /// out and retransmit outstanding data chunks that are not acked
+    /// or abandoned yet.
     fn get_data_packets_to_retransmit(&mut self, now: Instant) -> Vec<Packet> {
         let awnd = core::cmp::min(self.cwnd, self.rwnd);
         let mut chunks = vec![];

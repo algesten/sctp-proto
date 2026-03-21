@@ -335,7 +335,7 @@ impl Association {
         // config.rs to get max_payload_size from INITIAL_MTU.
         let mtu = max_payload_size + COMMON_HEADER_SIZE + DATA_CHUNK_HEADER_SIZE;
 
-        // RFC 4690 Sec 7.2.1
+        // RFC 4960 Sec 7.2.1
         // The initial cwnd before DATA transmission or after a sufficiently
         // long idle period MUST be set to min(4*MTU, max (2*MTU, 4380bytes)).
         let cwnd = (2 * mtu).clamp(4380, 4 * mtu);
@@ -1088,7 +1088,7 @@ impl Association {
         self.rwnd = i.advertised_receiver_window_credit;
         debug!("[{}] initial rwnd={}", self.side, self.rwnd);
 
-        // RFC 4690 Sec 7.2.1
+        // RFC 4960 Sec 7.2.1
         //  o  The initial value of ssthresh MAY be arbitrarily high (for
         //     example, implementations MAY use the size of the receiver
         //     advertised window).

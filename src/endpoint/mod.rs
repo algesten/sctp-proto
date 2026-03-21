@@ -3,7 +3,7 @@ mod endpoint_test;
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use core::fmt;
 use core::iter;
@@ -12,8 +12,8 @@ use core::ops::{Index, IndexMut};
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::association::Association;
-use crate::chunk::chunk_type::CT_INIT;
+use crate::chunk::{chunk_init::ChunkInit, chunk_type::CT_INIT};
+use crate::config::MAX_SNAP_INIT_BYTES;
 use crate::config::{ClientConfig, EndpointConfig, ServerConfig, TransportConfig};
 use crate::packet::PartialDecode;
 use crate::shared::AssociationEvent;
@@ -21,9 +21,10 @@ use crate::shared::{AssociationEventInner, AssociationId};
 use crate::shared::{EndpointEvent, EndpointEventInner};
 use crate::util::{AssociationIdGenerator, RandomAssociationIdGenerator};
 use crate::{EcnCodepoint, Payload, Transmit};
+use crate::{association::Association, chunk::Chunk};
 
 use bytes::Bytes;
-use log::{debug, trace};
+use log::{debug, trace, warn};
 use rand::{SeedableRng, rngs::StdRng};
 use rustc_hash::FxHashMap;
 use slab::Slab;
@@ -152,7 +153,7 @@ impl Endpoint {
             //TODO: improve INIT handling for DoS attack
             if partial_decode.first_chunk_type == CT_INIT {
                 if let Some(dst_cid) = partial_decode.initiate_tag {
-                    self.association_ids.get(&dst_cid).cloned()
+                    self.association_ids_init.get(&dst_cid).cloned()
                 } else {
                     None
                 }
@@ -183,7 +184,26 @@ impl Endpoint {
             .map(|(ch, a)| (ch, DatagramEvent::NewAssociation(a)))
     }
 
-    /// Initiate an Association
+    /// Initiate an association.
+    ///
+    /// If SNAP tokens (INIT chunks) are provided via [`ClientConfig::with_snap`],
+    /// the association will skip the SCTP 4-way handshake (RFC 4960 Section 5.1)
+    /// and immediately transition to the ESTABLISHED state.
+    ///
+    /// Both `local_sctp_init` and `remote_sctp_init` must be provided for SNAP;
+    /// use [`generate_snap_token`](crate::generate_snap_token) to create the
+    /// local token.
+    ///
+    /// If only one side is set (e.g. the peer does not support SNAP), the
+    /// association falls back to the normal SCTP handshake.
+    ///
+    /// **Note:** When using SNAP, **both** peers must call [`Endpoint::connect`]
+    /// (there is no server-side SNAP via [`Endpoint::handle`]). Each peer
+    /// generates its own token via [`generate_snap_token`](crate::generate_snap_token),
+    /// exchanges it with the remote peer through a signaling channel (e.g.,
+    /// SDP `a=sctp-init`), and then calls `connect` with `with_snap(local, remote)`.
+    ///
+    /// See [draft-hancke-tsvwg-snap-01](https://datatracker.ietf.org/doc/draft-hancke-tsvwg-snap/).
     pub fn connect(
         &mut self,
         config: ClientConfig,
@@ -196,18 +216,180 @@ impl Endpoint {
             return Err(ConnectError::InvalidRemoteAddress(remote));
         }
 
-        let remote_aid = RandomAssociationIdGenerator::new().generate_aid();
-        let local_aid = self.new_aid();
+        match (config.local_sctp_init, config.remote_sctp_init) {
+            (Some(local_init), Some(remote_init)) => {
+                self.connect_with_snap(config.transport, remote, local_init, remote_init)
+            }
+            (partial_local, partial_remote) => {
+                if partial_local.is_some() || partial_remote.is_some() {
+                    warn!(
+                        "partial SNAP config: both local_sctp_init and \
+                        remote_sctp_init must be set; falling back to normal handshake"
+                    );
+                }
+                let remote_aid = RandomAssociationIdGenerator::new().generate_aid();
+                let local_aid = self.new_aid();
 
-        let (ch, conn) = self.add_association(
-            remote_aid,
-            local_aid,
+                Ok(self.add_association(
+                    remote_aid,
+                    local_aid,
+                    remote,
+                    None,
+                    Instant::now(),
+                    None,
+                    config.transport,
+                ))
+            }
+        }
+    }
+
+    /// Create an association using SNAP (out-of-band exchanged INIT chunks).
+    fn connect_with_snap(
+        &mut self,
+        transport: Arc<TransportConfig>,
+        remote: SocketAddr,
+        local_snap_bytes: Bytes,
+        remote_snap_bytes: Bytes,
+    ) -> Result<(AssociationHandle, Association), ConnectError> {
+        // Enforce a size ceiling on raw INIT bytes before parsing.
+        if local_snap_bytes.len() > MAX_SNAP_INIT_BYTES {
+            return Err(ConnectError::Snap(SnapError::OversizedInit {
+                side: SnapSide::Local,
+                len: local_snap_bytes.len(),
+            }));
+        }
+        if remote_snap_bytes.len() > MAX_SNAP_INIT_BYTES {
+            return Err(ConnectError::Snap(SnapError::OversizedInit {
+                side: SnapSide::Remote,
+                len: remote_snap_bytes.len(),
+            }));
+        }
+
+        let local_init = ChunkInit::unmarshal(&local_snap_bytes).map_err(|err| {
+            ConnectError::Snap(SnapError::ParseFailed {
+                side: SnapSide::Local,
+                reason: err.to_string(),
+            })
+        })?;
+        let remote_init = ChunkInit::unmarshal(&remote_snap_bytes).map_err(|err| {
+            ConnectError::Snap(SnapError::ParseFailed {
+                side: SnapSide::Remote,
+                reason: err.to_string(),
+            })
+        })?;
+
+        // Validate both chunks are INIT (not INIT-ACK)
+        if local_init.is_ack {
+            return Err(ConnectError::Snap(SnapError::InvalidInitAck {
+                side: SnapSide::Local,
+            }));
+        }
+        if remote_init.is_ack {
+            return Err(ConnectError::Snap(SnapError::InvalidInitAck {
+                side: SnapSide::Remote,
+            }));
+        }
+
+        let local_aid = local_init.initiate_tag;
+        let remote_aid = remote_init.initiate_tag;
+
+        // RFC 4960 Section 3.3.2: The Initiate Tag MUST NOT take the value 0.
+        if local_aid == 0 {
+            return Err(ConnectError::Snap(SnapError::ZeroInitiateTag {
+                side: SnapSide::Local,
+            }));
+        }
+        if remote_aid == 0 {
+            return Err(ConnectError::Snap(SnapError::ZeroInitiateTag {
+                side: SnapSide::Remote,
+            }));
+        }
+
+        // initial_tsn=0 is degenerate: wrapping_sub(1) yields u32::MAX for
+        // peer_last_tsn, which would accept nearly all incoming TSNs.
+        if local_init.initial_tsn == 0 {
+            return Err(ConnectError::Snap(SnapError::ZeroInitialTsn {
+                side: SnapSide::Local,
+            }));
+        }
+        if remote_init.initial_tsn == 0 {
+            return Err(ConnectError::Snap(SnapError::ZeroInitialTsn {
+                side: SnapSide::Remote,
+            }));
+        }
+
+        // RFC 4960 §3.3.2 / §5.1: validate stream counts, a_rwnd, etc.
+        local_init.check().map_err(|err| {
+            ConnectError::Snap(SnapError::InvalidInit {
+                side: SnapSide::Local,
+                reason: err.to_string(),
+            })
+        })?;
+        remote_init.check().map_err(|err| {
+            ConnectError::Snap(SnapError::InvalidInit {
+                side: SnapSide::Remote,
+                reason: err.to_string(),
+            })
+        })?;
+
+        // Check for collision BEFORE allocating any resources.
+        if local_aid == remote_aid {
+            return Err(ConnectError::Snap(SnapError::AidCollision {
+                kind: AidCollisionKind::LocalEqualsRemote,
+                aid: local_aid,
+            }));
+        }
+        if self.association_ids.contains_key(&local_aid) {
+            return Err(ConnectError::Snap(SnapError::AidCollision {
+                kind: AidCollisionKind::LocalInAssociationIds,
+                aid: local_aid,
+            }));
+        }
+        if self.association_ids.contains_key(&remote_aid) {
+            return Err(ConnectError::Snap(SnapError::AidCollision {
+                kind: AidCollisionKind::RemoteInAssociationIds,
+                aid: remote_aid,
+            }));
+        }
+        if self.association_ids_init.contains_key(&remote_aid) {
+            return Err(ConnectError::Snap(SnapError::AidCollision {
+                kind: AidCollisionKind::RemoteInAssociationIdsInit,
+                aid: remote_aid,
+            }));
+        }
+        if self.association_ids_init.contains_key(&local_aid) {
+            return Err(ConnectError::Snap(SnapError::AidCollision {
+                kind: AidCollisionKind::LocalInAssociationIdsInit,
+                aid: local_aid,
+            }));
+        }
+
+        let conn = Association::new_with_out_of_band_init(
+            transport,
+            self.config.get_max_payload_size(),
             remote,
             None,
-            Instant::now(),
-            None,
-            config.transport,
+            local_init,
+            remote_init,
+        )
+        .map_err(|err| ConnectError::Snap(SnapError::AssociationFailed(err.to_string())))?;
+
+        let id = self.associations.insert(AssociationMeta {
+            init_cid: remote_aid,
+            cids_issued: 1,
+            loc_cids: iter::once((0, local_aid)).collect(),
+            initial_remote: remote,
+        });
+
+        let ch = AssociationHandle(id);
+        self.association_ids.insert(local_aid, ch);
+        self.association_ids_init.insert(remote_aid, ch);
+
+        debug!(
+            "Created SNAP association: local_aid={:#x} remote_aid={:#x}",
+            local_aid, remote_aid
         );
+
         Ok((ch, conn))
     }
 
@@ -262,6 +444,10 @@ impl Endpoint {
             transport_config,
         );
 
+        // Map the peer's INIT Initiate Tag so that retransmitted INITs (which use
+        // verification_tag=0) can be routed to the association created for the first INIT.
+        self.association_ids_init.insert(remote_aid, ch);
+
         conn.handle_event(AssociationEvent(AssociationEventInner::Datagram(
             Transmit {
                 now,
@@ -298,7 +484,7 @@ impl Endpoint {
 
         let id = self.associations.insert(AssociationMeta {
             init_cid: remote_aid,
-            cids_issued: 0,
+            cids_issued: 1,
             loc_cids: iter::once((0, local_aid)).collect(),
             initial_remote: remote_addr,
         });
@@ -399,4 +585,122 @@ pub enum ConnectError {
     /// Use `Endpoint::connect_with` to specify a client configuration.
     #[error("no default client config")]
     NoDefaultClientConfig,
+    /// Out-of-band SNAP setup error.
+    #[error("SNAP error: {0}")]
+    Snap(#[from] SnapError),
+}
+
+/// Which peer's token (INIT chunk) caused a [`SnapError`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapSide {
+    /// The locally-generated token.
+    Local,
+    /// The remote peer's token.
+    Remote,
+}
+
+impl fmt::Display for SnapSide {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SnapSide::Local => f.write_str("local"),
+            SnapSide::Remote => f.write_str("remote"),
+        }
+    }
+}
+
+/// Which routing table detected an association-ID collision in [`SnapError::AidCollision`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AidCollisionKind {
+    /// The local and remote association IDs are equal.
+    LocalEqualsRemote,
+    /// The local AID is already present in `association_ids`.
+    LocalInAssociationIds,
+    /// The remote AID is already present in `association_ids`.
+    RemoteInAssociationIds,
+    /// The remote AID is already present in `association_ids_init`.
+    RemoteInAssociationIdsInit,
+    /// The local AID is already present in `association_ids_init`.
+    LocalInAssociationIdsInit,
+}
+
+impl fmt::Display for AidCollisionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AidCollisionKind::LocalEqualsRemote => f.write_str("local_aid equals remote_aid"),
+            AidCollisionKind::LocalInAssociationIds => f.write_str("local_aid in association_ids"),
+            AidCollisionKind::RemoteInAssociationIds => {
+                f.write_str("remote_aid in association_ids")
+            }
+            AidCollisionKind::RemoteInAssociationIdsInit => {
+                f.write_str("remote_aid in association_ids_init")
+            }
+            AidCollisionKind::LocalInAssociationIdsInit => {
+                f.write_str("local_aid in association_ids_init")
+            }
+        }
+    }
+}
+
+/// Specific errors that can occur during SNAP (out-of-band token) setup.
+///
+/// These are not part of the stable API — match on [`ConnectError::Snap`]
+/// and use the `Display` impl for user-facing messages.
+#[non_exhaustive]
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum SnapError {
+    /// Failed to parse token (INIT chunk) bytes.
+    #[error("failed to parse {side} SNAP token: {reason}")]
+    ParseFailed {
+        /// Which side's token failed to parse.
+        side: SnapSide,
+        /// The underlying parse error message.
+        reason: String,
+    },
+    /// The provided bytes were an INIT-ACK, not an INIT.
+    #[error("invalid {side} SNAP token: expected INIT, got INIT-ACK")]
+    InvalidInitAck {
+        /// Which side provided an INIT-ACK instead of an INIT.
+        side: SnapSide,
+    },
+    /// The token's `initiate_tag` is zero (RFC 4960 §3.3.2 violation).
+    #[error("{side} SNAP token has zero initiate_tag")]
+    ZeroInitiateTag {
+        /// Which side has the zero tag.
+        side: SnapSide,
+    },
+    /// The token's `initial_tsn` is zero.
+    #[error("{side} SNAP token has zero initial_tsn")]
+    ZeroInitialTsn {
+        /// Which side has the zero TSN.
+        side: SnapSide,
+    },
+    /// An association ID collision was detected.
+    #[error("SNAP collision: {kind} {aid:#x} already in use")]
+    AidCollision {
+        /// Which routing table collided.
+        kind: AidCollisionKind,
+        /// The colliding association ID.
+        aid: u32,
+    },
+    /// The token (INIT chunk) bytes exceed the maximum allowed size.
+    #[error("{side} SNAP token too large: {len} bytes (max {max})", max = MAX_SNAP_INIT_BYTES)]
+    OversizedInit {
+        /// Which side sent oversized bytes.
+        side: SnapSide,
+        /// Actual byte length.
+        len: usize,
+    },
+    /// The parsed token (INIT chunk) failed RFC 4960 validation.
+    #[error("invalid {side} SNAP token: {reason}")]
+    InvalidInit {
+        /// Which side has the invalid token.
+        side: SnapSide,
+        /// The underlying validation error message.
+        reason: String,
+    },
+    /// Association creation failed.
+    #[error("failed to create SNAP association: {0}")]
+    AssociationFailed(String),
 }

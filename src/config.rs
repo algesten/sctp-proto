@@ -2,6 +2,7 @@ use crate::util::{AssociationIdGenerator, RandomAssociationIdGenerator};
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use bytes::Bytes;
 use core::fmt;
 
 /// MTU for inbound packet (from DTLS)
@@ -289,19 +290,50 @@ impl ServerConfig {
     }
 }
 
-/// Configuration for outgoing associations
+/// Default SCTP source/destination port (conventional for WebRTC data channels).
+pub const DEFAULT_SCTP_PORT: u16 = 5000;
+
+/// Maximum allowed size (in bytes) of a serialized SNAP token (INIT chunk)
+/// accepted via out-of-band negotiation. A typical token is well under
+/// 100 bytes; this limit prevents accidentally feeding megabytes of
+/// untrusted signaling data into the parser.
+pub const MAX_SNAP_INIT_BYTES: usize = 2048;
+
+/// Configuration for outgoing associations.
 ///
 /// Default values should be suitable for most internet applications.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     /// Transport configuration to use
     pub transport: Arc<TransportConfig>,
+    /// Local SNAP token (INIT chunk) bytes.
+    ///
+    /// Generated via [`generate_snap_token`]. When both `local_sctp_init` and
+    /// `remote_sctp_init` are set, the association skips the SCTP 4-way
+    /// handshake (RFC 4960 Section 5.1) and immediately transitions to the
+    /// ESTABLISHED state.
+    ///
+    /// If only one side is set (e.g. the peer does not support SNAP), the
+    /// association falls back to the normal SCTP handshake.
+    ///
+    /// See [draft-hancke-tsvwg-snap-01](https://datatracker.ietf.org/doc/draft-hancke-tsvwg-snap/).
+    pub(crate) local_sctp_init: Option<Bytes>,
+    /// Remote SNAP token (INIT chunk) bytes.
+    ///
+    /// Received from the peer via a signaling channel (e.g., SDP `a=sctp-init`
+    /// attribute). Must be provided together with `local_sctp_init` to enable
+    /// SNAP.
+    ///
+    /// See [draft-hancke-tsvwg-snap-01](https://datatracker.ietf.org/doc/draft-hancke-tsvwg-snap/).
+    pub(crate) remote_sctp_init: Option<Bytes>,
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
         ClientConfig {
             transport: Arc::new(TransportConfig::default()),
+            local_sctp_init: None,
+            remote_sctp_init: None,
         }
     }
 }
@@ -311,4 +343,60 @@ impl ClientConfig {
     pub fn new() -> Self {
         ClientConfig::default()
     }
+
+    /// Enable SNAP (SCTP Negotiation Acceleration Protocol).
+    ///
+    /// Both a local and remote SNAP token (INIT chunk) must be provided.
+    /// The local token should be generated via [`generate_snap_token`] and
+    /// exchanged with the remote peer through a signaling channel (e.g.,
+    /// SDP `a=sctp-init` attribute). The remote token is the peer's
+    /// corresponding bytes received via signaling.
+    ///
+    /// When both are set, the association skips the SCTP 4-way handshake
+    /// (RFC 4960 Section 5.1) and immediately transitions to the ESTABLISHED
+    /// state.
+    ///
+    /// **Note:** When using SNAP, **both** peers must call
+    /// [`Endpoint::connect`](crate::Endpoint::connect) — there is no
+    /// server-side SNAP via [`Endpoint::handle`](crate::Endpoint::handle).
+    ///
+    /// See [draft-hancke-tsvwg-snap-01](https://datatracker.ietf.org/doc/draft-hancke-tsvwg-snap/).
+    pub fn with_snap(mut self, local_sctp_init: Bytes, remote_sctp_init: Bytes) -> Self {
+        self.local_sctp_init = Some(local_sctp_init);
+        self.remote_sctp_init = Some(remote_sctp_init);
+        self
+    }
+}
+
+/// Generate a SNAP token (INIT chunk) for out-of-band negotiation.
+///
+/// Creates a serialized SCTP INIT **chunk** (not a full SCTP packet — no
+/// common header or IP/UDP framing) with random `initiate_tag` and
+/// `initial_tsn` values, using the receiver window from the provided
+/// [`TransportConfig`]. Stream counts are set to `u16::MAX` so that the
+/// actual limit is determined by the peer's offer during negotiation.
+///
+/// The returned bytes are suitable for exchange via a signaling channel
+/// (e.g., SDP `a=sctp-init`) as described in
+/// [draft-hancke-tsvwg-snap-01](https://datatracker.ietf.org/doc/draft-hancke-tsvwg-snap/).
+///
+/// Each call generates fresh random values. The caller must hold onto the
+/// returned bytes and pass them to [`ClientConfig::with_snap`] alongside
+/// the remote peer's token.
+pub fn generate_snap_token(config: &TransportConfig) -> Result<Bytes, crate::error::Error> {
+    use crate::chunk::{Chunk, chunk_init::ChunkInit};
+    use core::num::NonZeroU32;
+    use rand::random;
+
+    let mut init = ChunkInit {
+        initiate_tag: random::<NonZeroU32>().get(),
+        initial_tsn: random::<NonZeroU32>().get(),
+        num_outbound_streams: u16::MAX,
+        num_inbound_streams: u16::MAX,
+        advertised_receiver_window_credit: config.max_receive_buffer_size(),
+        ..Default::default()
+    };
+    init.set_supported_extensions();
+    init.check()?;
+    init.marshal()
 }

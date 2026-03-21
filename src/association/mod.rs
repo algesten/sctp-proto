@@ -19,7 +19,10 @@ use crate::chunk::chunk_shutdown::ChunkShutdown;
 use crate::chunk::chunk_shutdown_ack::ChunkShutdownAck;
 use crate::chunk::chunk_shutdown_complete::ChunkShutdownComplete;
 use crate::chunk::chunk_type::CT_FORWARD_TSN;
-use crate::config::{COMMON_HEADER_SIZE, DATA_CHUNK_HEADER_SIZE, ServerConfig, TransportConfig};
+use crate::config::COMMON_HEADER_SIZE;
+use crate::config::DATA_CHUNK_HEADER_SIZE;
+use crate::config::DEFAULT_SCTP_PORT;
+use crate::config::{ServerConfig, TransportConfig};
 use crate::error::{Error, Result};
 use crate::packet::{CommonHeader, Packet};
 use crate::param::Param;
@@ -44,6 +47,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use bytes::Bytes;
 use core::net::{IpAddr, SocketAddr};
+use core::num::NonZeroU32;
 use core::str::FromStr;
 use core::time::Duration;
 use log::{debug, error, trace, warn};
@@ -316,21 +320,15 @@ impl Default for Association {
 }
 
 impl Association {
-    pub(crate) fn new(
-        server_config: Option<Arc<ServerConfig>>,
+    fn new_common(
         config: Arc<TransportConfig>,
         max_payload_size: u32,
-        local_aid: AssociationId,
         remote_addr: SocketAddr,
         local_ip: Option<IpAddr>,
-        now: Instant,
+        side: Side,
+        verification_tag: u32,
+        initial_tsn: u32,
     ) -> Self {
-        let side = if server_config.is_some() {
-            Side::Server
-        } else {
-            Side::Client
-        };
-
         // It's a bit strange, but we're going backwards from the calculation in
         // config.rs to get max_payload_size from INITIAL_MTU.
         let mtu = max_payload_size + COMMON_HEADER_SIZE + DATA_CHUNK_HEADER_SIZE;
@@ -339,12 +337,8 @@ impl Association {
         // The initial cwnd before DATA transmission or after a sufficiently
         // long idle period MUST be set to min(4*MTU, max (2*MTU, 4380bytes)).
         let cwnd = (2 * mtu).clamp(4380, 4 * mtu);
-        let mut tsn = random::<u32>();
-        if tsn == 0 {
-            tsn += 1;
-        }
 
-        let mut this = Association {
+        Association {
             side,
             handshake_completed: false,
             max_receive_buffer_size: config.max_receive_buffer_size(),
@@ -370,16 +364,47 @@ impl Association {
             remote_addr,
             local_ip,
 
-            my_verification_tag: local_aid,
-            my_next_tsn: tsn,
-            my_next_rsn: tsn,
-            min_tsn2measure_rtt: tsn,
-            cumulative_tsn_ack_point: tsn - 1,
-            advanced_peer_tsn_ack_point: tsn - 1,
+            my_verification_tag: verification_tag,
+            my_next_tsn: initial_tsn,
+            my_next_rsn: initial_tsn,
+            min_tsn2measure_rtt: initial_tsn,
+            cumulative_tsn_ack_point: initial_tsn.wrapping_sub(1),
+            advanced_peer_tsn_ack_point: initial_tsn.wrapping_sub(1),
             error: None,
 
             ..Default::default()
+        }
+    }
+
+    pub(crate) fn new(
+        server_config: Option<Arc<ServerConfig>>,
+        config: Arc<TransportConfig>,
+        max_payload_size: u32,
+        local_aid: AssociationId,
+        remote_addr: SocketAddr,
+        local_ip: Option<IpAddr>,
+        now: Instant,
+    ) -> Self {
+        let side = if server_config.is_some() {
+            Side::Server
+        } else {
+            Side::Client
         };
+
+        let tsn = random::<NonZeroU32>().get();
+
+        let mut this = Self::new_common(
+            config,
+            max_payload_size,
+            remote_addr,
+            local_ip,
+            side,
+            local_aid,
+            tsn,
+        );
+
+        this.source_port = DEFAULT_SCTP_PORT;
+        this.destination_port = DEFAULT_SCTP_PORT;
 
         if side.is_client() {
             let mut init = ChunkInit {
@@ -400,6 +425,97 @@ impl Association {
         }
 
         this
+    }
+
+    /// Creates a new association using out-of-band exchanged SNAP tokens (INIT chunks).
+    ///
+    /// This allows skipping the SCTP 4-way handshake (RFC 4960 Section 5.1)
+    /// by exchanging tokens out-of-band (e.g., via a signaling channel
+    /// using SDP `a=sctp-init`). The association immediately transitions to
+    /// the ESTABLISHED state.
+    ///
+    /// **Note:** When using SNAP, **both** peers must call
+    /// [`Endpoint::connect`](crate::Endpoint::connect). There is no
+    /// server-side SNAP via [`Endpoint::handle`](crate::Endpoint::handle).
+    ///
+    /// See [draft-hancke-tsvwg-snap-01](https://datatracker.ietf.org/doc/draft-hancke-tsvwg-snap/).
+    ///
+    /// # Arguments
+    /// * `config` - Transport configuration.
+    /// * `max_payload_size` - Maximum payload size.
+    /// * `remote_addr` - Remote socket address.
+    /// * `local_ip` - Optional local IP address.
+    /// * `local_init` - Parsed local token (INIT chunk).
+    /// * `remote_init` - Parsed remote token (INIT chunk).
+    ///
+    /// # Returns
+    /// A new association in the ESTABLISHED state, or an error if the
+    /// tokens are invalid.
+    pub(crate) fn new_with_out_of_band_init(
+        config: Arc<TransportConfig>,
+        max_payload_size: u32,
+        remote_addr: SocketAddr,
+        local_ip: Option<IpAddr>,
+        local_init: ChunkInit,
+        remote_init: ChunkInit,
+    ) -> Result<Self> {
+        // Derive side deterministically: the peer with the lower initiate_tag
+        // acts as server so that log lines are distinguishable. This is purely
+        // cosmetic — equal tags are impossible because the caller in
+        // `connect_with_snap` rejects that case with `AidCollision`.
+        let side = if local_init.initiate_tag <= remote_init.initiate_tag {
+            Side::Server
+        } else {
+            Side::Client
+        };
+
+        // Use the TSN from our local INIT chunk
+        let tsn = local_init.initial_tsn;
+
+        let mut this = Self::new_common(
+            config.clone(),
+            max_payload_size,
+            remote_addr,
+            local_ip,
+            side,
+            local_init.initiate_tag,
+            tsn,
+        );
+
+        // Negotiate stream counts: use the smaller of our config limit and
+        // what the remote offers (RFC 4960 §5.1.1 cross-negotiation).
+        this.my_max_num_inbound_streams = core::cmp::min(
+            config.max_num_inbound_streams(),
+            remote_init.num_outbound_streams,
+        );
+        this.my_max_num_outbound_streams = core::cmp::min(
+            config.max_num_outbound_streams(),
+            remote_init.num_inbound_streams,
+        );
+
+        this.peer_verification_tag = remote_init.initiate_tag;
+
+        this.source_port = DEFAULT_SCTP_PORT;
+        this.destination_port = DEFAULT_SCTP_PORT;
+        this.handshake_completed = true;
+
+        this.apply_remote_init_params(
+            remote_init.initial_tsn,
+            remote_init.advertised_receiver_window_credit,
+            &remote_init.params,
+            "out-of-band init",
+        );
+
+        // Set state to ESTABLISHED - out-of-band init skips the handshake
+        this.set_state(AssociationState::Established);
+        this.events.push_back(Event::Connected);
+
+        debug!(
+            "[{}] out-of-band init association established: my_tag={:#x} peer_tag={:#x} tsn={}",
+            this.side, this.my_verification_tag, this.peer_verification_tag, this.my_next_tsn
+        );
+
+        Ok(this)
     }
 
     /// Returns application-facing event
@@ -806,13 +922,58 @@ impl Association {
         self.state
     }
 
+    /// Apply common remote-side parameters from an INIT or INIT-ACK chunk.
+    ///
+    /// Sets `peer_last_tsn`, `rwnd`, `ssthresh`, and `use_forward_tsn` based
+    /// on the remote peer's initial TSN, advertised window, and supported
+    /// extensions. Used by `handle_init`, `handle_init_ack`, and
+    /// `new_with_out_of_band_init`.
+    fn apply_remote_init_params(
+        &mut self,
+        initial_tsn: u32,
+        advertised_receiver_window_credit: u32,
+        params: &[Box<dyn Param + Send + Sync>],
+        context: &str,
+    ) {
+        // RFC 4960 §13.2: peer_last_tsn is the peer's initial TSN minus one.
+        self.peer_last_tsn = initial_tsn.wrapping_sub(1);
+
+        self.rwnd = advertised_receiver_window_credit;
+        debug!("[{}] initial rwnd={}", self.side, self.rwnd);
+
+        // RFC 4960 Sec 7.2.1
+        //  o  The initial value of ssthresh MAY be arbitrarily high (for
+        //     example, implementations MAY use the size of the receiver
+        //     advertised window).
+        self.ssthresh = self.rwnd;
+        trace!(
+            "[{}] updated cwnd={} ssthresh={} inflight={} ({})",
+            self.side,
+            self.cwnd,
+            self.ssthresh,
+            self.inflight_queue.get_num_bytes(),
+            context,
+        );
+
+        for param in params {
+            if let Some(v) = param.as_any().downcast_ref::<ParamSupportedExtensions>() {
+                for t in &v.chunk_types {
+                    if *t == CT_FORWARD_TSN {
+                        debug!("[{}] use ForwardTSN (on {})", self.side, context);
+                        self.use_forward_tsn = true;
+                    }
+                }
+            }
+        }
+        if !self.use_forward_tsn {
+            warn!("[{}] not using ForwardTSN (on {})", self.side, context);
+        }
+    }
+
     /// caller must hold self.lock
     fn send_init(&mut self) -> Result<()> {
         if let Some(stored_init) = &self.stored_init {
             debug!("[{}] sending INIT", self.side);
-
-            self.source_port = 5000; // Spec??
-            self.destination_port = 5000; // Spec??
 
             let outbound = Packet {
                 common_header: CommonHeader {
@@ -986,49 +1147,12 @@ impl Association {
         self.source_port = p.common_header.destination_port;
         self.destination_port = p.common_header.source_port;
 
-        // 13.2 This is the last TSN received in sequence.  This value
-        // is set initially by taking the peer's initial TSN,
-        // received in the INIT or INIT ACK chunk, and
-        // subtracting one from it.
-        self.peer_last_tsn = if i.initial_tsn == 0 {
-            u32::MAX
-        } else {
-            i.initial_tsn - 1
-        };
-
-        // Initialize rwnd from the peer's advertised receiver window credit.
-        // This mirrors what handle_init_ack does for the client side.
-        // Without this, rwnd stays at 0 (the default) until the first SACK
-        // is received, which blocks all DATA sending except zero-window probes.
-        self.rwnd = i.advertised_receiver_window_credit;
-        debug!("[{}] initial rwnd={}", self.side, self.rwnd);
-
-        // RFC 4960 Sec 7.2.1
-        //  o  The initial value of ssthresh MAY be arbitrarily high (for
-        //     example, implementations MAY use the size of the receiver
-        //     advertised window).
-        self.ssthresh = self.rwnd;
-        trace!(
-            "[{}] updated cwnd={} ssthresh={} inflight={} (INI)",
-            self.side,
-            self.cwnd,
-            self.ssthresh,
-            self.inflight_queue.get_num_bytes()
+        self.apply_remote_init_params(
+            i.initial_tsn,
+            i.advertised_receiver_window_credit,
+            &i.params,
+            "init",
         );
-
-        for param in &i.params {
-            if let Some(v) = param.as_any().downcast_ref::<ParamSupportedExtensions>() {
-                for t in &v.chunk_types {
-                    if *t == CT_FORWARD_TSN {
-                        debug!("[{}] use ForwardTSN (on init)", self.side);
-                        self.use_forward_tsn = true;
-                    }
-                }
-            }
-        }
-        if !self.use_forward_tsn {
-            warn!("[{}] not using ForwardTSN (on init)", self.side);
-        }
 
         let mut outbound = Packet {
             common_header: CommonHeader {
@@ -1087,11 +1211,6 @@ impl Association {
         self.my_max_num_outbound_streams =
             core::cmp::min(i.num_outbound_streams, self.my_max_num_outbound_streams);
         self.peer_verification_tag = i.initiate_tag;
-        self.peer_last_tsn = if i.initial_tsn == 0 {
-            u32::MAX
-        } else {
-            i.initial_tsn - 1
-        };
         if self.source_port != p.common_header.destination_port
             || self.destination_port != p.common_header.source_port
         {
@@ -1099,41 +1218,20 @@ impl Association {
             return Ok(vec![]);
         }
 
-        self.rwnd = i.advertised_receiver_window_credit;
-        debug!("[{}] initial rwnd={}", self.side, self.rwnd);
-
-        // RFC 4960 Sec 7.2.1
-        //  o  The initial value of ssthresh MAY be arbitrarily high (for
-        //     example, implementations MAY use the size of the receiver
-        //     advertised window).
-        self.ssthresh = self.rwnd;
-        trace!(
-            "[{}] updated cwnd={} ssthresh={} inflight={} (INI)",
-            self.side,
-            self.cwnd,
-            self.ssthresh,
-            self.inflight_queue.get_num_bytes()
+        self.apply_remote_init_params(
+            i.initial_tsn,
+            i.advertised_receiver_window_credit,
+            &i.params,
+            "initAck",
         );
 
         self.timers.stop(Timer::T1Init);
         self.stored_init = None;
 
-        let mut cookie_param = None;
-        for param in &i.params {
-            if let Some(v) = param.as_any().downcast_ref::<ParamStateCookie>() {
-                cookie_param = Some(v);
-            } else if let Some(v) = param.as_any().downcast_ref::<ParamSupportedExtensions>() {
-                for t in &v.chunk_types {
-                    if *t == CT_FORWARD_TSN {
-                        debug!("[{}] use ForwardTSN (on initAck)", self.side);
-                        self.use_forward_tsn = true;
-                    }
-                }
-            }
-        }
-        if !self.use_forward_tsn {
-            warn!("[{}] not using ForwardTSN (on initAck)", self.side);
-        }
+        let cookie_param = i
+            .params
+            .iter()
+            .find_map(|param| param.as_any().downcast_ref::<ParamStateCookie>());
 
         if let Some(v) = cookie_param {
             self.stored_cookie_echo = Some(ChunkCookieEcho {

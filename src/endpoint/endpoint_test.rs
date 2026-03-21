@@ -5,6 +5,7 @@ use std::println;
 
 use super::*;
 use crate::association::Event;
+use crate::config::generate_snap_token;
 use crate::error::{Error, Result};
 
 use crate::association::state::{AckMode, AssociationState};
@@ -34,6 +35,7 @@ use core::{cmp, mem};
 use log::{info, trace};
 use std::net::UdpSocket;
 use std::sync::{LazyLock, Mutex};
+use std::time::Instant;
 
 pub static SERVER_PORTS: LazyLock<Mutex<RangeFrom<u16>>> = LazyLock::new(|| Mutex::new(4433..));
 pub static CLIENT_PORTS: LazyLock<Mutex<RangeFrom<u16>>> = LazyLock::new(|| Mutex::new(44433..));
@@ -385,6 +387,7 @@ fn create_association_pair(
         } else {
             TransportConfig::default()
         }),
+        ..Default::default()
     });
     pair.client_conn_mut(client_ch).ack_mode = ack_mode;
     pair.server_conn_mut(server_ch).ack_mode = ack_mode;
@@ -2954,4 +2957,888 @@ fn test_assoc_reconfig_failure_clears_pending() -> Result<()> {
     );
 
     Ok(())
+}
+
+#[test]
+fn test_snap_connect_established_and_transmit_uses_peer_verification_tag() {
+    let now = Instant::now();
+
+    let local_transport = TransportConfig::default();
+    let remote_transport = TransportConfig::default();
+
+    let local_init_bytes = generate_snap_token(&local_transport).expect("generate local init");
+    let remote_init_bytes = generate_snap_token(&remote_transport).expect("generate remote init");
+
+    // Parse remote to check verification tag later
+    let remote_init =
+        ChunkInit::unmarshal(&remote_init_bytes).expect("unmarshal remote INIT chunk");
+
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let client_config = ClientConfig::new().with_snap(local_init_bytes, remote_init_bytes);
+    let (_ch, mut assoc) = endpoint
+        .connect(client_config, remote_addr)
+        .expect("SNAP connect should succeed");
+
+    assert_eq!(assoc.state(), AssociationState::Established);
+    assert_matches!(assoc.poll(), Some(Event::Connected));
+
+    // Ensure outbound packets use the peer's initiate_tag as the verification tag.
+    let mut stream = assoc
+        .open_stream(1, PayloadProtocolIdentifier::Binary)
+        .expect("open stream");
+    let msg = Bytes::from_static(b"hello");
+    stream
+        .write_sctp(&msg, PayloadProtocolIdentifier::Binary)
+        .expect("write_sctp");
+
+    let transmit = assoc
+        .poll_transmit(now)
+        .expect("expected at least one outbound datagram");
+    let Payload::RawEncode(datagrams) = transmit.payload else {
+        panic!("expected RawEncode transmit");
+    };
+    assert!(
+        !datagrams.is_empty(),
+        "expected at least one outbound packet"
+    );
+
+    let pkt = Packet::unmarshal(&datagrams[0]).expect("unmarshal outbound packet");
+    assert_eq!(
+        pkt.common_header.verification_tag, remote_init.initiate_tag,
+        "outbound packet should use peer initiate_tag as verification_tag"
+    );
+}
+
+#[test]
+fn test_server_retransmitted_init_routes_to_existing_association() {
+    let now = Instant::now();
+
+    let mut endpoint = Endpoint::new(
+        Arc::new(EndpointConfig::default()),
+        Some(Arc::new(ServerConfig::default())),
+    );
+
+    let remote: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let init_tag: u32 = 0x1122_3344;
+
+    let init = ChunkInit {
+        is_ack: false,
+        initiate_tag: init_tag,
+        ..Default::default()
+    };
+
+    let pkt = Packet {
+        common_header: CommonHeader {
+            source_port: 5000,
+            destination_port: 5000,
+            verification_tag: 0,
+        },
+        chunks: vec![Box::new(init)],
+    };
+
+    let bytes = pkt.marshal().expect("marshal INIT packet");
+
+    let (ch1, ev1) = endpoint
+        .handle(now, remote, None, None, bytes.clone())
+        .expect("first INIT should be handled");
+    assert!(
+        matches!(ev1, DatagramEvent::NewAssociation(_)),
+        "first INIT should create a new association"
+    );
+
+    // Same INIT retransmitted: should route to the same association handle.
+    let (ch2, ev2) = endpoint
+        .handle(now, remote, None, None, bytes)
+        .expect("retransmitted INIT should be handled");
+    assert_eq!(
+        ch2, ch1,
+        "retransmitted INIT should map to same association"
+    );
+    assert!(
+        matches!(ev2, DatagramEvent::AssociationEvent(_)),
+        "retransmitted INIT should be routed to existing association"
+    );
+}
+
+#[test]
+fn test_snap_rejects_invalid_remote_bytes() {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let local_init = generate_snap_token(&TransportConfig::default()).expect("local init");
+    let client_config = ClientConfig::new().with_snap(local_init, Bytes::from_static(b"nope"));
+    let res = endpoint.connect(client_config, remote_addr);
+    assert!(
+        matches!(
+            res,
+            Err(ConnectError::Snap(SnapError::ParseFailed {
+                side: SnapSide::Remote,
+                ..
+            }))
+        ),
+        "invalid remote bytes should fail with ParseFailed"
+    );
+}
+
+#[test]
+fn test_snap_rejects_invalid_local_bytes() {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let remote_init = generate_snap_token(&TransportConfig::default()).expect("remote init");
+    let client_config = ClientConfig::new().with_snap(Bytes::from_static(b"nope"), remote_init);
+    let res = endpoint.connect(client_config, remote_addr);
+    assert!(
+        matches!(
+            res,
+            Err(ConnectError::Snap(SnapError::ParseFailed {
+                side: SnapSide::Local,
+                ..
+            }))
+        ),
+        "invalid local bytes should fail with ParseFailed"
+    );
+}
+
+#[test]
+fn test_snap_rejects_remote_init_ack() {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let local_init = generate_snap_token(&TransportConfig::default()).expect("local init");
+    let remote_init_ack = ChunkInit {
+        is_ack: true,
+        initiate_tag: 1,
+        ..Default::default()
+    };
+    let remote_bytes = remote_init_ack.marshal().expect("marshal remote INIT-ACK");
+
+    let client_config = ClientConfig::new().with_snap(local_init, remote_bytes);
+    let res = endpoint.connect(client_config, remote_addr);
+    assert!(
+        matches!(
+            res,
+            Err(ConnectError::Snap(SnapError::InvalidInitAck {
+                side: SnapSide::Remote
+            }))
+        ),
+        "remote INIT-ACK should be rejected"
+    );
+}
+
+#[test]
+fn test_snap_rejects_remote_init_with_zero_initiate_tag() {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let local_init = generate_snap_token(&TransportConfig::default()).expect("local init");
+    let remote_init = ChunkInit {
+        is_ack: false,
+        initiate_tag: 0,
+        ..Default::default()
+    };
+    let remote_bytes = remote_init.marshal().expect("marshal remote INIT");
+
+    let client_config = ClientConfig::new().with_snap(local_init, remote_bytes);
+    let res = endpoint.connect(client_config, remote_addr);
+    assert!(
+        matches!(
+            res,
+            Err(ConnectError::Snap(SnapError::ZeroInitiateTag {
+                side: SnapSide::Remote
+            }))
+        ),
+        "remote INIT with initiate_tag=0 should be rejected"
+    );
+}
+
+#[test]
+fn test_snap_partial_config_falls_back_to_handshake() {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    // Only local_sctp_init set, remote missing — should fall back to normal handshake
+    let local_init = generate_snap_token(&TransportConfig::default()).expect("local init");
+    let client_config = ClientConfig {
+        local_sctp_init: Some(local_init),
+        ..Default::default()
+    };
+    let (_ch, assoc) = endpoint
+        .connect(client_config, remote_addr)
+        .expect("partial SNAP config should fall back to handshake");
+    assert_eq!(
+        assoc.state(),
+        AssociationState::CookieWait,
+        "should use normal handshake when only local init provided"
+    );
+
+    // Only remote_sctp_init set, local missing — should fall back to normal handshake
+    let remote_init = generate_snap_token(&TransportConfig::default()).expect("remote init");
+    let client_config = ClientConfig {
+        remote_sctp_init: Some(remote_init),
+        ..Default::default()
+    };
+    let (_ch, assoc) = endpoint
+        .connect(client_config, remote_addr)
+        .expect("partial SNAP config should fall back to handshake");
+    assert_eq!(
+        assoc.state(),
+        AssociationState::CookieWait,
+        "should use normal handshake when only remote init provided"
+    );
+}
+
+#[test]
+fn test_snap_rejects_reused_local_init() {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    // Generate a single local init — reusing it causes a collision
+    let local_init = generate_snap_token(&TransportConfig::default()).expect("local init");
+
+    let remote1 = generate_snap_token(&TransportConfig::default()).expect("remote init 1");
+    let remote2 = generate_snap_token(&TransportConfig::default()).expect("remote init 2");
+
+    // First connect succeeds
+    let cfg1 = ClientConfig::new().with_snap(local_init.clone(), remote1);
+    let res1 = endpoint.connect(cfg1, remote_addr);
+    assert!(res1.is_ok(), "first SNAP connect should succeed");
+
+    // Second connect with same local_init collides on local_aid
+    let cfg2 = ClientConfig::new().with_snap(local_init, remote2);
+    let res2 = endpoint.connect(cfg2, remote_addr);
+    assert!(
+        matches!(
+            res2,
+            Err(ConnectError::Snap(SnapError::AidCollision { .. }))
+        ),
+        "second SNAP connect should fail due to AID collision"
+    );
+}
+
+#[test]
+fn test_snap_rejects_local_init_ack() {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let remote_init = generate_snap_token(&TransportConfig::default()).expect("remote init");
+    let local_init_ack = ChunkInit {
+        is_ack: true,
+        initiate_tag: 1,
+        ..Default::default()
+    };
+    let local_bytes = local_init_ack.marshal().expect("marshal local INIT-ACK");
+
+    let client_config = ClientConfig::new().with_snap(local_bytes, remote_init);
+    let res = endpoint.connect(client_config, remote_addr);
+    assert!(
+        matches!(
+            res,
+            Err(ConnectError::Snap(SnapError::InvalidInitAck {
+                side: SnapSide::Local
+            }))
+        ),
+        "local INIT-ACK should be rejected"
+    );
+}
+
+#[test]
+fn test_snap_rejects_local_init_with_zero_initiate_tag() {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let remote_init = generate_snap_token(&TransportConfig::default()).expect("remote init");
+    let local_init = ChunkInit {
+        is_ack: false,
+        initiate_tag: 0,
+        ..Default::default()
+    };
+    let local_bytes = local_init.marshal().expect("marshal local INIT");
+
+    let client_config = ClientConfig::new().with_snap(local_bytes, remote_init);
+    let res = endpoint.connect(client_config, remote_addr);
+    assert!(
+        matches!(
+            res,
+            Err(ConnectError::Snap(SnapError::ZeroInitiateTag {
+                side: SnapSide::Local
+            }))
+        ),
+        "local INIT with initiate_tag=0 should be rejected"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SNAP hardening tests: size limits, truncated / empty / oversized input,
+// wrong chunk types, RFC field validation, round-trip token consistency.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_snap_rejects_empty_bytes() {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let valid = generate_snap_token(&TransportConfig::default()).expect("valid init");
+
+    // Empty remote
+    let cfg = ClientConfig::new().with_snap(valid.clone(), Bytes::new());
+    let res = endpoint.connect(cfg, remote_addr);
+    assert!(
+        matches!(
+            res,
+            Err(ConnectError::Snap(SnapError::ParseFailed {
+                side: SnapSide::Remote,
+                ..
+            }))
+        ),
+        "empty remote bytes should fail parsing"
+    );
+
+    // Empty local
+    let cfg = ClientConfig::new().with_snap(Bytes::new(), valid);
+    let res = endpoint.connect(cfg, remote_addr);
+    assert!(
+        matches!(
+            res,
+            Err(ConnectError::Snap(SnapError::ParseFailed {
+                side: SnapSide::Local,
+                ..
+            }))
+        ),
+        "empty local bytes should fail parsing"
+    );
+}
+
+#[test]
+fn test_snap_rejects_truncated_bytes() {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let valid = generate_snap_token(&TransportConfig::default()).expect("valid init");
+
+    // Truncate to just 10 bytes — not enough for INIT header + fixed fields
+    let truncated = valid.slice(..10.min(valid.len()));
+
+    let cfg = ClientConfig::new().with_snap(valid.clone(), truncated.clone());
+    let res = endpoint.connect(cfg, remote_addr);
+    assert!(
+        matches!(
+            res,
+            Err(ConnectError::Snap(SnapError::ParseFailed {
+                side: SnapSide::Remote,
+                ..
+            }))
+        ),
+        "truncated remote bytes should fail parsing"
+    );
+
+    let cfg = ClientConfig::new().with_snap(truncated, valid);
+    let res = endpoint.connect(cfg, remote_addr);
+    assert!(
+        matches!(
+            res,
+            Err(ConnectError::Snap(SnapError::ParseFailed {
+                side: SnapSide::Local,
+                ..
+            }))
+        ),
+        "truncated local bytes should fail parsing"
+    );
+}
+
+#[test]
+fn test_snap_rejects_oversized_bytes() {
+    use crate::config::MAX_SNAP_INIT_BYTES;
+
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let valid = generate_snap_token(&TransportConfig::default()).expect("valid init");
+    let oversized = Bytes::from(vec![0u8; MAX_SNAP_INIT_BYTES + 1]);
+
+    // Oversized remote
+    let cfg = ClientConfig::new().with_snap(valid.clone(), oversized.clone());
+    let res = endpoint.connect(cfg, remote_addr);
+    assert!(
+        matches!(
+            res,
+            Err(ConnectError::Snap(SnapError::OversizedInit {
+                side: SnapSide::Remote,
+                ..
+            }))
+        ),
+        "oversized remote bytes should be rejected"
+    );
+
+    // Oversized local
+    let cfg = ClientConfig::new().with_snap(oversized, valid);
+    let res = endpoint.connect(cfg, remote_addr);
+    assert!(
+        matches!(
+            res,
+            Err(ConnectError::Snap(SnapError::OversizedInit {
+                side: SnapSide::Local,
+                ..
+            }))
+        ),
+        "oversized local bytes should be rejected"
+    );
+}
+
+#[test]
+fn test_snap_rejects_remote_init_zero_inbound_streams() {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let local_init = generate_snap_token(&TransportConfig::default()).expect("local init");
+    let bad_remote = ChunkInit {
+        is_ack: false,
+        initiate_tag: 0xDEAD_BEEF,
+        initial_tsn: 1,
+        num_outbound_streams: 1,
+        num_inbound_streams: 0, // RFC violation
+        advertised_receiver_window_credit: 65535,
+        ..Default::default()
+    };
+    let remote_bytes = bad_remote.marshal().expect("marshal bad remote INIT");
+
+    let cfg = ClientConfig::new().with_snap(local_init, remote_bytes);
+    let res = endpoint.connect(cfg, remote_addr);
+    assert!(
+        matches!(
+            res,
+            Err(ConnectError::Snap(SnapError::InvalidInit {
+                side: SnapSide::Remote,
+                ..
+            }))
+        ),
+        "remote INIT with num_inbound_streams=0 should be rejected: got {:?}",
+        res
+    );
+}
+
+#[test]
+fn test_snap_rejects_remote_init_zero_outbound_streams() {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let local_init = generate_snap_token(&TransportConfig::default()).expect("local init");
+    let bad_remote = ChunkInit {
+        is_ack: false,
+        initiate_tag: 0xDEAD_BEEF,
+        initial_tsn: 1,
+        num_outbound_streams: 0, // RFC violation
+        num_inbound_streams: 1,
+        advertised_receiver_window_credit: 65535,
+        ..Default::default()
+    };
+    let remote_bytes = bad_remote.marshal().expect("marshal bad remote INIT");
+
+    let cfg = ClientConfig::new().with_snap(local_init, remote_bytes);
+    let res = endpoint.connect(cfg, remote_addr);
+    assert!(
+        matches!(
+            res,
+            Err(ConnectError::Snap(SnapError::InvalidInit {
+                side: SnapSide::Remote,
+                ..
+            }))
+        ),
+        "remote INIT with num_outbound_streams=0 should be rejected: got {:?}",
+        res
+    );
+}
+
+#[test]
+fn test_snap_rejects_remote_init_small_arwnd() {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let local_init = generate_snap_token(&TransportConfig::default()).expect("local init");
+    let bad_remote = ChunkInit {
+        is_ack: false,
+        initiate_tag: 0xDEAD_BEEF,
+        initial_tsn: 1,
+        num_outbound_streams: 1,
+        num_inbound_streams: 1,
+        advertised_receiver_window_credit: 100, // RFC says >= 1500
+        ..Default::default()
+    };
+    let remote_bytes = bad_remote.marshal().expect("marshal bad remote INIT");
+
+    let cfg = ClientConfig::new().with_snap(local_init, remote_bytes);
+    let res = endpoint.connect(cfg, remote_addr);
+    assert!(
+        matches!(
+            res,
+            Err(ConnectError::Snap(SnapError::InvalidInit {
+                side: SnapSide::Remote,
+                ..
+            }))
+        ),
+        "remote INIT with a_rwnd < 1500 should be rejected: got {:?}",
+        res
+    );
+}
+
+#[test]
+fn test_snap_rejects_local_init_zero_inbound_streams() {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let remote_init = generate_snap_token(&TransportConfig::default()).expect("remote init");
+    let bad_local = ChunkInit {
+        is_ack: false,
+        initiate_tag: 0xCAFE_BABE,
+        initial_tsn: 1,
+        num_outbound_streams: 1,
+        num_inbound_streams: 0,
+        advertised_receiver_window_credit: 65535,
+        ..Default::default()
+    };
+    let local_bytes = bad_local.marshal().expect("marshal bad local INIT");
+
+    let cfg = ClientConfig::new().with_snap(local_bytes, remote_init);
+    let res = endpoint.connect(cfg, remote_addr);
+    assert!(
+        matches!(
+            res,
+            Err(ConnectError::Snap(SnapError::InvalidInit {
+                side: SnapSide::Local,
+                ..
+            }))
+        ),
+        "local INIT with num_inbound_streams=0 should be rejected: got {:?}",
+        res
+    );
+}
+
+#[test]
+fn test_snap_rejects_local_init_small_arwnd() {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let remote_init = generate_snap_token(&TransportConfig::default()).expect("remote init");
+    let bad_local = ChunkInit {
+        is_ack: false,
+        initiate_tag: 0xCAFE_BABE,
+        initial_tsn: 1,
+        num_outbound_streams: 1,
+        num_inbound_streams: 1,
+        advertised_receiver_window_credit: 0,
+        ..Default::default()
+    };
+    let local_bytes = bad_local.marshal().expect("marshal bad local INIT");
+
+    let cfg = ClientConfig::new().with_snap(local_bytes, remote_init);
+    let res = endpoint.connect(cfg, remote_addr);
+    assert!(
+        matches!(
+            res,
+            Err(ConnectError::Snap(SnapError::InvalidInit {
+                side: SnapSide::Local,
+                ..
+            }))
+        ),
+        "local INIT with a_rwnd=0 should be rejected: got {:?}",
+        res
+    );
+}
+
+#[test]
+fn test_snap_generate_token_roundtrip_is_valid() {
+    let config = TransportConfig::default();
+    let bytes = generate_snap_token(&config).expect("generate token");
+
+    assert!(
+        bytes.len() <= crate::config::MAX_SNAP_INIT_BYTES,
+        "generated token should be within MAX_SNAP_INIT_BYTES"
+    );
+
+    let init = ChunkInit::unmarshal(&bytes).expect("unmarshal generated token");
+    assert!(!init.is_ack, "generated token should be INIT, not INIT-ACK");
+    assert_ne!(init.initiate_tag, 0, "initiate_tag must not be zero");
+    assert_ne!(init.initial_tsn, 0, "initial_tsn must not be zero");
+    assert_eq!(init.num_outbound_streams, u16::MAX);
+    assert_eq!(init.num_inbound_streams, u16::MAX);
+    assert_eq!(
+        init.advertised_receiver_window_credit,
+        config.max_receive_buffer_size()
+    );
+
+    // check() should pass for a token we generated ourselves
+    init.check()
+        .expect("check() should pass on generated token");
+}
+
+#[test]
+fn test_snap_generate_token_unique_per_call() {
+    let config = TransportConfig::default();
+    let t1 = generate_snap_token(&config).expect("token 1");
+    let t2 = generate_snap_token(&config).expect("token 2");
+    assert_ne!(t1, t2, "two generated tokens should differ (random values)");
+
+    let i1 = ChunkInit::unmarshal(&t1).expect("parse t1");
+    let i2 = ChunkInit::unmarshal(&t2).expect("parse t2");
+    assert_ne!(
+        i1.initiate_tag, i2.initiate_tag,
+        "initiate_tags should differ"
+    );
+}
+
+#[test]
+fn test_snap_rejects_wrong_chunk_type_bytes() {
+    use crate::chunk::Chunk;
+    use crate::chunk::chunk_selective_ack::ChunkSelectiveAck;
+
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let valid = generate_snap_token(&TransportConfig::default()).expect("valid init");
+
+    // Build a SACK chunk and try to use it as a SNAP INIT
+    let sack = ChunkSelectiveAck {
+        cumulative_tsn_ack: 1,
+        advertised_receiver_window_credit: 65535,
+        gap_ack_blocks: vec![],
+        duplicate_tsn: vec![],
+    };
+    let sack_bytes = sack.marshal().expect("marshal SACK");
+
+    let cfg = ClientConfig::new().with_snap(valid, sack_bytes);
+    let res = endpoint.connect(cfg, remote_addr);
+    assert!(
+        matches!(
+            res,
+            Err(ConnectError::Snap(SnapError::ParseFailed {
+                side: SnapSide::Remote,
+                ..
+            }))
+        ),
+        "SACK bytes should fail to parse as INIT: got {:?}",
+        res
+    );
+}
+
+#[test]
+fn test_snap_rejects_both_sides_empty() {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let cfg = ClientConfig::new().with_snap(Bytes::new(), Bytes::new());
+    let res = endpoint.connect(cfg, remote_addr);
+    assert!(
+        matches!(res, Err(ConnectError::Snap(SnapError::ParseFailed { .. }))),
+        "two empty byte slices should fail"
+    );
+}
+
+#[test]
+fn test_snap_rejects_random_garbage_bytes() {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let valid = generate_snap_token(&TransportConfig::default()).expect("valid init");
+
+    // 50 bytes of pseudo-random garbage
+    let garbage = Bytes::from(vec![0xAB; 50]);
+
+    let cfg = ClientConfig::new().with_snap(valid.clone(), garbage.clone());
+    let res = endpoint.connect(cfg, remote_addr);
+    assert!(
+        matches!(
+            res,
+            Err(ConnectError::Snap(SnapError::ParseFailed {
+                side: SnapSide::Remote,
+                ..
+            }))
+        ),
+        "garbage remote bytes should fail: got {:?}",
+        res
+    );
+
+    let cfg = ClientConfig::new().with_snap(garbage, valid);
+    let res = endpoint.connect(cfg, remote_addr);
+    assert!(
+        matches!(
+            res,
+            Err(ConnectError::Snap(SnapError::ParseFailed {
+                side: SnapSide::Local,
+                ..
+            }))
+        ),
+        "garbage local bytes should fail: got {:?}",
+        res
+    );
+}
+
+#[test]
+fn test_snap_identical_local_and_remote_init() {
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let token = generate_snap_token(&TransportConfig::default()).expect("token");
+
+    let cfg = ClientConfig::new().with_snap(token.clone(), token);
+    let res = endpoint.connect(cfg, remote_addr);
+    assert!(
+        matches!(res, Err(ConnectError::Snap(SnapError::AidCollision { .. }))),
+        "same token for both sides should collide: got {:?}",
+        res
+    );
+}
+
+#[test]
+fn test_snap_end_to_end_bidirectional_data() {
+    // Two endpoints, both using Endpoint::connect with SNAP, exchanging data
+    // through the full Endpoint::handle pipeline.
+    let endpoint_config = Arc::new(EndpointConfig::default());
+    let transport = TransportConfig::default();
+
+    let init_a = generate_snap_token(&transport).expect("init A");
+    let init_b = generate_snap_token(&transport).expect("init B");
+
+    let addr_a: SocketAddr = SocketAddr::new(
+        Ipv6Addr::LOCALHOST.into(),
+        CLIENT_PORTS.lock().unwrap().next().unwrap(),
+    );
+    let addr_b: SocketAddr = SocketAddr::new(
+        Ipv6Addr::LOCALHOST.into(),
+        CLIENT_PORTS.lock().unwrap().next().unwrap(),
+    );
+
+    // Both sides are clients (no server config) — this is the SNAP model.
+    let mut ep_a = Endpoint::new(endpoint_config.clone(), None);
+    let mut ep_b = Endpoint::new(endpoint_config, None);
+
+    let cfg_a = ClientConfig::new().with_snap(init_a.clone(), init_b.clone());
+    let (ch_a, mut assoc_a) = ep_a.connect(cfg_a, addr_b).expect("SNAP connect A");
+
+    let cfg_b = ClientConfig::new().with_snap(init_b, init_a);
+    let (ch_b, mut assoc_b) = ep_b.connect(cfg_b, addr_a).expect("SNAP connect B");
+
+    // Both should be established immediately.
+    assert_eq!(assoc_a.state(), AssociationState::Established);
+    assert_eq!(assoc_b.state(), AssociationState::Established);
+    assert_matches!(assoc_a.poll(), Some(Event::Connected));
+    assert_matches!(assoc_b.poll(), Some(Event::Connected));
+
+    let now = Instant::now();
+
+    // A writes to B.
+    let si = 1u16;
+    let msg_a = Bytes::from_static(b"hello from A");
+    let mut stream_a = assoc_a
+        .open_stream(si, PayloadProtocolIdentifier::Binary)
+        .expect("open stream A");
+    stream_a
+        .write_sctp(&msg_a, PayloadProtocolIdentifier::Binary)
+        .expect("write A");
+
+    // Pump transmits from A into B via Endpoint::handle.
+    while let Some(transmit) = assoc_a.poll_transmit(now) {
+        if let Payload::RawEncode(datagrams) = transmit.payload {
+            for dgram in datagrams {
+                if let Some((handle, event)) = ep_b.handle(now, addr_a, None, None, dgram) {
+                    assert_eq!(handle, ch_b);
+                    if let DatagramEvent::AssociationEvent(ev) = event {
+                        assoc_b.handle_event(ev);
+                    }
+                }
+            }
+        }
+    }
+
+    // B should now have data.
+    let accepted = assoc_b.accept_stream().expect("accept stream on B");
+    assert_eq!(accepted.stream_identifier, si);
+
+    let mut buf = vec![0u8; 64];
+    let chunks = assoc_b
+        .stream(si)
+        .expect("get stream B")
+        .read_sctp()
+        .expect("read B")
+        .expect("expected data");
+    let n = chunks.read(&mut buf).expect("read payload");
+    assert_eq!(&buf[..n], b"hello from A");
+
+    // B writes back to A.
+    let msg_b = Bytes::from_static(b"hello from B");
+    assoc_b
+        .stream(si)
+        .expect("get stream B for write")
+        .write_sctp(&msg_b, PayloadProtocolIdentifier::Binary)
+        .expect("write B");
+
+    // Pump transmits from B into A.
+    while let Some(transmit) = assoc_b.poll_transmit(now) {
+        if let Payload::RawEncode(datagrams) = transmit.payload {
+            for dgram in datagrams {
+                if let Some((handle, event)) = ep_a.handle(now, addr_b, None, None, dgram) {
+                    assert_eq!(handle, ch_a);
+                    if let DatagramEvent::AssociationEvent(ev) = event {
+                        assoc_a.handle_event(ev);
+                    }
+                }
+            }
+        }
+    }
+
+    // A should now have data back from B.
+    let chunks = assoc_a
+        .stream(si)
+        .expect("get stream A")
+        .read_sctp()
+        .expect("read A")
+        .expect("expected data from B");
+    let n = chunks.read(&mut buf).expect("read payload from B");
+    assert_eq!(&buf[..n], b"hello from B");
+}
+
+#[test]
+fn test_snap_association_drains_cleanly() {
+    // Verify that a SNAP association, once drained, properly cleans up both
+    // association_ids and association_ids_init in the endpoint.
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    let local_init = generate_snap_token(&TransportConfig::default()).expect("local init");
+    let remote_init = generate_snap_token(&TransportConfig::default()).expect("remote init");
+
+    let local_tag = ChunkInit::unmarshal(&local_init)
+        .expect("parse local")
+        .initiate_tag;
+    let remote_tag = ChunkInit::unmarshal(&remote_init)
+        .expect("parse remote")
+        .initiate_tag;
+
+    let cfg = ClientConfig::new().with_snap(local_init, remote_init);
+    let (ch, _assoc) = endpoint.connect(cfg, remote_addr).expect("SNAP connect");
+
+    // Endpoint should have entries in both routing tables.
+    assert!(
+        endpoint.association_ids.contains_key(&local_tag),
+        "local_tag should be in association_ids"
+    );
+    assert!(
+        endpoint.association_ids_init.contains_key(&remote_tag),
+        "remote_tag should be in association_ids_init"
+    );
+
+    // Simulate draining: send the Drained endpoint event.
+    let drain_event = EndpointEvent(EndpointEventInner::Drained);
+    endpoint.handle_event(ch, drain_event);
+
+    // Both routing tables should be cleaned up.
+    assert!(
+        !endpoint.association_ids.contains_key(&local_tag),
+        "local_tag should be removed from association_ids after drain"
+    );
+    assert!(
+        !endpoint.association_ids_init.contains_key(&remote_tag),
+        "remote_tag should be removed from association_ids_init after drain"
+    );
 }

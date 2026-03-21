@@ -1,3 +1,6 @@
+use crate::chunk::{Chunk, chunk_init::ChunkInit};
+use crate::config::generate_snap_token;
+
 use super::*;
 
 const ACCEPT_CH_SIZE: usize = 16;
@@ -631,4 +634,382 @@ fn test_assoc_max_message_size_asymmetric() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[test]
+fn test_generate_out_of_band_init() {
+    let config = TransportConfig::default();
+    let init_bytes = generate_snap_token(&config).unwrap();
+
+    // Parse it back to validate
+    let parsed = ChunkInit::unmarshal(&init_bytes).unwrap();
+
+    assert!(!parsed.is_ack, "Should be INIT, not INIT ACK");
+    assert!(parsed.initiate_tag != 0, "Initiate tag should not be zero");
+    // Token always advertises u16::MAX for stream counts;
+    // actual limits are applied from TransportConfig during negotiation.
+    assert_eq!(
+        parsed.num_outbound_streams,
+        u16::MAX,
+        "Outbound streams should always be u16::MAX in token"
+    );
+    assert_eq!(
+        parsed.num_inbound_streams,
+        u16::MAX,
+        "Inbound streams should always be u16::MAX in token"
+    );
+    assert_eq!(
+        parsed.advertised_receiver_window_credit,
+        config.max_receive_buffer_size(),
+        "ARWND should match config"
+    );
+}
+
+#[test]
+fn test_generate_out_of_band_init_with_custom_config() {
+    let config = TransportConfig::default()
+        .with_max_receive_buffer_size(2_000_000)
+        .with_max_num_outbound_streams(256)
+        .with_max_num_inbound_streams(512);
+
+    let init_bytes = generate_snap_token(&config).unwrap();
+    let parsed = ChunkInit::unmarshal(&init_bytes).unwrap();
+
+    // Token always advertises u16::MAX for stream counts;
+    // actual limits are applied from TransportConfig during negotiation.
+    assert_eq!(parsed.num_outbound_streams, u16::MAX);
+    assert_eq!(parsed.num_inbound_streams, u16::MAX);
+    assert_eq!(parsed.advertised_receiver_window_credit, 2_000_000);
+}
+
+#[test]
+fn test_generate_out_of_band_init_uniqueness() {
+    // Each call to generate_snap_token creates a new INIT with unique random tags.
+    let config1 = TransportConfig::default();
+    let config2 = TransportConfig::default();
+
+    let init1 = generate_snap_token(&config1).unwrap();
+    let init2 = generate_snap_token(&config2).unwrap();
+
+    let parsed1 = ChunkInit::unmarshal(&init1).unwrap();
+    let parsed2 = ChunkInit::unmarshal(&init2).unwrap();
+
+    // Initiate tags should be different (random)
+    assert_ne!(
+        parsed1.initiate_tag, parsed2.initiate_tag,
+        "Initiate tags should be unique across calls"
+    );
+
+    // Initial TSNs should be different (random)
+    assert_ne!(
+        parsed1.initial_tsn, parsed2.initial_tsn,
+        "Initial TSNs should be unique across calls"
+    );
+}
+
+#[test]
+fn test_out_of_band_association_creation() {
+    let local_config = Arc::new(TransportConfig::default());
+    let remote_config = TransportConfig::default();
+    let max_payload_size = 1200;
+
+    let local_init_bytes = generate_snap_token(&local_config).unwrap();
+    let remote_init_bytes = generate_snap_token(&remote_config).unwrap();
+
+    let local_init = ChunkInit::unmarshal(&local_init_bytes).unwrap();
+    let remote_init = ChunkInit::unmarshal(&remote_init_bytes).unwrap();
+
+    let remote_addr: SocketAddr = "192.168.1.1:5000".parse().unwrap();
+
+    let assoc = Association::new_with_out_of_band_init(
+        local_config.clone(),
+        max_payload_size,
+        remote_addr,
+        None,
+        local_init.clone(),
+        remote_init.clone(),
+    )
+    .expect("Should create out-of-band init association");
+
+    // Verify the association is in ESTABLISHED state
+    assert_eq!(
+        assoc.state(),
+        AssociationState::Established,
+        "Out-of-band init association should be in ESTABLISHED state"
+    );
+
+    // Verify handshake is marked complete
+    assert!(
+        assoc.handshake_completed,
+        "Out-of-band init association should have handshake completed"
+    );
+
+    // Verify verification tags
+    assert_eq!(
+        assoc.my_verification_tag, local_init.initiate_tag,
+        "My verification tag should match local init"
+    );
+    assert_eq!(
+        assoc.peer_verification_tag, remote_init.initiate_tag,
+        "Peer verification tag should match remote init"
+    );
+
+    // Verify TSN setup
+    assert_eq!(
+        assoc.my_next_tsn, local_init.initial_tsn,
+        "My next TSN should match local init"
+    );
+    assert_eq!(
+        assoc.peer_last_tsn,
+        remote_init.initial_tsn.wrapping_sub(1),
+        "Peer last TSN should be remote init TSN - 1"
+    );
+
+    // Verify rwnd
+    assert_eq!(
+        assoc.rwnd, remote_init.advertised_receiver_window_credit,
+        "rwnd should match remote advertised credit"
+    );
+}
+
+#[test]
+fn test_out_of_band_association_stream_negotiation() {
+    let config = Arc::new(
+        TransportConfig::default()
+            .with_max_num_outbound_streams(100)
+            .with_max_num_inbound_streams(200),
+    );
+
+    // Remote uses default config — token always advertises u16::MAX
+    let remote_config = TransportConfig::default();
+
+    let local_init_bytes = generate_snap_token(&config).unwrap();
+    let remote_init_bytes = generate_snap_token(&remote_config).unwrap();
+
+    let local_init = ChunkInit::unmarshal(&local_init_bytes).unwrap();
+    let remote_init = ChunkInit::unmarshal(&remote_init_bytes).unwrap();
+
+    // Token always advertises u16::MAX for stream counts
+    assert_eq!(local_init.num_outbound_streams, u16::MAX);
+    assert_eq!(local_init.num_inbound_streams, u16::MAX);
+    assert_eq!(remote_init.num_outbound_streams, u16::MAX);
+    assert_eq!(remote_init.num_inbound_streams, u16::MAX);
+
+    let remote_addr: SocketAddr = "192.168.1.1:5000".parse().unwrap();
+
+    let assoc = Association::new_with_out_of_band_init(
+        config.clone(),
+        1200,
+        remote_addr,
+        None,
+        local_init,
+        remote_init,
+    )
+    .expect("Should create out-of-band init association");
+
+    // Stream limits should be clamped by the local config, since the
+    // remote token always offers u16::MAX.
+    // my_max_num_outbound_streams = min(config.max_out=100, remote_in=MAX) = 100
+    assert_eq!(
+        assoc.my_max_num_outbound_streams, 100,
+        "Outbound streams should be clamped by local config"
+    );
+
+    // my_max_num_inbound_streams = min(config.max_in=200, remote_out=MAX) = 200
+    assert_eq!(
+        assoc.my_max_num_inbound_streams, 200,
+        "Inbound streams should be clamped by local config"
+    );
+}
+
+#[test]
+fn test_out_of_band_connected_event() {
+    let local_config = Arc::new(TransportConfig::default());
+    let remote_config = TransportConfig::default();
+
+    let local_init_bytes = generate_snap_token(&local_config).unwrap();
+    let remote_init_bytes = generate_snap_token(&remote_config).unwrap();
+
+    let local_init = ChunkInit::unmarshal(&local_init_bytes).unwrap();
+    let remote_init = ChunkInit::unmarshal(&remote_init_bytes).unwrap();
+
+    let remote_addr: SocketAddr = "192.168.1.1:5000".parse().unwrap();
+
+    let mut assoc = Association::new_with_out_of_band_init(
+        local_config.clone(),
+        1200,
+        remote_addr,
+        None,
+        local_init,
+        remote_init,
+    )
+    .expect("Should create out-of-band init association");
+
+    // Poll should return a Connected event
+    let event = assoc.poll();
+    assert!(
+        matches!(event, Some(Event::Connected)),
+        "Should emit Connected event, got {:?}",
+        event
+    );
+}
+
+#[test]
+fn test_out_of_band_symmetric_setup() {
+    // Test that both sides of an out-of-band init association work correctly
+    let config_a = Arc::new(TransportConfig::default());
+    let config_b = Arc::new(TransportConfig::default());
+
+    let init_a_bytes = generate_snap_token(&config_a).unwrap();
+    let init_b_bytes = generate_snap_token(&config_b).unwrap();
+
+    let init_a = ChunkInit::unmarshal(&init_a_bytes).unwrap();
+    let init_b = ChunkInit::unmarshal(&init_b_bytes).unwrap();
+
+    let addr_a: SocketAddr = "192.168.1.1:5000".parse().unwrap();
+    let addr_b: SocketAddr = "192.168.1.2:5000".parse().unwrap();
+
+    // Create association A (local=A, remote=B)
+    let assoc_a = Association::new_with_out_of_band_init(
+        config_a.clone(),
+        1200,
+        addr_b,
+        None,
+        init_a.clone(),
+        init_b.clone(),
+    )
+    .expect("Should create association A");
+
+    // Create association B (local=B, remote=A)
+    let assoc_b = Association::new_with_out_of_band_init(
+        config_b.clone(),
+        1200,
+        addr_a,
+        None,
+        init_b.clone(),
+        init_a.clone(),
+    )
+    .expect("Should create association B");
+
+    // Verify both are in ESTABLISHED state
+    assert_eq!(assoc_a.state(), AssociationState::Established);
+    assert_eq!(assoc_b.state(), AssociationState::Established);
+
+    // Verify verification tags are cross-matched
+    assert_eq!(assoc_a.my_verification_tag, assoc_b.peer_verification_tag);
+    assert_eq!(assoc_b.my_verification_tag, assoc_a.peer_verification_tag);
+}
+
+#[test]
+fn test_out_of_band_with_forward_tsn_support() {
+    let local_config = Arc::new(TransportConfig::default());
+    let remote_config = TransportConfig::default();
+
+    let local_init_bytes = generate_snap_token(&local_config).unwrap();
+    let remote_init_bytes = generate_snap_token(&remote_config).unwrap();
+
+    let local_init = ChunkInit::unmarshal(&local_init_bytes).unwrap();
+    let remote_init = ChunkInit::unmarshal(&remote_init_bytes).unwrap();
+
+    // Verify supported extensions are present
+    let mut has_forward_tsn = false;
+    for param in &local_init.params {
+        if let Some(ext) = param
+            .as_any()
+            .downcast_ref::<crate::param::param_supported_extensions::ParamSupportedExtensions>(
+        ) {
+            for ct in &ext.chunk_types {
+                if *ct == crate::chunk::chunk_type::CT_FORWARD_TSN {
+                    has_forward_tsn = true;
+                }
+            }
+        }
+    }
+    assert!(
+        has_forward_tsn,
+        "Generated INIT should include ForwardTSN support"
+    );
+
+    let remote_addr: SocketAddr = "192.168.1.1:5000".parse().unwrap();
+
+    let assoc = Association::new_with_out_of_band_init(
+        local_config.clone(),
+        1200,
+        remote_addr,
+        None,
+        local_init,
+        remote_init,
+    )
+    .expect("Should create out-of-band init association");
+
+    assert!(
+        assoc.use_forward_tsn,
+        "Out-of-band init association should have ForwardTSN enabled"
+    );
+}
+
+#[test]
+fn test_out_of_band_initial_tsn_zero_wrap() {
+    // Test edge case where initial TSN is 0 (wraps to MAX)
+    let config = Arc::new(TransportConfig::default());
+
+    let local_init_bytes = generate_snap_token(&config).unwrap();
+    let mut remote_init = ChunkInit::unmarshal(&local_init_bytes).unwrap();
+
+    // Set initial TSN to 0 to test the edge case
+    remote_init.initial_tsn = 0;
+    remote_init.initiate_tag = 12345;
+
+    // Generate a fresh local init for the association
+    let actual_local_init_bytes = generate_snap_token(&config).unwrap();
+    let local_init = ChunkInit::unmarshal(&actual_local_init_bytes).unwrap();
+    let remote_addr: SocketAddr = "192.168.1.1:5000".parse().unwrap();
+
+    let assoc = Association::new_with_out_of_band_init(
+        config.clone(),
+        1200,
+        remote_addr,
+        None,
+        local_init,
+        remote_init,
+    )
+    .expect("Should create out-of-band init association");
+
+    // peer_last_tsn should be u32::MAX when initial_tsn is 0
+    assert_eq!(
+        assoc.peer_last_tsn,
+        u32::MAX,
+        "peer_last_tsn should wrap to MAX when initial_tsn is 0"
+    );
+}
+
+#[test]
+fn test_out_of_band_rwnd_negotiation() {
+    let local_config = Arc::new(TransportConfig::default().with_max_receive_buffer_size(500_000));
+
+    let remote_config = TransportConfig::default().with_max_receive_buffer_size(300_000);
+
+    let local_init_bytes = generate_snap_token(&local_config).unwrap();
+    let remote_init_bytes = generate_snap_token(&remote_config).unwrap();
+
+    let local_init = ChunkInit::unmarshal(&local_init_bytes).unwrap();
+    let remote_init = ChunkInit::unmarshal(&remote_init_bytes).unwrap();
+
+    let remote_addr: SocketAddr = "192.168.1.1:5000".parse().unwrap();
+
+    let assoc = Association::new_with_out_of_band_init(
+        local_config.clone(),
+        1200,
+        remote_addr,
+        None,
+        local_init,
+        remote_init,
+    )
+    .expect("Should create out-of-band init association");
+
+    // rwnd should be set to remote's advertised receiver window credit
+    assert_eq!(
+        assoc.rwnd, 300_000,
+        "rwnd should be remote's advertised window"
+    );
 }

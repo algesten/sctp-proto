@@ -72,10 +72,15 @@ pub use crate::chunk::ErrorCauseCode;
 pub use crate::chunk::chunk_payload_data::{ChunkPayloadData, PayloadProtocolIdentifier};
 
 mod config;
-pub use crate::config::{ClientConfig, EndpointConfig, ServerConfig, TransportConfig};
+pub use crate::config::{
+    ClientConfig, DEFAULT_SCTP_PORT, EndpointConfig, MAX_SNAP_INIT_BYTES, ServerConfig,
+    TransportConfig, generate_snap_token,
+};
 
 mod endpoint;
-pub use crate::endpoint::{AssociationHandle, ConnectError, DatagramEvent, Endpoint};
+pub use crate::endpoint::{
+    AidCollisionKind, AssociationHandle, ConnectError, DatagramEvent, Endpoint, SnapError, SnapSide,
+};
 
 mod error;
 pub use crate::error::Error;

@@ -336,7 +336,7 @@ impl Association {
         // RFC 4960 Sec 7.2.1
         // The initial cwnd before DATA transmission or after a sufficiently
         // long idle period MUST be set to min(4*MTU, max (2*MTU, 4380bytes)).
-        let cwnd = (2 * mtu).clamp(4380, 4 * mtu);
+        let cwnd = (4 * mtu).min((2 * mtu).max(4380));
 
         Association {
             side,

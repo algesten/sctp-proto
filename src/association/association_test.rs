@@ -1013,3 +1013,26 @@ fn test_out_of_band_rwnd_negotiation() {
         "rwnd should be remote's advertised window"
     );
 }
+
+#[test]
+fn test_initial_cwnd_small_mtu() {
+    // Regression test for #47: a small MTU made 4*MTU < 4380, which previously
+    // panicked because clamp(4380, 4*MTU) was called with min > max.
+    let max_payload_size = 100;
+    let mtu = max_payload_size + COMMON_HEADER_SIZE + DATA_CHUNK_HEADER_SIZE;
+    assert!(4 * mtu < 4380, "test must exercise the small-MTU branch");
+
+    let assoc = Association::new(
+        None,
+        Arc::new(TransportConfig::default()),
+        max_payload_size,
+        0,
+        SocketAddr::from_str("0.0.0.0:0").unwrap(),
+        None,
+        Instant::now(),
+    );
+
+    // RFC 4960 Sec 7.2.1: min(4*MTU, max(2*MTU, 4380)).
+    assert_eq!(assoc.cwnd, (4 * mtu).min((2 * mtu).max(4380)));
+    assert_eq!(assoc.cwnd, 4 * mtu);
+}

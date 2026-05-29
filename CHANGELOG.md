@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Fix cwnd computation panic for small MTU sizes #47
   * Bump rand 0.9.2 -> 0.9.4 to address RUSTSEC-2026-0097 #48
 
 # 0.9.0
@@ -14,14 +15,14 @@
   * Downgrade rand to 0.9 to avoid double chacha20 dep #39
 
 # 0.8.0 (yanked)
-  
+
   * Add I-FORWARD-TSN (RFC 8260) chunk support #29
   * MSRV 1.85, Edition 2024, bump deps #38
   * Enforce receive-side max message size #27
 
 # 0.7.1
 
-  * Fix server-side rwnd initialization from INIT #28 
+  * Fix server-side rwnd initialization from INIT #28
 
 # 0.7.0
 

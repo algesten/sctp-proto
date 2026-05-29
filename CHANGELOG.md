@@ -1,5 +1,7 @@
 # Unreleased
 
+  * Bump rand 0.9.2 -> 0.9.4 to address RUSTSEC-2026-0097 #48
+
 # 0.9.0
 
   * Add support for out of band negotiation for SNAP #34

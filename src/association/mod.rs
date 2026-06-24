@@ -72,10 +72,10 @@ pub enum AssociationError {
     /// Handshake failed
     #[error("{0}")]
     HandshakeFailed(#[from] Error),
-    /// The peer violated the QUIC specification as understood by this implementation
+    /// The peer violated the SCTP specification as understood by this implementation
     #[error("transport error")]
     TransportError,
-    /// The peer's QUIC stack aborted the association automatically
+    /// The peer's SCTP stack aborted the association
     #[error("aborted by peer")]
     AssociationClosed,
     /// The peer closed the association
@@ -108,14 +108,12 @@ pub enum Event {
         /// Reason that the handshake failed
         reason: AssociationError,
     },
-    /// A stream was lost
-    ///
-    /// Emitted if a stream is closed or an error is encountered on a stream.
+    /// The association was lost
+    /// 
+    /// Emitted if the peer closes the association or an error is encountered
     AssociationLost {
         /// Reason that the stream was closed
         reason: AssociationError,
-        /// Which stream was lost
-        id: StreamId,
     },
     /// Stream events
     Stream(StreamEvent),
@@ -758,8 +756,12 @@ impl Association {
             self.close_all_timers();
 
             for si in self.streams.keys().cloned().collect::<Vec<u16>>() {
-                self.unregister_stream(si, AssociationError::LocallyClosed);
+                self.unregister_stream(si, false);
             }
+
+            self.events.push_back(Event::AssociationLost {
+                reason: AssociationError::AssociationClosed,
+            });
 
             debug!("[{}] association closed", self.side);
             debug!(
@@ -895,14 +897,15 @@ impl Association {
 
     /// unregister_stream un-registers a stream from the association
     /// The caller should hold the association write lock.
-    fn unregister_stream(&mut self, stream_identifier: StreamId, reason: AssociationError) {
+    fn unregister_stream(&mut self, stream_identifier: StreamId, emit_stream_finished: bool) {
         if let Some(mut s) = self.streams.remove(&stream_identifier) {
             debug!("[{}] unregister_stream {}", self.side, stream_identifier);
             s.state = RecvSendState::Closed;
-            self.events.push_back(Event::AssociationLost {
-                reason,
-                id: stream_identifier,
-            });
+            if emit_stream_finished {
+                self.events.push_back(Event::Stream(StreamEvent::Finished {
+                    id: stream_identifier,
+                }));
+            }
         }
     }
 
@@ -2150,7 +2153,7 @@ impl Association {
                     if respond {
                         sis_to_reset.push(*id);
                     }
-                    self.unregister_stream(*id, AssociationError::Reset);
+                    self.unregister_stream(*id, true);
                 }
             }
             self.reconfig_requests

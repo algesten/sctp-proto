@@ -109,10 +109,10 @@ pub enum Event {
         reason: AssociationError,
     },
     /// The association was lost
-    /// 
+    ///
     /// Emitted if the peer closes the association or an error is encountered
     AssociationLost {
-        /// Reason that the stream was closed
+        /// Reason that the association was closed
         reason: AssociationError,
     },
     /// Stream events

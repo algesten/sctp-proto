@@ -1,5 +1,7 @@
 # Unreleased
 
+# 0.10.0
+
   * Report association loss separately from stream finish (breaking) #49
   * Fix cwnd computation panic for small MTU sizes #47
   * Bump rand 0.9.2 -> 0.9.4 to address RUSTSEC-2026-0097 #48

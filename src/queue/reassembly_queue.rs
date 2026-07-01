@@ -281,12 +281,65 @@ impl ReassemblyQueue {
     fn calculate_unordered_message_size(&self, new_chunk: &ChunkPayloadData) -> usize {
         // For unordered, calculate size of contiguous chunk set this belongs to
         // This is more complex - need to find the message boundary
-        // Simplified: sum all unordered chunks + new chunk (conservative)
-        self.unordered_chunks
+
+        // first find the set of TSNs that preceeds this chunk
+        let prefix = if new_chunk.beginning_fragment {
+            0
+        } else if let Some(mut p) = self
+            .unordered_chunks
             .iter()
-            .map(|c| c.user_data.len())
-            .sum::<usize>()
-            + new_chunk.user_data.len()
+            .rposition(|f| f.tsn == (new_chunk.tsn - 1))
+        {
+            let mut cnt = 0;
+            let mut tsn = new_chunk.tsn;
+            loop {
+                if self.unordered_chunks[p].tsn == tsn - 1 {
+                    cnt += self.unordered_chunks[p].user_data.len();
+                    tsn = self.unordered_chunks[p].tsn;
+                } else {
+                    break;
+                }
+
+                if self.unordered_chunks[p].beginning_fragment || (p == 0) {
+                    break;
+                }
+                p -= 1;
+            }
+            cnt
+        } else {
+            0
+        };
+
+        // next find the set of TSNs that succeeds this chunk
+        let suffix = if new_chunk.ending_fragment {
+            0
+        } else if let Some(mut p) = self
+            .unordered_chunks
+            .iter()
+            .rposition(|f| f.tsn == (new_chunk.tsn + 1))
+        {
+            let mut cnt = 0;
+            let mut tsn = new_chunk.tsn;
+            while p < self.unordered_chunks.len() {
+                if self.unordered_chunks[p].tsn == tsn + 1 {
+                    cnt += self.unordered_chunks[p].user_data.len();
+                    tsn = self.unordered_chunks[p].tsn;
+                } else {
+                    break;
+                }
+
+                if self.unordered_chunks[p].ending_fragment {
+                    break;
+                }
+                p += 1;
+            }
+            cnt
+        } else {
+            0
+        };
+
+        // now sum the lengths together
+        prefix + new_chunk.user_data.len() + suffix
     }
 
     pub(crate) fn find_complete_unordered_chunk_set(&mut self) -> Option<Chunks> {

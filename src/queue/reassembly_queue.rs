@@ -288,12 +288,12 @@ impl ReassemblyQueue {
         } else if let Some(mut p) = self
             .unordered_chunks
             .iter()
-            .rposition(|f| f.tsn == (new_chunk.tsn - 1))
+            .rposition(|f| f.tsn == new_chunk.tsn.wrapping_sub(1))
         {
             let mut cnt = 0;
             let mut tsn = new_chunk.tsn;
             loop {
-                if self.unordered_chunks[p].tsn == tsn - 1 {
+                if self.unordered_chunks[p].tsn == tsn.wrapping_sub(1) {
                     cnt += self.unordered_chunks[p].user_data.len();
                     tsn = self.unordered_chunks[p].tsn;
                 } else {
@@ -316,12 +316,12 @@ impl ReassemblyQueue {
         } else if let Some(mut p) = self
             .unordered_chunks
             .iter()
-            .rposition(|f| f.tsn == (new_chunk.tsn + 1))
+            .rposition(|f| f.tsn == new_chunk.tsn.wrapping_add(1))
         {
             let mut cnt = 0;
             let mut tsn = new_chunk.tsn;
             while p < self.unordered_chunks.len() {
-                if self.unordered_chunks[p].tsn == tsn + 1 {
+                if self.unordered_chunks[p].tsn == tsn.wrapping_add(1) {
                     cnt += self.unordered_chunks[p].user_data.len();
                     tsn = self.unordered_chunks[p].tsn;
                 } else {

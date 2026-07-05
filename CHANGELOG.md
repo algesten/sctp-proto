@@ -1,5 +1,7 @@
 # Unreleased
 
+  * Add Association::is_closing() to expose SCTP shutdown-in-progress state #51
+
 # 0.10.0
 
   * Report association loss separately from stream finish (breaking) #49

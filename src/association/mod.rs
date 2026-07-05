@@ -679,6 +679,14 @@ impl Association {
         self.state == AssociationState::Closed
     }
 
+    /// Whether the Association has started SCTP shutdown, but is not closed yet
+    ///
+    /// Closing Associations may still need polling, timer-driven retransmission, and packet output
+    /// before they become fully closed.
+    pub fn is_closing(&self) -> bool {
+        self.state.is_closing()
+    }
+
     /// Whether there is no longer any need to keep the association around
     ///
     /// Closed associations become drained after a brief timeout to absorb any remaining in-flight

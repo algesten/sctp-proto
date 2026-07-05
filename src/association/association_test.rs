@@ -18,6 +18,40 @@ fn create_association(config: TransportConfig) -> Association {
 }
 
 #[test]
+fn test_assoc_is_closing() {
+    let closing_states = [
+        AssociationState::ShutdownSent,
+        AssociationState::ShutdownAckSent,
+        AssociationState::ShutdownPending,
+        AssociationState::ShutdownReceived,
+    ];
+
+    for state in [
+        AssociationState::Closed,
+        AssociationState::CookieWait,
+        AssociationState::CookieEchoed,
+        AssociationState::Established,
+    ] {
+        let a = Association {
+            state,
+            ..Default::default()
+        };
+
+        assert!(!a.is_closing(), "{state} should not be closing");
+    }
+
+    for state in closing_states {
+        let a = Association {
+            state,
+            ..Default::default()
+        };
+
+        assert!(a.is_closing(), "{state} should be closing");
+        assert!(!a.is_closed(), "{state} should not be closed");
+    }
+}
+
+#[test]
 fn test_create_forward_tsn_forward_one_abandoned() -> Result<()> {
     let mut a = Association {
         cumulative_tsn_ack_point: 9,

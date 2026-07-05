@@ -46,7 +46,7 @@ impl fmt::Display for AssociationState {
 }
 
 impl AssociationState {
-    pub(crate) fn is_drained(&self) -> bool {
+    pub(crate) fn is_closing(&self) -> bool {
         matches!(
             *self,
             AssociationState::ShutdownSent
@@ -54,6 +54,10 @@ impl AssociationState {
                 | AssociationState::ShutdownPending
                 | AssociationState::ShutdownReceived
         )
+    }
+
+    pub(crate) fn is_drained(&self) -> bool {
+        self.is_closing()
     }
 }
 

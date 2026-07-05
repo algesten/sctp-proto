@@ -1,5 +1,7 @@
 # Unreleased
 
+# 0.10.1
+
   * Add Association::is_closing() to expose SCTP shutdown-in-progress state #51
 
 # 0.10.0

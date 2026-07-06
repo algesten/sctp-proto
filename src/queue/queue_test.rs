@@ -1100,3 +1100,58 @@ fn test_reassembly_queue_wrap_find_complete() {
         "chunkSet with wrapping TSNs is not complete"
     );
 }
+
+#[test]
+fn test_reassembly_queue_max_message_size() {
+    let mut rq = ReassemblyQueue::new(0, 65536);
+    rq.max_message_size = 15;
+
+    assert_eq!(
+        rq.push(ChunkPayloadData {
+            tsn: 100,
+            beginning_fragment: true,
+            unordered: true,
+            user_data: Bytes::from_owner([0; 5]),
+            ..Default::default()
+        }),
+        Ok(false)
+    );
+    assert_eq!(
+        rq.push(ChunkPayloadData {
+            tsn: 102,
+            ending_fragment: true,
+            unordered: true,
+            user_data: Bytes::from_owner([0; 5]),
+            ..Default::default()
+        }),
+        Ok(false)
+    );
+    assert_eq!(
+        rq.push(ChunkPayloadData {
+            tsn: 103,
+            beginning_fragment: true,
+            unordered: true,
+            user_data: Bytes::from_owner([0; 5]),
+            ..Default::default()
+        }),
+        Ok(false)
+    );
+    assert_eq!(
+        rq.push(ChunkPayloadData {
+            tsn: 104,
+            unordered: true,
+            user_data: Bytes::from_owner([0; 5]),
+            ..Default::default()
+        }),
+        Ok(false)
+    );
+    assert_eq!(
+        rq.push(ChunkPayloadData {
+            tsn: 101,
+            unordered: true,
+            user_data: Bytes::from_owner([0; 5]),
+            ..Default::default()
+        }),
+        Ok(true)
+    );
+}

@@ -1036,3 +1036,125 @@ fn test_reassembly_queue_ssn_overflow_in_forward_tsn_for_ordered() -> Result<()>
 
     Ok(())
 }
+
+#[test]
+fn test_chunk_set_wrap() {
+    let cset = Chunks::new(
+        0,
+        PayloadProtocolIdentifier::default(),
+        vec![
+            ChunkPayloadData {
+                tsn: u32::MAX - 1,
+                beginning_fragment: true,
+                ..Default::default()
+            },
+            ChunkPayloadData {
+                tsn: u32::MAX,
+                ..Default::default()
+            },
+            ChunkPayloadData {
+                tsn: 0,
+                ending_fragment: true,
+                ..Default::default()
+            },
+        ],
+    );
+
+    assert!(
+        cset.is_complete(),
+        "chunkSet with wrapping TSNs is not complete"
+    );
+}
+
+#[test]
+fn test_reassembly_queue_wrap_find_complete() {
+    let mut rq = ReassemblyQueue::new(0, 65535);
+
+    assert!(
+        rq.push(ChunkPayloadData {
+            tsn: u32::MAX - 1,
+            unordered: true,
+            beginning_fragment: true,
+            ..Default::default()
+        })
+        .is_ok()
+    );
+    assert!(
+        rq.push(ChunkPayloadData {
+            tsn: u32::MAX,
+            unordered: true,
+            ..Default::default()
+        })
+        .is_ok()
+    );
+    assert!(
+        rq.push(ChunkPayloadData {
+            tsn: 0,
+            unordered: true,
+            ending_fragment: true,
+            ..Default::default()
+        })
+        .is_ok()
+    );
+
+    assert_eq!(
+        rq.unordered.len(),
+        1,
+        "chunkSet with wrapping TSNs is not complete"
+    );
+}
+
+#[test]
+fn test_reassembly_queue_max_message_size() {
+    let mut rq = ReassemblyQueue::new(0, 65536);
+    rq.max_message_size = 15;
+
+    assert_eq!(
+        rq.push(ChunkPayloadData {
+            tsn: 100,
+            beginning_fragment: true,
+            unordered: true,
+            user_data: Bytes::from_owner([0; 5]),
+            ..Default::default()
+        }),
+        Ok(false)
+    );
+    assert_eq!(
+        rq.push(ChunkPayloadData {
+            tsn: 102,
+            ending_fragment: true,
+            unordered: true,
+            user_data: Bytes::from_owner([0; 5]),
+            ..Default::default()
+        }),
+        Ok(false)
+    );
+    assert_eq!(
+        rq.push(ChunkPayloadData {
+            tsn: 103,
+            beginning_fragment: true,
+            unordered: true,
+            user_data: Bytes::from_owner([0; 5]),
+            ..Default::default()
+        }),
+        Ok(false)
+    );
+    assert_eq!(
+        rq.push(ChunkPayloadData {
+            tsn: 104,
+            unordered: true,
+            user_data: Bytes::from_owner([0; 5]),
+            ..Default::default()
+        }),
+        Ok(false)
+    );
+    assert_eq!(
+        rq.push(ChunkPayloadData {
+            tsn: 101,
+            unordered: true,
+            user_data: Bytes::from_owner([0; 5]),
+            ..Default::default()
+        }),
+        Ok(true)
+    );
+}

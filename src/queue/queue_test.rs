@@ -1070,29 +1070,32 @@ fn test_chunk_set_wrap() {
 fn test_reassembly_queue_wrap_find_complete() {
     let mut rq = ReassemblyQueue::new(0, 65535);
 
-    assert!(rq
-        .push(ChunkPayloadData {
+    assert!(
+        rq.push(ChunkPayloadData {
             tsn: u32::MAX - 1,
             unordered: true,
             beginning_fragment: true,
             ..Default::default()
         })
-        .is_ok());
-    assert!(rq
-        .push(ChunkPayloadData {
+        .is_ok()
+    );
+    assert!(
+        rq.push(ChunkPayloadData {
             tsn: u32::MAX,
             unordered: true,
             ..Default::default()
         })
-        .is_ok());
-    assert!(rq
-        .push(ChunkPayloadData {
+        .is_ok()
+    );
+    assert!(
+        rq.push(ChunkPayloadData {
             tsn: 0,
             unordered: true,
             ending_fragment: true,
             ..Default::default()
         })
-        .is_ok());
+        .is_ok()
+    );
 
     assert_eq!(
         rq.unordered.len(),

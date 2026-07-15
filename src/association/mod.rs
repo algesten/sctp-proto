@@ -168,6 +168,9 @@ pub struct Association {
     reconfigs: FxHashMap<u32, ChunkReconfig>,
     reconfig_requests: FxHashMap<u32, ParamOutgoingResetRequest>,
     max_completed_reconfig_rsn: Option<u32>,
+    /// Stream ids for which `StreamEvent::Finished` has fired but whose
+    /// `StreamEvent::ResetComplete` is still awaited.
+    pending_reset_completions: Vec<StreamId>,
 
     // Non-RFC internal data
     remote_addr: SocketAddr,
@@ -257,6 +260,7 @@ impl Default for Association {
             reconfigs: FxHashMap::default(),
             reconfig_requests: FxHashMap::default(),
             max_completed_reconfig_rsn: None,
+            pending_reset_completions: Vec::new(),
 
             // Non-RFC internal data
             remote_addr: SocketAddr::from_str("0.0.0.0:0").unwrap(),
@@ -767,6 +771,9 @@ impl Association {
                 self.unregister_stream(si, false);
             }
 
+            // AssociationLost stops any pending  ResetComplete.
+            self.pending_reset_completions.clear();
+
             self.events.push_back(Event::AssociationLost {
                 reason: AssociationError::AssociationClosed,
             });
@@ -892,6 +899,23 @@ impl Association {
         self.set_max_send_message_size(value)
     }
 
+    /// Push [`StreamEvent::ResetComplete`] for each candidate id whose reset
+    /// handshake has completed, `Finished` must have been already fired for it
+    /// and no pending outgoing RE-CONFIG names it.
+    fn emit_reset_complete(&mut self, ids: impl IntoIterator<Item = StreamId>) {
+        for id in ids {
+            // An id with a reset still pending must stay armed,
+            // so only disarm once nothing is pending.
+            if self.pending_reset_completions.contains(&id)
+                && !self.has_pending_reset_for_stream(id)
+            {
+                self.pending_reset_completions.retain(|&x| x != id);
+                self.events
+                    .push_back(Event::Stream(StreamEvent::ResetComplete { id }));
+            }
+        }
+    }
+
     /// Returns true if the given stream ID appears in any pending outgoing
     /// RE-CONFIG that has not yet been acknowledged by the remote peer.
     fn has_pending_reset_for_stream(&self, stream_id: StreamId) -> bool {
@@ -913,6 +937,11 @@ impl Association {
                 self.events.push_back(Event::Stream(StreamEvent::Finished {
                     id: stream_identifier,
                 }));
+                // Every Finished owes a ResetComplete once the handshake
+                // complete, even if the peer re-creates the stream id first.
+                if !self.pending_reset_completions.contains(&stream_identifier) {
+                    self.pending_reset_completions.push(stream_identifier);
+                }
             }
         }
     }
@@ -1834,7 +1863,27 @@ impl Association {
             }
             Ok(())
         } else if let Some(p) = raw.as_any().downcast_ref::<ParamReconfigResponse>() {
-            self.reconfigs.remove(&p.reconfig_response_sequence_number);
+            // In progress result means the peer has deferred the request,
+            // not answered it. The request stays outstanding and its timer restarts
+            // without counting toward the retransmission limit.
+            if p.result == ReconfigResult::InProgress {
+                if self
+                    .reconfigs
+                    .contains_key(&p.reconfig_response_sequence_number)
+                {
+                    self.timers.stop(Timer::Reconfig);
+                }
+                return Ok(());
+            }
+            if let Some(c) = self.reconfigs.remove(&p.reconfig_response_sequence_number) {
+                let ids: Vec<StreamId> = c
+                    .param_a
+                    .as_ref()
+                    .and_then(|pa| pa.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+                    .map(|pa| pa.stream_identifiers.clone())
+                    .unwrap_or_default();
+                self.emit_reset_complete(ids);
+            }
             if self.reconfigs.is_empty() {
                 self.timers.stop(Timer::Reconfig);
             }
@@ -2145,22 +2194,21 @@ impl Association {
     fn reset_streams_if_any(
         &mut self,
         p: &ParamOutgoingResetRequest,
-        respond: bool,
+        from_wire: bool,
         reply: &mut Vec<Packet>,
     ) -> Result<()> {
         let mut result = ReconfigResult::SuccessPerformed;
         let mut sis_to_reset = vec![];
 
-        if sna32lte(p.sender_last_tsn, self.peer_last_tsn) {
+        let performed = sna32lte(p.sender_last_tsn, self.peer_last_tsn);
+        if performed {
             debug!(
                 "[{}] resetStream(): senderLastTSN={} <= peer_last_tsn={}",
                 self.side, p.sender_last_tsn, self.peer_last_tsn
             );
             for id in &p.stream_identifiers {
                 if self.streams.contains_key(id) {
-                    if respond {
-                        sis_to_reset.push(*id);
-                    }
+                    sis_to_reset.push(*id);
                     self.unregister_stream(*id, true);
                 }
             }
@@ -2174,8 +2222,13 @@ impl Association {
             result = ReconfigResult::InProgress;
         }
 
-        // Answer incoming reset requests with the same reset request, but with
-        // reconfig_response_sequence_number.
+        // Answer incoming reset requests with the same reset request,
+        // this is the peer's teardown of its own half.
+        // 
+        // The reciprocal also keeps each unregistered id pending in
+        // `reconfigs`, which is what defers `StreamEvent::ResetComplete`
+        // until the reciprocal is acknowledged (handle_reconfig_param) or
+        // abandoned (on_retransmission_failure).
         if !sis_to_reset.is_empty() {
             let rsn = self.generate_next_rsn();
             let tsn = self.my_next_tsn - 1;
@@ -2196,17 +2249,24 @@ impl Association {
             reply.push(p);
         }
 
-        let packet = self.create_packet(vec![Box::new(ChunkReconfig {
-            param_a: Some(Box::new(ParamReconfigResponse {
-                reconfig_response_sequence_number: p.reconfig_request_sequence_number,
-                result,
-            })),
-            param_b: None,
-        })]);
+        // Respond to every request that arrived, fresh, retransmitted
+        // or defered by arrival of in-flight data.
+        // 
+        // Intermediate re-evaluations that still fail due to in-flight data
+        // stay silent rather than repeating "In progress" on every advance.
+        if from_wire || performed {
+            let packet = self.create_packet(vec![Box::new(ChunkReconfig {
+                param_a: Some(Box::new(ParamReconfigResponse {
+                    reconfig_response_sequence_number: p.reconfig_request_sequence_number,
+                    result,
+                })),
+                param_b: None,
+            })]);
 
-        debug!("[{}] RESET RESPONSE: {}", self.side, packet);
+            debug!("[{}] RESET RESPONSE: {}", self.side, packet);
 
-        reply.push(packet);
+            reply.push(packet);
+        }
 
         Ok(())
     }
@@ -3143,7 +3203,21 @@ impl Association {
                     self.side,
                     self.reconfigs.len()
                 );
+                // Abandonment completes the handshake just like an ack, the
+                // cleared entries no longer block their stream ids, so any
+                // armed id owes its ResetComplete now.
+                let ids: Vec<StreamId> = self
+                    .reconfigs
+                    .values()
+                    .filter_map(|c| {
+                        c.param_a
+                            .as_ref()
+                            .and_then(|pa| pa.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+                    })
+                    .flat_map(|pa| pa.stream_identifiers.iter().copied())
+                    .collect();
                 self.reconfigs.clear();
+                self.emit_reset_complete(ids);
             }
 
             _ => {}

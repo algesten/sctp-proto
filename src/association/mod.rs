@@ -53,7 +53,7 @@ use core::time::Duration;
 use log::{debug, error, trace, warn};
 use rand::random;
 use rustc_hash::FxHashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use thiserror::Error;
 
@@ -170,7 +170,7 @@ pub struct Association {
     max_completed_reconfig_rsn: Option<u32>,
     /// Stream ids for which `StreamEvent::Finished` has fired but whose
     /// `StreamEvent::ResetComplete` is still awaited.
-    pending_reset_completions: Vec<StreamId>,
+    pending_reset_completions: HashSet<StreamId>,
 
     // Non-RFC internal data
     remote_addr: SocketAddr,
@@ -260,7 +260,7 @@ impl Default for Association {
             reconfigs: FxHashMap::default(),
             reconfig_requests: FxHashMap::default(),
             max_completed_reconfig_rsn: None,
-            pending_reset_completions: Vec::new(),
+            pending_reset_completions: HashSet::new(),
 
             // Non-RFC internal data
             remote_addr: SocketAddr::from_str("0.0.0.0:0").unwrap(),
@@ -909,7 +909,7 @@ impl Association {
             if self.pending_reset_completions.contains(&id)
                 && !self.has_pending_reset_for_stream(id)
             {
-                self.pending_reset_completions.retain(|&x| x != id);
+                self.pending_reset_completions.remove(&id);
                 self.events
                     .push_back(Event::Stream(StreamEvent::ResetComplete { id }));
             }
@@ -939,9 +939,7 @@ impl Association {
                 }));
                 // Every Finished owes a ResetComplete once the handshake
                 // complete, even if the peer re-creates the stream id first.
-                if !self.pending_reset_completions.contains(&stream_identifier) {
-                    self.pending_reset_completions.push(stream_identifier);
-                }
+                self.pending_reset_completions.insert(stream_identifier);
             }
         }
     }

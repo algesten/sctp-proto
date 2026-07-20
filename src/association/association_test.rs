@@ -110,7 +110,7 @@ fn test_reset_complete_only_for_successful_reconfig_response() -> Result<()> {
         ReconfigResult::Unknown,
     ] {
         let mut a = Association::default();
-        a.pending_reset_completions.push(stream_id);
+        a.pending_reset_completions.insert(stream_id);
         a.reconfigs.insert(rsn, outgoing_reset(rsn, stream_id));
 
         let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
@@ -138,7 +138,7 @@ fn test_reconfig_retransmission_failure_does_not_complete_reset() {
     let rsn = 7;
     let stream_id = 1;
     let mut a = Association::default();
-    a.pending_reset_completions.push(stream_id);
+    a.pending_reset_completions.insert(stream_id);
     a.reconfigs.insert(rsn, outgoing_reset(rsn, stream_id));
 
     a.on_retransmission_failure(Timer::Reconfig);

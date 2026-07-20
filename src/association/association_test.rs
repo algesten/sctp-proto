@@ -51,6 +51,139 @@ fn test_assoc_is_closing() {
     }
 }
 
+fn outgoing_reset(rsn: u32, stream_id: StreamId) -> ChunkReconfig {
+    ChunkReconfig {
+        param_a: Some(Box::new(ParamOutgoingResetRequest {
+            reconfig_request_sequence_number: rsn,
+            stream_identifiers: vec![stream_id],
+            ..Default::default()
+        })),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn test_reconfig_in_progress_timeout_does_not_consume_retry_budget() -> Result<()> {
+    let now = Instant::now();
+    let rsn = 7;
+    let mut a = create_association(
+        TransportConfig::default()
+            .with_max_init_retransmits(Some(0))
+            .with_rto_initial_ms(1),
+    );
+
+    a.reconfigs.insert(rsn, outgoing_reset(rsn, 1));
+    a.timers.start(Timer::Reconfig, now, a.rto_mgr.get_rto());
+
+    let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+        reconfig_response_sequence_number: rsn,
+        result: ReconfigResult::InProgress,
+    });
+    a.handle_reconfig_param(&response, &mut vec![])?;
+
+    // The outbound path restarts the timer after processing InProgress. RFC
+    // 6525 section 5.2.7 H2 requires the next expiry to retransmit without
+    // incrementing the error counter.
+    a.timers
+        .restart_if_stale(Timer::Reconfig, now, a.rto_mgr.get_rto());
+    let deadline = a.timers.get(Timer::Reconfig).unwrap();
+    a.handle_timeout(deadline);
+
+    assert!(a.reconfigs.contains_key(&rsn));
+    assert!(a.will_retransmit_reconfig);
+    Ok(())
+}
+
+#[test]
+fn test_reset_complete_only_for_successful_reconfig_response() -> Result<()> {
+    let rsn = 7;
+    let stream_id = 1;
+
+    for result in [
+        ReconfigResult::SuccessNop,
+        ReconfigResult::SuccessPerformed,
+        ReconfigResult::Denied,
+        ReconfigResult::ErrorWrongSsn,
+        ReconfigResult::ErrorRequestAlreadyInProgress,
+        ReconfigResult::ErrorBadSequenceNumber,
+        ReconfigResult::InProgress,
+        ReconfigResult::Unknown,
+    ] {
+        let mut a = Association::default();
+        a.pending_reset_completions.push(stream_id);
+        a.reconfigs.insert(rsn, outgoing_reset(rsn, stream_id));
+
+        let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+            reconfig_response_sequence_number: rsn,
+            result,
+        });
+        a.handle_reconfig_param(&response, &mut vec![])?;
+
+        let completed = matches!(
+            a.poll(),
+            Some(Event::Stream(StreamEvent::ResetComplete { id })) if id == stream_id
+        );
+        let should_complete = matches!(
+            result,
+            ReconfigResult::SuccessNop | ReconfigResult::SuccessPerformed
+        );
+        assert_eq!(completed, should_complete, "unexpected result for {result}");
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_reconfig_retransmission_failure_does_not_complete_reset() {
+    let rsn = 7;
+    let stream_id = 1;
+    let mut a = Association::default();
+    a.pending_reset_completions.push(stream_id);
+    a.reconfigs.insert(rsn, outgoing_reset(rsn, stream_id));
+
+    a.on_retransmission_failure(Timer::Reconfig);
+
+    assert!(!matches!(
+        a.poll(),
+        Some(Event::Stream(StreamEvent::ResetComplete { id })) if id == stream_id
+    ));
+}
+
+#[test]
+fn test_reset_complete_preserves_stream_generations() {
+    let stream_id = 1;
+    let mut a = Association::default();
+
+    assert!(
+        a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
+            .is_some()
+    );
+    a.unregister_stream(stream_id, true);
+
+    // Incoming DATA can recreate an id while the previous reciprocal reset is
+    // still pending. A second reset of that id is a distinct generation.
+    assert!(a.get_or_create_stream(stream_id).is_some());
+    a.unregister_stream(stream_id, true);
+
+    a.emit_reset_complete([stream_id]);
+    a.emit_reset_complete([stream_id]);
+
+    let mut finished = 0;
+    let mut reset_complete = 0;
+    while let Some(event) = a.poll() {
+        match event {
+            Event::Stream(StreamEvent::Finished { id }) if id == stream_id => finished += 1,
+            Event::Stream(StreamEvent::ResetComplete { id }) if id == stream_id => {
+                reset_complete += 1;
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(finished, 2);
+    assert_eq!(reset_complete, 2);
+}
+
 #[test]
 fn test_create_forward_tsn_forward_one_abandoned() -> Result<()> {
     let mut a = Association {

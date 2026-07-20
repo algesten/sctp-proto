@@ -2224,7 +2224,7 @@ impl Association {
 
         // Answer incoming reset requests with the same reset request,
         // this is the peer's teardown of its own half.
-        // 
+        //
         // The reciprocal also keeps each unregistered id pending in
         // `reconfigs`, which is what defers `StreamEvent::ResetComplete`
         // until the reciprocal is acknowledged (handle_reconfig_param) or
@@ -2251,7 +2251,7 @@ impl Association {
 
         // Respond to every request that arrived, fresh, retransmitted
         // or defered by arrival of in-flight data.
-        // 
+        //
         // Intermediate re-evaluations that still fail due to in-flight data
         // stay silent rather than repeating "In progress" on every advance.
         if from_wire || performed {

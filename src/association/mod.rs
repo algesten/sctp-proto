@@ -53,7 +53,7 @@ use core::time::Duration;
 use log::{debug, error, trace, warn};
 use rand::random;
 use rustc_hash::FxHashMap;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Instant;
 use thiserror::Error;
 
@@ -121,6 +121,37 @@ pub enum Event {
     DatagramReceived,
 }
 
+/// Multiset of stream ids owing a [`StreamEvent::ResetComplete`].
+/// Each `Finished` for an id arms one completion, a re-created id is a distinct
+/// generation and owes its own.
+#[derive(Debug, Default)]
+struct PendingResetCompletions(FxHashMap<StreamId, usize>);
+
+impl PendingResetCompletions {
+    /// Arm one completion for this id.
+    fn insert(&mut self, id: StreamId) {
+        *self.0.entry(id).or_default() += 1;
+    }
+
+    fn contains(&self, id: &StreamId) -> bool {
+        self.0.contains_key(id)
+    }
+
+    /// Consume one armed completion for this id.
+    fn take_one(&mut self, id: StreamId) {
+        if let Some(count) = self.0.get_mut(&id) {
+            *count -= 1;
+            if *count == 0 {
+                self.0.remove(&id);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
 ///Association represents an SCTP association
 //13.2.  Parameters Necessary per Association (i.e., the TCB)
 //Peer : Tag value to be sent in every packet and is received
@@ -170,7 +201,7 @@ pub struct Association {
     max_completed_reconfig_rsn: Option<u32>,
     /// Stream ids for which `StreamEvent::Finished` has fired but whose
     /// `StreamEvent::ResetComplete` is still awaited.
-    pending_reset_completions: HashSet<StreamId>,
+    pending_reset_completions: PendingResetCompletions,
 
     // Non-RFC internal data
     remote_addr: SocketAddr,
@@ -260,7 +291,7 @@ impl Default for Association {
             reconfigs: FxHashMap::default(),
             reconfig_requests: FxHashMap::default(),
             max_completed_reconfig_rsn: None,
-            pending_reset_completions: HashSet::new(),
+            pending_reset_completions: PendingResetCompletions::default(),
 
             // Non-RFC internal data
             remote_addr: SocketAddr::from_str("0.0.0.0:0").unwrap(),
@@ -909,7 +940,7 @@ impl Association {
             if self.pending_reset_completions.contains(&id)
                 && !self.has_pending_reset_for_stream(id)
             {
-                self.pending_reset_completions.remove(&id);
+                self.pending_reset_completions.take_one(id);
                 self.events
                     .push_back(Event::Stream(StreamEvent::ResetComplete { id }));
             }
@@ -1870,6 +1901,7 @@ impl Association {
                     .contains_key(&p.reconfig_response_sequence_number)
                 {
                     self.timers.stop(Timer::Reconfig);
+                    self.timers.suppress_error_count(Timer::Reconfig);
                 }
                 return Ok(());
             }
@@ -1880,7 +1912,20 @@ impl Association {
                     .and_then(|pa| pa.as_any().downcast_ref::<ParamOutgoingResetRequest>())
                     .map(|pa| pa.stream_identifiers.clone())
                     .unwrap_or_default();
-                self.emit_reset_complete(ids);
+                match p.result {
+                    ReconfigResult::SuccessNop | ReconfigResult::SuccessPerformed => {
+                        self.emit_reset_complete(ids);
+                    }
+                    // A denied or failed reset ends the handshake without
+                    // making the id reusable, consume the armed completion
+                    // without notifying.
+                    // (InProgress is intercepted early and can never reach this match)
+                    _ => {
+                        for id in ids {
+                            self.pending_reset_completions.take_one(id);
+                        }
+                    }
+                }
             }
             if self.reconfigs.is_empty() {
                 self.timers.stop(Timer::Reconfig);
@@ -3201,9 +3246,9 @@ impl Association {
                     self.side,
                     self.reconfigs.len()
                 );
-                // Abandonment completes the handshake just like an ack, the
-                // cleared entries no longer block their stream ids, so any
-                // armed id owes its ResetComplete now.
+                // Abandonment ends the handshake without confirmation from the peer,
+                // ids must not be reported as reusable, consume their armed completions
+                // without emitting ResetComplete.
                 let ids: Vec<StreamId> = self
                     .reconfigs
                     .values()
@@ -3215,7 +3260,9 @@ impl Association {
                     .flat_map(|pa| pa.stream_identifiers.iter().copied())
                     .collect();
                 self.reconfigs.clear();
-                self.emit_reset_complete(ids);
+                for id in ids {
+                    self.pending_reset_completions.take_one(id);
+                }
             }
 
             _ => {}

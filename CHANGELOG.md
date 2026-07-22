@@ -1,5 +1,10 @@
 # Unreleased
 
+# 0.10.2
+
+  * Calculate message length accurately in the reassembly queue #50
+  * Fix stream reset handshake and emit ResetComplete when complete #53
+
 # 0.10.1
 
   * Add Association::is_closing() to expose SCTP shutdown-in-progress state #51

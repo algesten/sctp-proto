@@ -34,6 +34,8 @@ pub(crate) struct TimerTable {
     retrans: [usize; TIMER_COUNT],
     /// Maximum retransmissions for each timer. `None` means unlimited.
     max_retrans: [Option<usize>; TIMER_COUNT],
+    /// Timers whose next expiry must not increment the error counter
+    no_error_count: [bool; TIMER_COUNT],
     /// Maximum RTO value for exponential backoff.
     rto_max: u64,
 }
@@ -44,6 +46,7 @@ impl Default for TimerTable {
             data: [None; TIMER_COUNT],
             retrans: [0; TIMER_COUNT],
             max_retrans: [None; TIMER_COUNT],
+            no_error_count: [false; TIMER_COUNT],
             rto_max: 60000, // Default RTO_MAX
         }
     }
@@ -106,19 +109,29 @@ impl TimerTable {
     pub fn stop(&mut self, timer: Timer) {
         self.data[timer as usize] = None;
         self.retrans[timer as usize] = 0;
+        self.no_error_count[timer as usize] = false;
+    }
+
+    /// Exempt the timer's next expiry from the `max_retrans` accounting.
+    pub fn suppress_error_count(&mut self, timer: Timer) {
+        self.no_error_count[timer as usize] = true;
     }
 
     pub fn is_expired(&mut self, timer: Timer, after: Instant) -> (bool, bool, usize) {
         let expired = self.data[timer as usize].is_some_and(|x| x <= after);
         let mut failure = false;
         if expired {
-            self.retrans[timer as usize] += 1;
-            if let Some(max) = self.max_retrans[timer as usize] {
-                if self.retrans[timer as usize] > max {
-                    failure = true;
+            if self.no_error_count[timer as usize] {
+                self.no_error_count[timer as usize] = false;
+            } else {
+                self.retrans[timer as usize] += 1;
+                if let Some(max) = self.max_retrans[timer as usize] {
+                    if self.retrans[timer as usize] > max {
+                        failure = true;
+                    }
                 }
+                // If max_retrans is None, failure stays false (unlimited)
             }
-            // If max_retrans is None, failure stays false (unlimited)
         }
 
         (expired, failure, self.retrans[timer as usize])

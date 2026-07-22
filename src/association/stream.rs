@@ -36,9 +36,23 @@ pub enum StreamEvent {
         /// Which stream is now writable
         id: StreamId,
     },
-    /// A finished stream has been fully acknowledged or stopped
+    /// The stream was torn down by a reset, an inbound reset
+    /// request from the peer naming the id was processed or
+    /// its reciprocal to a locally-initiated one.
+    ///
+    /// No more data can be read from or written to it.
+    ///
+    /// Once this fires, [`StreamEvent::ResetComplete`] for the same id is
+    /// guaranteed to eventually follow, unless the association closes first.
     Finished {
         /// Which stream has been finished
+        id: StreamId,
+    },
+    /// The reset handshake involving this stream id has fully
+    /// completed and the id can be reused and
+    /// `[Association::open_stream]` stop failing.
+    ResetComplete {
+        /// Which stream id has become reusable
         id: StreamId,
     },
     /// The peer asked us to stop sending on an outgoing stream
@@ -229,20 +243,32 @@ impl<'a> Stream<'a> {
 
     /// stop closes the read-direction of the stream.
     /// Future calls to read are not permitted after calling stop.
+    ///    
+    /// NOTE: a stream closed without a queued reset never produces
+    /// `StreamEvent::Finished` / `StreamEvent::ResetComplete`.
     pub fn stop(&mut self) -> Result<()> {
-        let mut reset = false;
-        if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
-            if s.state == RecvSendState::Readable || s.state == RecvSendState::ReadWritable {
-                reset = true;
-            }
-            s.state = ((s.state as u8) & 0x2).into();
-        }
+        let reset = self
+            .association
+            .streams
+            .get(&self.stream_identifier)
+            .is_some_and(|s| {
+                s.state == RecvSendState::Readable || s.state == RecvSendState::ReadWritable
+            });
 
         if reset {
             // Reset the outgoing stream
             // https://tools.ietf.org/html/rfc6525
+            //
+            // Queued before clearing the read bit below, send_reset_request
+            // is the only fallible step, and failing after the state
+            // mutation would leave the stream half-closed with the reset
+            // silently dropped and unretryable.
             self.association
                 .send_reset_request(self.stream_identifier)?;
+        }
+
+        if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
+            s.state = ((s.state as u8) & 0x2).into();
         }
 
         Ok(())
@@ -261,6 +287,10 @@ impl<'a> Stream<'a> {
     ///
     /// This is a convenience method that calls `finish()` followed by `stop()`.
     /// Resets the stream when both halves are shutdown.
+    ///
+    /// The single failure mode is `stop()`'s, if the association is not
+    /// established, no reset was queued, retrying `close()` will
+    /// attempt the reset again.
     pub fn close(&mut self) -> Result<()> {
         self.finish()?;
         self.stop()

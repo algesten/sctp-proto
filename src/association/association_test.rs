@@ -150,6 +150,30 @@ fn test_reconfig_retransmission_failure_does_not_complete_reset() {
 }
 
 #[test]
+fn test_denied_reset_remains_quarantined_without_terminal_event() -> Result<()> {
+    let rsn = 7;
+    let stream_id = 1;
+    let mut a = Association::default();
+    a.pending_reset_completions.insert(stream_id);
+    a.reconfigs.insert(rsn, outgoing_reset(rsn, stream_id));
+
+    let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+        reconfig_response_sequence_number: rsn,
+        result: ReconfigResult::Denied,
+    });
+    a.handle_reconfig_param(&response, &mut vec![])?;
+
+    // Until the public API has a ResetFailed/ResetDenied event, forgetting
+    // this generation would leave the caller unable to distinguish an unsafe
+    // ID from one whose reset completed.
+    assert!(
+        a.pending_reset_completions.contains(&stream_id),
+        "a failed reset needs either a terminal event or continued quarantine"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_reset_complete_preserves_stream_generations() {
     let stream_id = 1;
     let mut a = Association::default();
@@ -182,6 +206,78 @@ fn test_reset_complete_preserves_stream_generations() {
 
     assert_eq!(finished, 2);
     assert_eq!(reset_complete, 2);
+}
+
+#[test]
+fn test_reset_complete_preserves_generations_through_responses() -> Result<()> {
+    let stream_id = 1;
+    let first_rsn = 7;
+    let second_rsn = 8;
+    let mut a = Association::default();
+
+    // Two Finished events for the same stream ID represent two distinct
+    // incarnations. Each successful reset response must complete one.
+    a.pending_reset_completions.insert(stream_id);
+    a.pending_reset_completions.insert(stream_id);
+    a.reconfigs
+        .insert(first_rsn, outgoing_reset(first_rsn, stream_id));
+    a.reconfigs
+        .insert(second_rsn, outgoing_reset(second_rsn, stream_id));
+
+    for rsn in [first_rsn, second_rsn] {
+        let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+            reconfig_response_sequence_number: rsn,
+            result: ReconfigResult::SuccessPerformed,
+        });
+        a.handle_reconfig_param(&response, &mut vec![])?;
+    }
+
+    let reset_complete = std::iter::from_fn(|| a.poll())
+        .filter(|event| {
+            matches!(
+                event,
+                Event::Stream(StreamEvent::ResetComplete { id }) if *id == stream_id
+            )
+        })
+        .count();
+
+    assert_eq!(
+        reset_complete, 2,
+        "each completed stream generation needs its own ResetComplete"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_outgoing_reset_implicitly_acknowledges_pending_request() -> Result<()> {
+    let local_rsn = 7;
+    let stream_id = 1;
+    let mut a = Association::default();
+
+    a.reconfigs
+        .insert(local_rsn, outgoing_reset(local_rsn, stream_id));
+    a.timers
+        .start(Timer::Reconfig, Instant::now(), a.rto_mgr.get_rto());
+
+    // RFC 6525 section 5.2.2 E1: the response sequence number carried by an
+    // incoming Outgoing Reset Request acknowledges our matching request.
+    let request: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 8,
+        reconfig_response_sequence_number: local_rsn,
+        sender_last_tsn: a.peer_last_tsn,
+        stream_identifiers: vec![],
+    });
+    a.handle_reconfig_param(&request, &mut vec![])?;
+
+    assert!(
+        !a.reconfigs.contains_key(&local_rsn),
+        "the implicitly acknowledged request must no longer be in flight"
+    );
+    assert!(
+        a.timers.get(Timer::Reconfig).is_none(),
+        "the timer must stop after the final in-flight request is acknowledged"
+    );
+    Ok(())
 }
 
 #[test]

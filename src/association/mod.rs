@@ -937,7 +937,7 @@ impl Association {
         for id in ids {
             // An id with a reset still pending must stay armed,
             // so only disarm once nothing is pending.
-            if self.pending_reset_completions.contains(&id)
+            while self.pending_reset_completions.contains(&id)
                 && !self.has_pending_reset_for_stream(id)
             {
                 self.pending_reset_completions.take_one(id);
@@ -1861,6 +1861,21 @@ impl Association {
         reply: &mut Vec<Packet>,
     ) -> Result<()> {
         if let Some(p) = raw.as_any().downcast_ref::<ParamOutgoingResetRequest>() {
+            // RFC 6525 section 5.2.2 E1: the response sequence number in an
+            // Outgoing Reset Request implicitly acknowledges our request.
+            if let Some(c) = self.reconfigs.remove(&p.reconfig_response_sequence_number) {
+                let ids = c
+                    .param_a
+                    .as_ref()
+                    .and_then(|pa| pa.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+                    .map(|pa| pa.stream_identifiers.clone())
+                    .unwrap_or_default();
+                self.emit_reset_complete(ids);
+                if self.reconfigs.is_empty() {
+                    self.timers.stop(Timer::Reconfig);
+                }
+            }
+
             let seq = p.reconfig_request_sequence_number;
             // Detect retransmission of a completed request. An InProgress request
             // is still in reconfig_requests, so we must let those through for
@@ -1916,15 +1931,11 @@ impl Association {
                     ReconfigResult::SuccessNop | ReconfigResult::SuccessPerformed => {
                         self.emit_reset_complete(ids);
                     }
-                    // A denied or failed reset ends the handshake without
-                    // making the id reusable, consume the armed completion
-                    // without notifying.
+                    // A denied or failed reset ends the handshake without making
+                    // the id reusable. Keep its completion armed as a quarantine
+                    // marker until the API can report a terminal failure event.
                     // (InProgress is intercepted early and can never reach this match)
-                    _ => {
-                        for id in ids {
-                            self.pending_reset_completions.take_one(id);
-                        }
-                    }
+                    _ => {}
                 }
             }
             if self.reconfigs.is_empty() {

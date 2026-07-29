@@ -1,5 +1,7 @@
 # Unreleased
 
+  * Fix reset completion bookkeeping across failed and overlapping resets #54
+
 # 0.10.2
 
   * Calculate message length accurately in the reassembly queue #50

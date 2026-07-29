@@ -232,7 +232,7 @@ fn test_reset_complete_preserves_generations_through_responses() -> Result<()> {
         a.handle_reconfig_param(&response, &mut vec![])?;
     }
 
-    let reset_complete = std::iter::from_fn(|| a.poll())
+    let reset_complete = core::iter::from_fn(|| a.poll())
         .filter(|event| {
             matches!(
                 event,

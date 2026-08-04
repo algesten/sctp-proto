@@ -644,6 +644,183 @@ fn test_peer_recreated_quarantined_stream_is_not_writable() -> Result<()> {
 }
 
 #[test]
+fn test_only_one_buffered_reconfig_is_sent_when_timer_is_idle() {
+    let mut a = Association {
+        state: AssociationState::Established,
+        ..Default::default()
+    };
+
+    for (rsn, stream_id) in [(7, 1), (8, 2)] {
+        let c = outgoing_reset(rsn, stream_id);
+        a.reconfigs.insert(rsn, c.clone());
+        a.unsent_reconfigs.insert(rsn);
+        let packet = a.create_packet(vec![Box::new(c)]);
+        a.control_queue.push_back(packet);
+    }
+    assert!(a.timers.get(Timer::Reconfig).is_none());
+
+    assert!(a.poll_transmit(Instant::now()).is_some());
+    assert_eq!(
+        a.unsent_reconfigs.len(),
+        1,
+        "RFC 6525 permits only one reconfiguration request in flight"
+    );
+}
+
+#[test]
+fn test_in_progress_keeps_later_request_buffered() -> Result<()> {
+    let mut a = Association {
+        state: AssociationState::Established,
+        ..Default::default()
+    };
+
+    a.reconfigs.insert(7, outgoing_reset(7, 1));
+    let buffered = outgoing_reset(8, 2);
+    a.reconfigs.insert(8, buffered.clone());
+    a.unsent_reconfigs.insert(8);
+    let packet = a.create_packet(vec![Box::new(buffered)]);
+    a.control_queue.push_back(packet);
+    a.timers
+        .start(Timer::Reconfig, Instant::now(), a.rto_mgr.get_rto());
+
+    let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+        reconfig_response_sequence_number: 7,
+        result: ReconfigResult::InProgress,
+    });
+    a.handle_reconfig_param(&response, &mut vec![])?;
+    assert!(a.reconfigs.contains_key(&7));
+
+    let _ = a.poll_transmit(Instant::now());
+    assert!(
+        a.unsent_reconfigs.contains(&8),
+        "InProgress leaves the current request in flight, so the next must stay buffered"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_local_reset_stays_queued_while_reconfig_timer_runs() -> Result<()> {
+    let mut a = Association {
+        state: AssociationState::Established,
+        my_next_tsn: 1,
+        ..Default::default()
+    };
+
+    a.reconfigs.insert(7, outgoing_reset(7, 1));
+    a.timers
+        .start(Timer::Reconfig, Instant::now(), a.rto_mgr.get_rto());
+    a.send_reset_request(2)?;
+
+    let _ = a.poll_transmit(Instant::now());
+    assert_eq!(
+        a.reconfigs.len(),
+        1,
+        "a locally initiated reset must remain queued while another request is in flight"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_retransmission_does_not_send_buffered_reconfigs() {
+    let mut a = Association {
+        state: AssociationState::Established,
+        ..Default::default()
+    };
+
+    let active = outgoing_reset(7, 1);
+    let buffered = outgoing_reset(8, 2);
+    a.reconfigs.insert(7, active);
+    a.reconfigs.insert(8, buffered.clone());
+    a.unsent_reconfigs.insert(8);
+    a.control_queue
+        .push_back(a.create_packet(vec![Box::new(buffered)]));
+    a.timers
+        .start(Timer::Reconfig, Instant::now(), a.rto_mgr.get_rto());
+    a.will_retransmit_reconfig = true;
+
+    let (packets, _) = a.gather_outbound(Instant::now());
+    assert_eq!(
+        packets.len(),
+        1,
+        "retransmission must include only the request associated with the running timer"
+    );
+}
+
+#[test]
+fn test_older_completion_does_not_make_newer_generation_writable() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association::default();
+
+    a.pending_reset_completions.insert(stream_id);
+    a.pending_reset_completions.insert(stream_id);
+    a.reconfigs.insert(7, outgoing_reset(7, stream_id));
+    a.reconfigs.insert(8, outgoing_reset(8, stream_id));
+    a.unsent_reconfigs.insert(8);
+    a.timers
+        .start(Timer::Reconfig, Instant::now(), a.rto_mgr.get_rto());
+
+    assert!(a.get_or_create_stream(stream_id).is_some());
+    assert!(!a.stream(stream_id)?.is_writable());
+
+    let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+        reconfig_response_sequence_number: 7,
+        result: ReconfigResult::SuccessPerformed,
+    });
+    a.handle_reconfig_param(&response, &mut vec![])?;
+
+    assert!(a.reconfigs.contains_key(&8));
+    assert!(
+        !a.stream(stream_id)?.is_writable(),
+        "an older success cannot release the newer generation's outgoing quarantine"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_stale_completion_does_not_override_newer_denial() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association::default();
+
+    a.pending_reset_completions.insert(stream_id);
+    a.reconfigs.insert(7, outgoing_reset(7, stream_id));
+
+    let success: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+        reconfig_response_sequence_number: 7,
+        result: ReconfigResult::SuccessPerformed,
+    });
+    a.handle_reconfig_param(&success, &mut vec![])?;
+
+    // Before the application polls generation 7's completion, the peer opens
+    // and uses generation 8, then resets it. Its nonzero outgoing sequence
+    // means a denied reciprocal reset must quarantine the id.
+    assert!(a.get_or_create_stream(stream_id).is_some());
+    a.streams.get_mut(&stream_id).unwrap().sequence_number = 1;
+    a.unregister_stream(stream_id, true);
+    a.reconfigs.insert(8, outgoing_reset(8, stream_id));
+    a.timers
+        .start(Timer::Reconfig, Instant::now(), a.rto_mgr.get_rto());
+
+    let denied: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+        reconfig_response_sequence_number: 8,
+        result: ReconfigResult::Denied,
+    });
+    a.handle_reconfig_param(&denied, &mut vec![])?;
+
+    // Polling the stale completion must not resurrect reuse permission after
+    // generation 8 has already failed.
+    assert!(matches!(
+        a.poll(),
+        Some(Event::Stream(StreamEvent::ResetComplete { id })) if id == stream_id
+    ));
+
+    assert!(matches!(
+        a.open_stream(stream_id, PayloadProtocolIdentifier::Binary),
+        Err(Error::ErrStreamResetPending)
+    ));
+    Ok(())
+}
+
+#[test]
 fn test_create_forward_tsn_forward_one_abandoned() -> Result<()> {
     let mut a = Association {
         cumulative_tsn_ack_point: 9,

@@ -170,6 +170,13 @@ fn test_denied_reset_remains_quarantined_without_terminal_event() -> Result<()> 
         a.pending_reset_completions.contains(&stream_id),
         "a failed reset needs either a terminal event or continued quarantine"
     );
+    assert!(
+        matches!(
+            a.open_stream(stream_id, PayloadProtocolIdentifier::Binary),
+            Err(Error::ErrStreamResetPending)
+        ),
+        "the quarantine must prevent the failed stream ID from being reused"
+    );
     Ok(())
 }
 
@@ -249,6 +256,80 @@ fn test_reset_complete_preserves_generations_through_responses() -> Result<()> {
 }
 
 #[test]
+fn test_overlapping_generations_success_then_denied_reports_success() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association::default();
+
+    a.pending_reset_completions.insert(stream_id);
+    a.pending_reset_completions.insert(stream_id);
+    a.reconfigs.insert(7, outgoing_reset(7, stream_id));
+    a.reconfigs.insert(8, outgoing_reset(8, stream_id));
+
+    for (rsn, result) in [
+        (7, ReconfigResult::SuccessPerformed),
+        (8, ReconfigResult::Denied),
+    ] {
+        let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+            reconfig_response_sequence_number: rsn,
+            result,
+        });
+        a.handle_reconfig_param(&response, &mut vec![])?;
+    }
+
+    let reset_complete = core::iter::from_fn(|| a.poll())
+        .filter(|event| {
+            matches!(
+                event,
+                Event::Stream(StreamEvent::ResetComplete { id }) if *id == stream_id
+            )
+        })
+        .count();
+
+    assert_eq!(
+        reset_complete, 1,
+        "the successful generation still needs its ResetComplete"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_overlapping_generations_denied_then_success_reports_only_success() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association::default();
+
+    a.pending_reset_completions.insert(stream_id);
+    a.pending_reset_completions.insert(stream_id);
+    a.reconfigs.insert(7, outgoing_reset(7, stream_id));
+    a.reconfigs.insert(8, outgoing_reset(8, stream_id));
+
+    for (rsn, result) in [
+        (7, ReconfigResult::Denied),
+        (8, ReconfigResult::SuccessPerformed),
+    ] {
+        let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+            reconfig_response_sequence_number: rsn,
+            result,
+        });
+        a.handle_reconfig_param(&response, &mut vec![])?;
+    }
+
+    let reset_complete = core::iter::from_fn(|| a.poll())
+        .filter(|event| {
+            matches!(
+                event,
+                Event::Stream(StreamEvent::ResetComplete { id }) if *id == stream_id
+            )
+        })
+        .count();
+
+    assert_eq!(
+        reset_complete, 1,
+        "the denied generation must not inherit a later successful completion"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_outgoing_reset_implicitly_acknowledges_pending_request() -> Result<()> {
     let local_rsn = 7;
     let stream_id = 1;
@@ -276,6 +357,60 @@ fn test_outgoing_reset_implicitly_acknowledges_pending_request() -> Result<()> {
     assert!(
         a.timers.get(Timer::Reconfig).is_none(),
         "the timer must stop after the final in-flight request is acknowledged"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_outgoing_reset_does_not_ack_unsent_reciprocal() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association {
+        my_next_tsn: 1,
+        ..Default::default()
+    };
+    assert!(
+        a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
+            .is_some()
+    );
+
+    // Handling this request queues a reciprocal Outgoing Reset Request in
+    // `reply`, but it has not been transmitted and its timer is not running.
+    let request: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 7,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: a.peer_last_tsn,
+        stream_identifiers: vec![stream_id],
+    });
+    let mut reply = vec![];
+    a.handle_reconfig_param(&request, &mut reply)?;
+
+    let reciprocal_rsn = *a.reconfigs.keys().next().unwrap();
+    assert!(!reply.is_empty());
+    assert!(a.timers.get(Timer::Reconfig).is_none());
+
+    // RFC 6525 section 5.2.2 E1 only acknowledges a request for which the
+    // Re-configuration Timer is running. A peer must not be able to pre-ack
+    // the queued reciprocal before the application polls it for transmission.
+    let premature_ack: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 8,
+        reconfig_response_sequence_number: reciprocal_rsn,
+        sender_last_tsn: a.peer_last_tsn,
+        stream_identifiers: vec![],
+    });
+    a.handle_reconfig_param(&premature_ack, &mut vec![])?;
+
+    let reset_complete = core::iter::from_fn(|| a.poll())
+        .filter(|event| {
+            matches!(
+                event,
+                Event::Stream(StreamEvent::ResetComplete { id }) if *id == stream_id
+            )
+        })
+        .count();
+    assert_eq!(
+        (a.reconfigs.contains_key(&reciprocal_rsn), reset_complete),
+        (true, 0),
+        "an unsent reciprocal must remain pending and cannot complete a reset"
     );
     Ok(())
 }

@@ -9,7 +9,7 @@ use crate::config::generate_snap_token;
 use crate::error::{Error, Result};
 
 use crate::association::state::{AckMode, AssociationState};
-use crate::association::stream::{ReliabilityType, Stream};
+use crate::association::stream::{ReliabilityType, Stream, StreamEvent, StreamResetError};
 use crate::chunk::chunk_abort::ChunkAbort;
 use crate::chunk::chunk_cookie_echo::ChunkCookieEcho;
 use crate::chunk::chunk_error::ChunkError;
@@ -2945,6 +2945,17 @@ fn test_assoc_reconfig_failure_keeps_stream_quarantined() -> Result<()> {
         pair.drive_client();
         pair.server.inbound.clear();
     }
+
+    assert!(
+        core::iter::from_fn(|| pair.client_conn_mut(client_ch).poll()).any(|event| matches!(
+            event,
+            Event::Stream(StreamEvent::ResetFailed {
+                id,
+                reason: StreamResetError::Failed,
+            }) if id == si
+        )),
+        "reset retransmission exhaustion should emit a terminal failure event"
+    );
 
     // The in-flight request is abandoned, but without a terminal success the
     // stream ID remains quarantined and must not be reused.

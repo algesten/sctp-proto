@@ -15,6 +15,16 @@ use log::{debug, error, trace};
 /// Identifier for a stream within a particular association
 pub type StreamId = u16;
 
+/// Why a stream reset did not complete successfully.
+#[non_exhaustive]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum StreamResetError {
+    /// The peer explicitly denied the reset request.
+    Denied,
+    /// The reset failed because of a protocol error or exhausted retransmissions.
+    Failed,
+}
+
 /// Application events about streams
 #[non_exhaustive]
 #[derive(Debug, PartialEq, Eq)]
@@ -42,18 +52,30 @@ pub enum StreamEvent {
     ///
     /// No more data can be read from or written to it.
     ///
-    /// Once this fires, [`StreamEvent::ResetComplete`] for the same id is
-    /// guaranteed to eventually follow, unless the association closes first.
+    /// Once this fires, either [`StreamEvent::ResetComplete`] or
+    /// [`StreamEvent::ResetFailed`] for the same id is guaranteed to eventually
+    /// follow, unless the association closes first.
     Finished {
         /// Which stream has been finished
         id: StreamId,
     },
-    /// The reset handshake involving this stream id has fully
-    /// completed and the id can be reused and
-    /// `[Association::open_stream]` stop failing.
+    /// A reset handshake involving this stream id completed successfully.
+    ///
+    /// The id can be reused unless a newer reset for the same id has since
+    /// started or failed.
     ResetComplete {
-        /// Which stream id has become reusable
+        /// Which stream id completed its reset.
         id: StreamId,
+    },
+    /// A reset handshake involving this stream id did not complete.
+    ///
+    /// The id remains unavailable for reuse until a later reset succeeds or
+    /// the association closes.
+    ResetFailed {
+        /// Which stream id failed to reset.
+        id: StreamId,
+        /// Why the reset did not complete.
+        reason: StreamResetError,
     },
     /// The peer asked us to stop sending on an outgoing stream
     Stopped {
@@ -234,6 +256,14 @@ impl<'a> Stream<'a> {
     }
 
     pub fn is_writable(&self) -> bool {
+        // RFC 6525 section 5.1.2 A1 forbids assigning new SSNs while an
+        // Outgoing SSN Reset Request for this stream is pending.
+        if self
+            .association
+            .stream_reset_in_progress(self.stream_identifier)
+        {
+            return false;
+        }
         if let Some(s) = self.association.streams.get(&self.stream_identifier) {
             s.state == RecvSendState::Writable || s.state == RecvSendState::ReadWritable
         } else {
@@ -245,7 +275,8 @@ impl<'a> Stream<'a> {
     /// Future calls to read are not permitted after calling stop.
     ///    
     /// NOTE: a stream closed without a queued reset never produces
-    /// `StreamEvent::Finished` / `StreamEvent::ResetComplete`.
+    /// `StreamEvent::Finished` followed by `StreamEvent::ResetComplete` or
+    /// `StreamEvent::ResetFailed`.
     pub fn stop(&mut self) -> Result<()> {
         let reset = self
             .association

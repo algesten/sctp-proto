@@ -65,7 +65,9 @@ pub use crate::association::Association;
 pub use crate::association::AssociationError;
 pub use crate::association::Event;
 pub use crate::association::stats::AssociationStats;
-pub use crate::association::stream::{ReliabilityType, Stream, StreamEvent, StreamId, StreamState};
+pub use crate::association::stream::{
+    ReliabilityType, Stream, StreamEvent, StreamId, StreamResetError, StreamState,
+};
 
 pub(crate) mod chunk;
 pub use crate::chunk::ErrorCauseCode;

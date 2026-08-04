@@ -1,6 +1,6 @@
 # Unreleased
 
-  * Fix reset completion bookkeeping across failed and overlapping resets #54
+  * Fix stream reset completion, failure reporting, and request serialization #54
 
 # 0.10.2
 

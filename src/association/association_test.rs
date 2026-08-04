@@ -62,6 +62,18 @@ fn outgoing_reset(rsn: u32, stream_id: StreamId) -> ChunkReconfig {
     }
 }
 
+fn insert_active_reset(a: &mut Association, rsn: u32, stream_id: StreamId) {
+    a.reconfigs.insert(rsn, outgoing_reset(rsn, stream_id));
+    a.active_reconfig = Some(rsn);
+}
+
+fn insert_queued_reset(a: &mut Association, rsn: u32, stream_id: StreamId) {
+    let reset = outgoing_reset(rsn, stream_id);
+    a.reconfigs.insert(rsn, reset.clone());
+    let packet = a.create_packet(vec![Box::new(reset)]);
+    a.control_queue.push_back(packet);
+}
+
 #[test]
 fn test_reconfig_in_progress_timeout_does_not_consume_retry_budget() -> Result<()> {
     let now = Instant::now();
@@ -72,7 +84,7 @@ fn test_reconfig_in_progress_timeout_does_not_consume_retry_budget() -> Result<(
             .with_rto_initial_ms(1),
     );
 
-    a.reconfigs.insert(rsn, outgoing_reset(rsn, 1));
+    insert_active_reset(&mut a, rsn, 1);
     a.timers.start(Timer::Reconfig, now, a.rto_mgr.get_rto());
 
     let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
@@ -111,7 +123,7 @@ fn test_reset_complete_only_for_successful_reconfig_response() -> Result<()> {
     ] {
         let mut a = Association::default();
         a.pending_reset_completions.insert(stream_id);
-        a.reconfigs.insert(rsn, outgoing_reset(rsn, stream_id));
+        insert_active_reset(&mut a, rsn, stream_id);
 
         let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
             reconfig_response_sequence_number: rsn,
@@ -134,28 +146,31 @@ fn test_reset_complete_only_for_successful_reconfig_response() -> Result<()> {
 }
 
 #[test]
-fn test_reconfig_retransmission_failure_does_not_complete_reset() {
+fn test_reconfig_retransmission_failure_is_terminal() {
     let rsn = 7;
     let stream_id = 1;
     let mut a = Association::default();
     a.pending_reset_completions.insert(stream_id);
-    a.reconfigs.insert(rsn, outgoing_reset(rsn, stream_id));
+    insert_active_reset(&mut a, rsn, stream_id);
 
     a.on_retransmission_failure(Timer::Reconfig);
 
-    assert!(!matches!(
+    assert!(matches!(
         a.poll(),
-        Some(Event::Stream(StreamEvent::ResetComplete { id })) if id == stream_id
+        Some(Event::Stream(StreamEvent::ResetFailed {
+            id,
+            reason: StreamResetError::Failed,
+        })) if id == stream_id
     ));
 }
 
 #[test]
-fn test_denied_reset_remains_quarantined_without_terminal_event() -> Result<()> {
+fn test_denied_reset_emits_terminal_event_and_remains_quarantined() -> Result<()> {
     let rsn = 7;
     let stream_id = 1;
     let mut a = Association::default();
     a.pending_reset_completions.insert(stream_id);
-    a.reconfigs.insert(rsn, outgoing_reset(rsn, stream_id));
+    insert_active_reset(&mut a, rsn, stream_id);
 
     let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
         reconfig_response_sequence_number: rsn,
@@ -163,13 +178,14 @@ fn test_denied_reset_remains_quarantined_without_terminal_event() -> Result<()> 
     });
     a.handle_reconfig_param(&response, &mut vec![])?;
 
-    // Until the public API has a ResetFailed/ResetDenied event, forgetting
-    // this generation would leave the caller unable to distinguish an unsafe
-    // ID from one whose reset completed.
-    assert!(
-        a.pending_reset_completions.contains(&stream_id),
-        "a failed reset needs either a terminal event or continued quarantine"
-    );
+    assert!(matches!(
+        a.poll(),
+        Some(Event::Stream(StreamEvent::ResetFailed {
+            id,
+            reason: StreamResetError::Denied,
+        })) if id == stream_id
+    ));
+    assert!(!a.pending_reset_completions.contains(&stream_id));
     assert!(
         matches!(
             a.open_stream(stream_id, PayloadProtocolIdentifier::Binary),
@@ -232,6 +248,7 @@ fn test_reset_complete_preserves_generations_through_responses() -> Result<()> {
         .insert(second_rsn, outgoing_reset(second_rsn, stream_id));
 
     for rsn in [first_rsn, second_rsn] {
+        a.active_reconfig = Some(rsn);
         let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
             reconfig_response_sequence_number: rsn,
             result: ReconfigResult::SuccessPerformed,
@@ -269,6 +286,7 @@ fn test_overlapping_generations_success_then_denied_reports_success() -> Result<
         (7, ReconfigResult::SuccessPerformed),
         (8, ReconfigResult::Denied),
     ] {
+        a.active_reconfig = Some(rsn);
         let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
             reconfig_response_sequence_number: rsn,
             result,
@@ -306,6 +324,7 @@ fn test_overlapping_generations_denied_then_success_reports_only_success() -> Re
         (7, ReconfigResult::Denied),
         (8, ReconfigResult::SuccessPerformed),
     ] {
+        a.active_reconfig = Some(rsn);
         let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
             reconfig_response_sequence_number: rsn,
             result,
@@ -335,8 +354,7 @@ fn test_outgoing_reset_implicitly_acknowledges_pending_request() -> Result<()> {
     let stream_id = 1;
     let mut a = Association::default();
 
-    a.reconfigs
-        .insert(local_rsn, outgoing_reset(local_rsn, stream_id));
+    insert_active_reset(&mut a, local_rsn, stream_id);
     a.timers
         .start(Timer::Reconfig, Instant::now(), a.rto_mgr.get_rto());
 
@@ -416,7 +434,7 @@ fn test_outgoing_reset_does_not_ack_unsent_reciprocal() -> Result<()> {
 }
 
 #[test]
-fn test_reset_complete_only_fires_when_stream_id_is_reusable() -> Result<()> {
+fn test_reset_complete_does_not_override_newer_failure() -> Result<()> {
     let stream_id = 1;
     let mut a = Association::default();
 
@@ -429,6 +447,7 @@ fn test_reset_complete_only_fires_when_stream_id_is_reusable() -> Result<()> {
         (7, ReconfigResult::SuccessPerformed),
         (8, ReconfigResult::Denied),
     ] {
+        a.active_reconfig = Some(rsn);
         let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
             reconfig_response_sequence_number: rsn,
             result,
@@ -440,11 +459,17 @@ fn test_reset_complete_only_fires_when_stream_id_is_reusable() -> Result<()> {
         a.poll(),
         Some(Event::Stream(StreamEvent::ResetComplete { id })) if id == stream_id
     ));
-    assert!(
-        a.open_stream(stream_id, PayloadProtocolIdentifier::Binary)
-            .is_ok(),
-        "ResetComplete promises that this stream ID has become reusable"
-    );
+    assert!(matches!(
+        a.poll(),
+        Some(Event::Stream(StreamEvent::ResetFailed {
+            id,
+            reason: StreamResetError::Denied,
+        })) if id == stream_id
+    ));
+    assert!(matches!(
+        a.open_stream(stream_id, PayloadProtocolIdentifier::Binary),
+        Err(Error::ErrStreamResetPending)
+    ));
     Ok(())
 }
 
@@ -510,7 +535,7 @@ fn test_outgoing_reset_does_not_ack_unsent_reciprocal_with_unrelated_timer() -> 
             .is_some()
     );
 
-    a.reconfigs.insert(sent_rsn, outgoing_reset(sent_rsn, 2));
+    insert_active_reset(&mut a, sent_rsn, 2);
     a.timers
         .start(Timer::Reconfig, Instant::now(), a.rto_mgr.get_rto());
 
@@ -568,6 +593,7 @@ fn test_failed_generation_stays_quarantined_after_other_success() -> Result<()> 
         (7, ReconfigResult::SuccessPerformed),
         (8, ReconfigResult::Denied),
     ] {
+        a.active_reconfig = Some(rsn);
         let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
             reconfig_response_sequence_number: rsn,
             result,
@@ -596,7 +622,7 @@ fn test_second_reconfig_request_stays_buffered_while_timer_runs() -> Result<()> 
             .is_some()
     );
 
-    a.reconfigs.insert(sent_rsn, outgoing_reset(sent_rsn, 2));
+    insert_active_reset(&mut a, sent_rsn, 2);
     a.timers
         .start(Timer::Reconfig, Instant::now(), a.rto_mgr.get_rto());
 
@@ -613,14 +639,25 @@ fn test_second_reconfig_request_stays_buffered_while_timer_runs() -> Result<()> 
     a.handle_reconfig_param(&request, &mut reply)?;
 
     let reciprocal_rsn = *a.reconfigs.keys().find(|&&rsn| rsn != sent_rsn).unwrap();
-    assert!(a.unsent_reconfigs.contains(&reciprocal_rsn));
     a.control_queue.extend(reply);
 
     assert!(a.poll_transmit(Instant::now()).is_some());
-    assert!(
-        a.unsent_reconfigs.contains(&reciprocal_rsn),
+    assert_eq!(
+        a.active_reconfig,
+        Some(sent_rsn),
         "a second request must remain buffered while the first request's timer runs"
     );
+    assert!(a.reconfigs.contains_key(&reciprocal_rsn));
+    assert_eq!(a.control_queue.len(), 1);
+
+    let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+        reconfig_response_sequence_number: sent_rsn,
+        result: ReconfigResult::SuccessPerformed,
+    });
+    a.handle_reconfig_param(&response, &mut vec![])?;
+    assert!(a.poll_transmit(Instant::now()).is_some());
+    assert_eq!(a.active_reconfig, Some(reciprocal_rsn));
+    assert!(a.control_queue.is_empty());
     Ok(())
 }
 
@@ -633,12 +670,29 @@ fn test_peer_recreated_quarantined_stream_is_not_writable() -> Result<()> {
     // outgoing reset is acknowledged. Reading that generation is safe, but
     // sending with a freshly initialized SSN is not yet safe.
     a.pending_reset_completions.insert(stream_id);
-    a.reconfigs.insert(7, outgoing_reset(7, stream_id));
+    insert_active_reset(&mut a, 7, stream_id);
 
     assert!(a.get_or_create_stream(stream_id).is_some());
     assert!(
         !a.stream(stream_id)?.is_writable(),
         "a pending reciprocal reset must quarantine the outgoing direction"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_pending_reset_blocks_existing_stream_writes() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association::default();
+    assert!(
+        a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
+            .is_some()
+    );
+    insert_active_reset(&mut a, 7, stream_id);
+
+    assert!(
+        !a.stream(stream_id)?.is_writable(),
+        "new SSNs must not be assigned while an outgoing reset is pending"
     );
     Ok(())
 }
@@ -651,20 +705,23 @@ fn test_only_one_buffered_reconfig_is_sent_when_timer_is_idle() {
     };
 
     for (rsn, stream_id) in [(7, 1), (8, 2)] {
-        let c = outgoing_reset(rsn, stream_id);
-        a.reconfigs.insert(rsn, c.clone());
-        a.unsent_reconfigs.insert(rsn);
-        let packet = a.create_packet(vec![Box::new(c)]);
-        a.control_queue.push_back(packet);
+        insert_queued_reset(&mut a, rsn, stream_id);
     }
     assert!(a.timers.get(Timer::Reconfig).is_none());
 
     assert!(a.poll_transmit(Instant::now()).is_some());
-    assert_eq!(
-        a.unsent_reconfigs.len(),
-        1,
-        "RFC 6525 permits only one reconfiguration request in flight"
-    );
+    assert_eq!(a.active_reconfig, Some(7));
+    assert_eq!(a.control_queue.len(), 1);
+    assert!(a.reconfigs.contains_key(&8));
+
+    let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+        reconfig_response_sequence_number: 7,
+        result: ReconfigResult::SuccessPerformed,
+    });
+    a.handle_reconfig_param(&response, &mut vec![]).unwrap();
+    assert!(a.poll_transmit(Instant::now()).is_some());
+    assert_eq!(a.active_reconfig, Some(8));
+    assert!(a.control_queue.is_empty());
 }
 
 #[test]
@@ -674,12 +731,8 @@ fn test_in_progress_keeps_later_request_buffered() -> Result<()> {
         ..Default::default()
     };
 
-    a.reconfigs.insert(7, outgoing_reset(7, 1));
-    let buffered = outgoing_reset(8, 2);
-    a.reconfigs.insert(8, buffered.clone());
-    a.unsent_reconfigs.insert(8);
-    let packet = a.create_packet(vec![Box::new(buffered)]);
-    a.control_queue.push_back(packet);
+    insert_active_reset(&mut a, 7, 1);
+    insert_queued_reset(&mut a, 8, 2);
     a.timers
         .start(Timer::Reconfig, Instant::now(), a.rto_mgr.get_rto());
 
@@ -691,10 +744,8 @@ fn test_in_progress_keeps_later_request_buffered() -> Result<()> {
     assert!(a.reconfigs.contains_key(&7));
 
     let _ = a.poll_transmit(Instant::now());
-    assert!(
-        a.unsent_reconfigs.contains(&8),
-        "InProgress leaves the current request in flight, so the next must stay buffered"
-    );
+    assert_eq!(a.active_reconfig, Some(7));
+    assert_eq!(a.control_queue.len(), 1);
     Ok(())
 }
 
@@ -706,7 +757,7 @@ fn test_local_reset_stays_queued_while_reconfig_timer_runs() -> Result<()> {
         ..Default::default()
     };
 
-    a.reconfigs.insert(7, outgoing_reset(7, 1));
+    insert_active_reset(&mut a, 7, 1);
     a.timers
         .start(Timer::Reconfig, Instant::now(), a.rto_mgr.get_rto());
     a.send_reset_request(2)?;
@@ -717,6 +768,48 @@ fn test_local_reset_stays_queued_while_reconfig_timer_runs() -> Result<()> {
         1,
         "a locally initiated reset must remain queued while another request is in flight"
     );
+    assert_eq!(
+        a.pending_reset_streams.iter().copied().collect::<Vec<_>>(),
+        [2]
+    );
+
+    let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+        reconfig_response_sequence_number: 7,
+        result: ReconfigResult::SuccessPerformed,
+    });
+    a.handle_reconfig_param(&response, &mut vec![])?;
+    assert!(a.poll_transmit(Instant::now()).is_some());
+    assert_ne!(a.active_reconfig, Some(7));
+    assert!(a.active_reconfig.is_some());
+    assert!(a.pending_reset_streams.is_empty());
+    Ok(())
+}
+
+#[test]
+fn test_local_reset_does_not_overtake_pending_data() -> Result<()> {
+    let mut a = Association {
+        state: AssociationState::Established,
+        my_next_tsn: 1,
+        ..Default::default()
+    };
+    a.inflight_queue.push_no_check(ChunkPayloadData {
+        tsn: 1,
+        user_data: Bytes::from_static(b"inflight"),
+        ..Default::default()
+    });
+    a.pending_queue.push(ChunkPayloadData {
+        stream_identifier: 1,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"pending"),
+        ..Default::default()
+    });
+    a.send_reset_request(1)?;
+
+    let _ = a.poll_transmit(Instant::now());
+    assert!(a.active_reconfig.is_none());
+    assert!(a.reconfigs.is_empty());
+    assert_eq!(a.pending_reset_streams.len(), 1);
     Ok(())
 }
 
@@ -727,13 +820,8 @@ fn test_retransmission_does_not_send_buffered_reconfigs() {
         ..Default::default()
     };
 
-    let active = outgoing_reset(7, 1);
-    let buffered = outgoing_reset(8, 2);
-    a.reconfigs.insert(7, active);
-    a.reconfigs.insert(8, buffered.clone());
-    a.unsent_reconfigs.insert(8);
-    a.control_queue
-        .push_back(a.create_packet(vec![Box::new(buffered)]));
+    insert_active_reset(&mut a, 7, 1);
+    insert_queued_reset(&mut a, 8, 2);
     a.timers
         .start(Timer::Reconfig, Instant::now(), a.rto_mgr.get_rto());
     a.will_retransmit_reconfig = true;
@@ -753,9 +841,8 @@ fn test_older_completion_does_not_make_newer_generation_writable() -> Result<()>
 
     a.pending_reset_completions.insert(stream_id);
     a.pending_reset_completions.insert(stream_id);
-    a.reconfigs.insert(7, outgoing_reset(7, stream_id));
-    a.reconfigs.insert(8, outgoing_reset(8, stream_id));
-    a.unsent_reconfigs.insert(8);
+    insert_active_reset(&mut a, 7, stream_id);
+    insert_queued_reset(&mut a, 8, stream_id);
     a.timers
         .start(Timer::Reconfig, Instant::now(), a.rto_mgr.get_rto());
 
@@ -782,7 +869,7 @@ fn test_stale_completion_does_not_override_newer_denial() -> Result<()> {
     let mut a = Association::default();
 
     a.pending_reset_completions.insert(stream_id);
-    a.reconfigs.insert(7, outgoing_reset(7, stream_id));
+    insert_active_reset(&mut a, 7, stream_id);
 
     let success: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
         reconfig_response_sequence_number: 7,
@@ -796,7 +883,7 @@ fn test_stale_completion_does_not_override_newer_denial() -> Result<()> {
     assert!(a.get_or_create_stream(stream_id).is_some());
     a.streams.get_mut(&stream_id).unwrap().sequence_number = 1;
     a.unregister_stream(stream_id, true);
-    a.reconfigs.insert(8, outgoing_reset(8, stream_id));
+    insert_active_reset(&mut a, 8, stream_id);
     a.timers
         .start(Timer::Reconfig, Instant::now(), a.rto_mgr.get_rto());
 

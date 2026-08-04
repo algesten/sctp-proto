@@ -850,7 +850,9 @@ impl Association {
             return Err(Error::ErrStreamAlreadyExist);
         }
 
-        if self.has_pending_reset_for_stream(stream_identifier) {
+        if self.pending_reset_completions.contains(&stream_identifier)
+            || self.has_pending_reset_for_stream(stream_identifier)
+        {
             return Err(Error::ErrStreamResetPending);
         }
 
@@ -930,16 +932,13 @@ impl Association {
         self.set_max_send_message_size(value)
     }
 
-    /// Push [`StreamEvent::ResetComplete`] for each candidate id whose reset
-    /// handshake has completed, `Finished` must have been already fired for it
-    /// and no pending outgoing RE-CONFIG names it.
+    /// Push one [`StreamEvent::ResetComplete`] for each candidate id whose reset
+    /// handshake has completed and `Finished` has already been fired for it.
     fn emit_reset_complete(&mut self, ids: impl IntoIterator<Item = StreamId>) {
         for id in ids {
-            // An id with a reset still pending must stay armed,
-            // so only disarm once nothing is pending.
-            while self.pending_reset_completions.contains(&id)
-                && !self.has_pending_reset_for_stream(id)
-            {
+            // Each acknowledged request completes exactly one stream generation.
+            // Other generations of the same id may still be pending or quarantined.
+            if self.pending_reset_completions.contains(&id) {
                 self.pending_reset_completions.take_one(id);
                 self.events
                     .push_back(Event::Stream(StreamEvent::ResetComplete { id }));
@@ -1863,16 +1862,18 @@ impl Association {
         if let Some(p) = raw.as_any().downcast_ref::<ParamOutgoingResetRequest>() {
             // RFC 6525 section 5.2.2 E1: the response sequence number in an
             // Outgoing Reset Request implicitly acknowledges our request.
-            if let Some(c) = self.reconfigs.remove(&p.reconfig_response_sequence_number) {
-                let ids = c
-                    .param_a
-                    .as_ref()
-                    .and_then(|pa| pa.as_any().downcast_ref::<ParamOutgoingResetRequest>())
-                    .map(|pa| pa.stream_identifiers.clone())
-                    .unwrap_or_default();
-                self.emit_reset_complete(ids);
-                if self.reconfigs.is_empty() {
-                    self.timers.stop(Timer::Reconfig);
+            if self.timers.get(Timer::Reconfig).is_some() {
+                if let Some(c) = self.reconfigs.remove(&p.reconfig_response_sequence_number) {
+                    let ids = c
+                        .param_a
+                        .as_ref()
+                        .and_then(|pa| pa.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+                        .map(|pa| pa.stream_identifiers.clone())
+                        .unwrap_or_default();
+                    self.emit_reset_complete(ids);
+                    if self.reconfigs.is_empty() {
+                        self.timers.stop(Timer::Reconfig);
+                    }
                 }
             }
 
@@ -3257,23 +3258,10 @@ impl Association {
                     self.side,
                     self.reconfigs.len()
                 );
-                // Abandonment ends the handshake without confirmation from the peer,
-                // ids must not be reported as reusable, consume their armed completions
-                // without emitting ResetComplete.
-                let ids: Vec<StreamId> = self
-                    .reconfigs
-                    .values()
-                    .filter_map(|c| {
-                        c.param_a
-                            .as_ref()
-                            .and_then(|pa| pa.as_any().downcast_ref::<ParamOutgoingResetRequest>())
-                    })
-                    .flat_map(|pa| pa.stream_identifiers.iter().copied())
-                    .collect();
+                // Abandonment ends the handshake without confirmation from the peer.
+                // Keep the armed completions as quarantine markers so the ids cannot
+                // be reused without a terminal success event.
                 self.reconfigs.clear();
-                for id in ids {
-                    self.pending_reset_completions.take_one(id);
-                }
             }
 
             _ => {}

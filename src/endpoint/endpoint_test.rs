@@ -2905,7 +2905,7 @@ fn test_assoc_open_stream_rejects_pending_reset_id() -> Result<()> {
 }
 
 #[test]
-fn test_assoc_reconfig_failure_clears_pending() -> Result<()> {
+fn test_assoc_reconfig_failure_keeps_stream_quarantined() -> Result<()> {
     let si: u16 = 1;
 
     let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
@@ -2946,15 +2946,13 @@ fn test_assoc_reconfig_failure_clears_pending() -> Result<()> {
         pair.server.inbound.clear();
     }
 
-    // After retransmission failure, reconfigs should be cleared and the stream
-    // ID should be available for reuse.
-    let _ = pair
-        .client_conn_mut(client_ch)
-        .open_stream(si, PayloadProtocolIdentifier::Binary)?;
-    assert!(
-        pair.client_stream(client_ch, si).is_ok(),
-        "stream 1 should be available after reconfig retransmission failure"
-    );
+    // The in-flight request is abandoned, but without a terminal success the
+    // stream ID remains quarantined and must not be reused.
+    assert!(matches!(
+        pair.client_conn_mut(client_ch)
+            .open_stream(si, PayloadProtocolIdentifier::Binary),
+        Err(Error::ErrStreamResetPending)
+    ));
 
     Ok(())
 }

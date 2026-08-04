@@ -52,7 +52,7 @@ use core::str::FromStr;
 use core::time::Duration;
 use log::{debug, error, trace, warn};
 use rand::random;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 use std::time::Instant;
 use thiserror::Error;
@@ -197,11 +197,15 @@ pub struct Association {
     // Reconfig
     my_next_rsn: u32,
     reconfigs: FxHashMap<u32, ChunkReconfig>,
+    /// Locally queued reciprocal requests that have not reached `poll_transmit`.
+    unsent_reconfigs: FxHashSet<u32>,
     reconfig_requests: FxHashMap<u32, ParamOutgoingResetRequest>,
     max_completed_reconfig_rsn: Option<u32>,
     /// Stream ids for which `StreamEvent::Finished` has fired but whose
     /// `StreamEvent::ResetComplete` is still awaited.
     pending_reset_completions: PendingResetCompletions,
+    /// Stream ids for which a successful reset has granted reuse permission.
+    reset_complete_streams: FxHashSet<StreamId>,
 
     // Non-RFC internal data
     remote_addr: SocketAddr,
@@ -289,9 +293,11 @@ impl Default for Association {
             // Reconfig
             my_next_rsn: 0,
             reconfigs: FxHashMap::default(),
+            unsent_reconfigs: FxHashSet::default(),
             reconfig_requests: FxHashMap::default(),
             max_completed_reconfig_rsn: None,
             pending_reset_completions: PendingResetCompletions::default(),
+            reset_complete_streams: FxHashSet::default(),
 
             // Non-RFC internal data
             remote_addr: SocketAddr::from_str("0.0.0.0:0").unwrap(),
@@ -804,6 +810,8 @@ impl Association {
 
             // AssociationLost stops any pending  ResetComplete.
             self.pending_reset_completions.clear();
+            self.reset_complete_streams.clear();
+            self.unsent_reconfigs.clear();
 
             self.events.push_back(Event::AssociationLost {
                 reason: AssociationError::AssociationClosed,
@@ -850,12 +858,14 @@ impl Association {
             return Err(Error::ErrStreamAlreadyExist);
         }
 
-        if self.pending_reset_completions.contains(&stream_identifier)
+        if (self.pending_reset_completions.contains(&stream_identifier)
+            && !self.reset_complete_streams.contains(&stream_identifier))
             || self.has_pending_reset_for_stream(stream_identifier)
         {
             return Err(Error::ErrStreamResetPending);
         }
 
+        self.reset_complete_streams.remove(&stream_identifier);
         if let Some(s) = self.create_stream(stream_identifier, false, default_payload_type) {
             Ok(s)
         } else {
@@ -940,6 +950,7 @@ impl Association {
             // Other generations of the same id may still be pending or quarantined.
             if self.pending_reset_completions.contains(&id) {
                 self.pending_reset_completions.take_one(id);
+                self.reset_complete_streams.insert(id);
                 self.events
                     .push_back(Event::Stream(StreamEvent::ResetComplete { id }));
             }
@@ -964,6 +975,7 @@ impl Association {
             debug!("[{}] unregister_stream {}", self.side, stream_identifier);
             s.state = RecvSendState::Closed;
             if emit_stream_finished {
+                self.reset_complete_streams.remove(&stream_identifier);
                 self.events.push_back(Event::Stream(StreamEvent::Finished {
                     id: stream_identifier,
                 }));
@@ -1862,7 +1874,11 @@ impl Association {
         if let Some(p) = raw.as_any().downcast_ref::<ParamOutgoingResetRequest>() {
             // RFC 6525 section 5.2.2 E1: the response sequence number in an
             // Outgoing Reset Request implicitly acknowledges our request.
-            if self.timers.get(Timer::Reconfig).is_some() {
+            if self.timers.get(Timer::Reconfig).is_some()
+                && !self
+                    .unsent_reconfigs
+                    .contains(&p.reconfig_response_sequence_number)
+            {
                 if let Some(c) = self.reconfigs.remove(&p.reconfig_response_sequence_number) {
                     let ids = c
                         .param_a
@@ -1908,6 +1924,15 @@ impl Association {
             }
             Ok(())
         } else if let Some(p) = raw.as_any().downcast_ref::<ParamReconfigResponse>() {
+            // RFC 6525 section 5.2.1 H1: ignore responses to requests that have
+            // not yet been transmitted (and therefore have no running timer).
+            if self
+                .unsent_reconfigs
+                .contains(&p.reconfig_response_sequence_number)
+            {
+                return Ok(());
+            }
+
             // In progress result means the peer has deferred the request,
             // not answered it. The request stays outstanding and its timer restarts
             // without counting toward the retransmission limit.
@@ -2299,6 +2324,7 @@ impl Association {
             };
 
             self.reconfigs.insert(rsn, c.clone()); // store in the map for retransmission
+            self.unsent_reconfigs.insert(rsn);
 
             let p = self.create_packet(vec![Box::new(c)]);
             reply.push(p);
@@ -2409,6 +2435,9 @@ impl Association {
                     continue;
                 }
             }
+            // Reciprocal RE-CONFIG requests are queued as control packets. Once
+            // the queue is drained by poll_transmit, those RSNs are acknowledgeable.
+            self.unsent_reconfigs.clear();
         }
 
         let state = self.state();
@@ -3262,6 +3291,7 @@ impl Association {
                 // Keep the armed completions as quarantine markers so the ids cannot
                 // be reused without a terminal success event.
                 self.reconfigs.clear();
+                self.unsent_reconfigs.clear();
             }
 
             _ => {}

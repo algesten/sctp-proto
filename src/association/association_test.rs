@@ -553,6 +553,97 @@ fn test_outgoing_reset_does_not_ack_unsent_reciprocal_with_unrelated_timer() -> 
 }
 
 #[test]
+fn test_failed_generation_stays_quarantined_after_other_success() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association::default();
+
+    a.pending_reset_completions.insert(stream_id);
+    a.pending_reset_completions.insert(stream_id);
+    a.reconfigs.insert(7, outgoing_reset(7, stream_id));
+    a.reconfigs.insert(8, outgoing_reset(8, stream_id));
+
+    // The older generation completes, but the newer generation is denied.
+    // A success for the former cannot make the latter safe to reuse.
+    for (rsn, result) in [
+        (7, ReconfigResult::SuccessPerformed),
+        (8, ReconfigResult::Denied),
+    ] {
+        let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+            reconfig_response_sequence_number: rsn,
+            result,
+        });
+        a.handle_reconfig_param(&response, &mut vec![])?;
+    }
+
+    assert!(matches!(
+        a.open_stream(stream_id, PayloadProtocolIdentifier::Binary),
+        Err(Error::ErrStreamResetPending)
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_second_reconfig_request_stays_buffered_while_timer_runs() -> Result<()> {
+    let stream_id = 1;
+    let sent_rsn = 99;
+    let mut a = Association {
+        state: AssociationState::Established,
+        my_next_tsn: 1,
+        ..Default::default()
+    };
+    assert!(
+        a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
+            .is_some()
+    );
+
+    a.reconfigs.insert(sent_rsn, outgoing_reset(sent_rsn, 2));
+    a.timers
+        .start(Timer::Reconfig, Instant::now(), a.rto_mgr.get_rto());
+
+    // Processing the peer's request creates a reciprocal request while another
+    // local request is already in flight. RFC 6525 section 5.1.1 requires the
+    // reciprocal request to remain buffered until the running timer stops.
+    let request: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 7,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: a.peer_last_tsn,
+        stream_identifiers: vec![stream_id],
+    });
+    let mut reply = vec![];
+    a.handle_reconfig_param(&request, &mut reply)?;
+
+    let reciprocal_rsn = *a.reconfigs.keys().find(|&&rsn| rsn != sent_rsn).unwrap();
+    assert!(a.unsent_reconfigs.contains(&reciprocal_rsn));
+    a.control_queue.extend(reply);
+
+    assert!(a.poll_transmit(Instant::now()).is_some());
+    assert!(
+        a.unsent_reconfigs.contains(&reciprocal_rsn),
+        "a second request must remain buffered while the first request's timer runs"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_peer_recreated_quarantined_stream_is_not_writable() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association::default();
+
+    // The peer may start its new incoming generation before our reciprocal
+    // outgoing reset is acknowledged. Reading that generation is safe, but
+    // sending with a freshly initialized SSN is not yet safe.
+    a.pending_reset_completions.insert(stream_id);
+    a.reconfigs.insert(7, outgoing_reset(7, stream_id));
+
+    assert!(a.get_or_create_stream(stream_id).is_some());
+    assert!(
+        !a.stream(stream_id)?.is_writable(),
+        "a pending reciprocal reset must quarantine the outgoing direction"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_create_forward_tsn_forward_one_abandoned() -> Result<()> {
     let mut a = Association {
         cumulative_tsn_ack_point: 9,

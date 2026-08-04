@@ -565,6 +565,10 @@ impl Association {
     #[must_use]
     pub fn poll(&mut self) -> Option<Event> {
         if let Some(x) = self.events.pop_front() {
+            if let Event::Stream(StreamEvent::ResetComplete { id }) = x {
+                self.reset_complete_streams.insert(id);
+                return Some(Event::Stream(StreamEvent::ResetComplete { id }));
+            }
             return Some(x);
         }
 
@@ -950,7 +954,11 @@ impl Association {
             // Other generations of the same id may still be pending or quarantined.
             if self.pending_reset_completions.contains(&id) {
                 self.pending_reset_completions.take_one(id);
-                self.reset_complete_streams.insert(id);
+                if let Some(stream) = self.streams.get_mut(&id) {
+                    if stream.state == RecvSendState::Readable {
+                        stream.state = RecvSendState::ReadWritable;
+                    }
+                }
                 self.events
                     .push_back(Event::Stream(StreamEvent::ResetComplete { id }));
             }
@@ -1887,8 +1895,13 @@ impl Association {
                         .map(|pa| pa.stream_identifiers.clone())
                         .unwrap_or_default();
                     self.emit_reset_complete(ids);
-                    if self.reconfigs.is_empty() {
+                    if self
+                        .reconfigs
+                        .keys()
+                        .all(|rsn| self.unsent_reconfigs.contains(rsn))
+                    {
                         self.timers.stop(Timer::Reconfig);
+                        self.awake_write_loop();
                     }
                 }
             }
@@ -1964,8 +1977,13 @@ impl Association {
                     _ => {}
                 }
             }
-            if self.reconfigs.is_empty() {
+            if self
+                .reconfigs
+                .keys()
+                .all(|rsn| self.unsent_reconfigs.contains(rsn))
+            {
                 self.timers.stop(Timer::Reconfig);
+                self.awake_write_loop();
             }
             Ok(())
         } else {
@@ -2373,13 +2391,20 @@ impl Association {
         accept: bool,
         default_payload_type: PayloadProtocolIdentifier,
     ) -> Option<Stream<'_>> {
-        let s = StreamState::new(
+        let mut s = StreamState::new(
             self.side,
             stream_identifier,
             self.max_payload_size,
             self.max_receive_message_size,
             default_payload_type,
         );
+
+        if accept
+            && (self.pending_reset_completions.contains(&stream_identifier)
+                || self.has_pending_reset_for_stream(stream_identifier))
+        {
+            s.state = RecvSendState::Readable;
+        }
 
         if accept {
             self.stream_queue.push_back(stream_identifier);
@@ -2427,17 +2452,39 @@ impl Association {
         let mut raw_packets = vec![];
 
         if !self.control_queue.is_empty() {
-            for p in self.control_queue.drain(..) {
+            let mut buffered = VecDeque::new();
+            let timer_running = self.timers.get(Timer::Reconfig).is_some();
+            let queued = core::mem::take(&mut self.control_queue);
+            for p in queued {
+                let outgoing_rsn = p.chunks.iter().find_map(|chunk| {
+                    chunk
+                        .as_any()
+                        .downcast_ref::<ChunkReconfig>()
+                        .and_then(|reconfig| reconfig.param_a.as_ref())
+                        .and_then(|param| {
+                            param.as_any().downcast_ref::<ParamOutgoingResetRequest>()
+                        })
+                        .map(|request| request.reconfig_request_sequence_number)
+                });
+
+                if timer_running
+                    && outgoing_rsn.is_some_and(|rsn| self.unsent_reconfigs.contains(&rsn))
+                {
+                    buffered.push_back(p);
+                    continue;
+                }
+
                 if let Ok(raw) = p.marshal() {
                     raw_packets.push(raw);
+                    if let Some(rsn) = outgoing_rsn {
+                        self.unsent_reconfigs.remove(&rsn);
+                    }
                 } else {
                     warn!("[{}] failed to serialize a control packet", self.side);
                     continue;
                 }
             }
-            // Reciprocal RE-CONFIG requests are queued as control packets. Once
-            // the queue is drained by poll_transmit, those RSNs are acknowledgeable.
-            self.unsent_reconfigs.clear();
+            self.control_queue = buffered;
         }
 
         let state = self.state();
@@ -2571,7 +2618,11 @@ impl Association {
         // Reconfigs can be inserted via reset_streams_if_any (incoming reset
         // response path) without going through the sis_to_reset / retransmit
         // block above.
-        if !self.reconfigs.is_empty() {
+        if self
+            .reconfigs
+            .keys()
+            .any(|rsn| !self.unsent_reconfigs.contains(rsn))
+        {
             self.timers
                 .restart_if_stale(Timer::Reconfig, now, self.rto_mgr.get_rto());
         }

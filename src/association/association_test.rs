@@ -416,6 +416,143 @@ fn test_outgoing_reset_does_not_ack_unsent_reciprocal() -> Result<()> {
 }
 
 #[test]
+fn test_reset_complete_only_fires_when_stream_id_is_reusable() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association::default();
+
+    a.pending_reset_completions.insert(stream_id);
+    a.pending_reset_completions.insert(stream_id);
+    a.reconfigs.insert(7, outgoing_reset(7, stream_id));
+    a.reconfigs.insert(8, outgoing_reset(8, stream_id));
+
+    for (rsn, result) in [
+        (7, ReconfigResult::SuccessPerformed),
+        (8, ReconfigResult::Denied),
+    ] {
+        let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+            reconfig_response_sequence_number: rsn,
+            result,
+        });
+        a.handle_reconfig_param(&response, &mut vec![])?;
+    }
+
+    assert!(matches!(
+        a.poll(),
+        Some(Event::Stream(StreamEvent::ResetComplete { id })) if id == stream_id
+    ));
+    assert!(
+        a.open_stream(stream_id, PayloadProtocolIdentifier::Binary)
+            .is_ok(),
+        "ResetComplete promises that this stream ID has become reusable"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_reconfig_response_does_not_ack_unsent_reciprocal() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association {
+        my_next_tsn: 1,
+        ..Default::default()
+    };
+    assert!(
+        a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
+            .is_some()
+    );
+
+    let request: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 7,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: a.peer_last_tsn,
+        stream_identifiers: vec![stream_id],
+    });
+    let mut reply = vec![];
+    a.handle_reconfig_param(&request, &mut reply)?;
+
+    let reciprocal_rsn = *a.reconfigs.keys().next().unwrap();
+    assert!(!reply.is_empty());
+    assert!(a.timers.get(Timer::Reconfig).is_none());
+
+    // The reciprocal is only queued in the reply and has not been transmitted.
+    // RFC 6525 H1 says to ignore a response for an RSN whose timer is not running.
+    let premature_response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+        reconfig_response_sequence_number: reciprocal_rsn,
+        result: ReconfigResult::SuccessPerformed,
+    });
+    a.handle_reconfig_param(&premature_response, &mut vec![])?;
+
+    let reset_complete = core::iter::from_fn(|| a.poll())
+        .filter(|event| {
+            matches!(
+                event,
+                Event::Stream(StreamEvent::ResetComplete { id }) if *id == stream_id
+            )
+        })
+        .count();
+    assert_eq!(
+        (a.reconfigs.contains_key(&reciprocal_rsn), reset_complete),
+        (true, 0),
+        "RFC 6525 H1 requires a response for an RSN whose timer is not running to be ignored"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_outgoing_reset_does_not_ack_unsent_reciprocal_with_unrelated_timer() -> Result<()> {
+    let stream_id = 1;
+    let sent_rsn = 99;
+    let mut a = Association {
+        my_next_tsn: 1,
+        ..Default::default()
+    };
+    assert!(
+        a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
+            .is_some()
+    );
+
+    a.reconfigs.insert(sent_rsn, outgoing_reset(sent_rsn, 2));
+    a.timers
+        .start(Timer::Reconfig, Instant::now(), a.rto_mgr.get_rto());
+
+    // The global timer belongs to the already-sent request above. Processing
+    // this incoming request queues a distinct reciprocal, but does not send it.
+    let request: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 7,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: a.peer_last_tsn,
+        stream_identifiers: vec![stream_id],
+    });
+    let mut reply = vec![];
+    a.handle_reconfig_param(&request, &mut reply)?;
+
+    let reciprocal_rsn = *a.reconfigs.keys().find(|&&rsn| rsn != sent_rsn).unwrap();
+    assert!(!reply.is_empty());
+
+    let premature_ack: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 8,
+        reconfig_response_sequence_number: reciprocal_rsn,
+        sender_last_tsn: a.peer_last_tsn,
+        stream_identifiers: vec![3],
+    });
+    a.handle_reconfig_param(&premature_ack, &mut vec![])?;
+
+    let reset_complete = core::iter::from_fn(|| a.poll())
+        .filter(|event| {
+            matches!(
+                event,
+                Event::Stream(StreamEvent::ResetComplete { id }) if *id == stream_id
+            )
+        })
+        .count();
+    assert_eq!(
+        (a.reconfigs.contains_key(&reciprocal_rsn), reset_complete),
+        (true, 0),
+        "a timer running for another RSN must not make an unsent reciprocal acknowledgeable"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_create_forward_tsn_forward_one_abandoned() -> Result<()> {
     let mut a = Association {
         cumulative_tsn_ack_point: 9,

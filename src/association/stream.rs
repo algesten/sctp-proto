@@ -257,10 +257,12 @@ impl<'a> Stream<'a> {
 
     pub fn is_writable(&self) -> bool {
         // RFC 6525 section 5.1.2 A1 forbids assigning new SSNs while an
-        // Outgoing SSN Reset Request for this stream is pending.
+        // Outgoing SSN Reset Request for this stream is pending. A failed
+        // reset also quarantines the outgoing direction because the peer may
+        // already have reset its corresponding incoming stream.
         if self
             .association
-            .stream_reset_in_progress(self.stream_identifier)
+            .stream_reset_blocked(self.stream_identifier)
         {
             return false;
         }

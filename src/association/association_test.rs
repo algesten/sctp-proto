@@ -806,6 +806,28 @@ fn test_only_one_buffered_reconfig_is_sent_when_timer_is_idle() {
 }
 
 #[test]
+fn test_close_discards_buffered_reconfig_requests() -> Result<()> {
+    let mut a = Association {
+        state: AssociationState::Established,
+        ..Default::default()
+    };
+    insert_active_reset(&mut a, 7, 1);
+    insert_queued_reset(&mut a, 8, 2);
+    a.timers
+        .start(Timer::Reconfig, Instant::now(), a.rto_mgr.get_rto());
+
+    a.close()?;
+
+    assert!(
+        a.poll_transmit(Instant::now()).is_none(),
+        "a closed association must not send a buffered stream-reset request"
+    );
+    assert!(a.active_reconfig.is_none());
+    assert!(a.reconfigs.is_empty());
+    Ok(())
+}
+
+#[test]
 fn test_in_progress_keeps_later_request_buffered() -> Result<()> {
     let mut a = Association {
         state: AssociationState::Established,

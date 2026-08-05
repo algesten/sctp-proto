@@ -698,6 +698,34 @@ fn test_pending_reset_blocks_existing_stream_writes() -> Result<()> {
 }
 
 #[test]
+fn test_reset_completion_does_not_reopen_finished_write_half() -> Result<()> {
+    let stream_id = 1;
+    let rsn = 7;
+    let mut a = Association::default();
+    assert!(
+        a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
+            .is_some()
+    );
+    insert_active_reset(&mut a, rsn, stream_id);
+
+    // Finishing the write half is permanent, including while a reset request
+    // temporarily makes the stream non-writable for protocol reasons.
+    a.stream(stream_id)?.finish()?;
+
+    let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+        reconfig_response_sequence_number: rsn,
+        result: ReconfigResult::SuccessPerformed,
+    });
+    a.handle_reconfig_param(&response, &mut vec![])?;
+
+    assert!(
+        !a.stream(stream_id)?.is_writable(),
+        "reset completion must not undo Stream::finish()"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_only_one_buffered_reconfig_is_sent_when_timer_is_idle() {
     let mut a = Association {
         state: AssociationState::Established,

@@ -868,6 +868,61 @@ fn test_local_reset_does_not_overtake_pending_data() -> Result<()> {
 }
 
 #[test]
+fn test_reciprocal_reset_covers_preexisting_pending_data() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association {
+        state: AssociationState::Established,
+        my_next_tsn: 1,
+        cwnd: 1400,
+        rwnd: 1400,
+        mtu: 1400,
+        ..Default::default()
+    };
+    assert!(
+        a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
+            .is_some()
+    );
+    a.pending_queue.push(ChunkPayloadData {
+        stream_identifier: stream_id,
+        stream_sequence_number: 4,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"pending"),
+        ..Default::default()
+    });
+
+    // Receiving the peer's outgoing reset creates a reciprocal outgoing reset.
+    // DATA accepted before that request must be assigned a TSN covered by the
+    // reciprocal request's Sender's Last Assigned TSN boundary.
+    let request: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 7,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: a.peer_last_tsn,
+        stream_identifiers: vec![stream_id],
+    });
+    let mut reply = vec![];
+    a.handle_reconfig_param(&request, &mut reply)?;
+    a.control_queue.extend(reply);
+
+    let _ = a.gather_outbound(Instant::now());
+
+    let data_tsn = a.inflight_queue.get(1).unwrap().tsn;
+    let reciprocal = a
+        .reconfigs
+        .get(&a.active_reconfig.unwrap())
+        .unwrap()
+        .param_a
+        .as_ref()
+        .and_then(|param| param.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+        .unwrap();
+    assert!(
+        sna32gte(reciprocal.sender_last_tsn, data_tsn),
+        "the reciprocal reset boundary must cover DATA queued before the reset"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_retransmission_does_not_send_buffered_reconfigs() {
     let mut a = Association {
         state: AssociationState::Established,

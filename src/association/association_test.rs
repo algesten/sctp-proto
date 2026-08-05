@@ -917,6 +917,42 @@ fn test_reset_request_sequence_number_wraps() -> Result<()> {
 }
 
 #[test]
+fn test_local_reset_acknowledges_latest_peer_request_sequence() -> Result<()> {
+    let peer_rsn = 41;
+    let mut a = Association {
+        state: AssociationState::Established,
+        my_next_tsn: 1,
+        ..Default::default()
+    };
+
+    let peer_request: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: peer_rsn,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: a.peer_last_tsn,
+        stream_identifiers: vec![],
+    });
+    a.handle_reconfig_param(&peer_request, &mut vec![])?;
+    assert_eq!(a.max_completed_reconfig_rsn, Some(peer_rsn));
+
+    a.send_reset_request(1)?;
+    let _ = a.gather_outbound(Instant::now());
+
+    let reset = a
+        .reconfigs
+        .get(&a.active_reconfig.unwrap())
+        .unwrap()
+        .param_a
+        .as_ref()
+        .and_then(|param| param.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+        .unwrap();
+    assert_eq!(
+        reset.reconfig_response_sequence_number, peer_rsn,
+        "RFC 6525 section 5.1.2 A4 requires the latest peer RSN in the response field"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_reciprocal_reset_covers_preexisting_pending_data() -> Result<()> {
     let stream_id = 1;
     let mut a = Association {

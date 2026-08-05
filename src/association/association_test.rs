@@ -868,6 +868,46 @@ fn test_local_reset_does_not_overtake_pending_data() -> Result<()> {
 }
 
 #[test]
+fn test_local_reset_is_not_blocked_by_unrelated_pending_data() -> Result<()> {
+    let reset_stream_id = 1;
+    let unrelated_stream_id = 2;
+    let mut a = Association {
+        state: AssociationState::Established,
+        my_next_tsn: 2,
+        cwnd: 0,
+        rwnd: 0,
+        mtu: 1400,
+        ..Default::default()
+    };
+    a.inflight_queue.push_no_check(ChunkPayloadData {
+        tsn: 1,
+        stream_identifier: unrelated_stream_id,
+        user_data: Bytes::from_static(b"inflight"),
+        ..Default::default()
+    });
+    a.pending_queue.push(ChunkPayloadData {
+        stream_identifier: unrelated_stream_id,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"flow controlled"),
+        ..Default::default()
+    });
+    a.send_reset_request(reset_stream_id)?;
+
+    let _ = a.gather_outbound(Instant::now());
+
+    assert!(
+        a.active_reconfig.is_some(),
+        "flow-controlled DATA on another stream must not starve this reset"
+    );
+    assert!(
+        !a.pending_queue.is_empty(),
+        "the test requires the unrelated DATA to remain flow controlled"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_reset_sender_last_tsn_wraps_at_zero() -> Result<()> {
     let stream_id = 1;
     let mut a = Association {

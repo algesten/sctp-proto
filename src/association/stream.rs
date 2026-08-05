@@ -316,6 +316,18 @@ impl<'a> Stream<'a> {
             s.state = ((s.state as u8) & 0x2).into();
         }
 
+        // stop() promises that future reads are not permitted. If a reset was
+        // preserving unread boundary DATA, discard that old generation now so
+        // its Finished event and unrelated association events cannot stall.
+        if self
+            .association
+            .retiring_streams
+            .contains_key(&self.stream_identifier)
+        {
+            self.association
+                .finish_retiring_stream(self.stream_identifier)?;
+        }
+
         Ok(())
     }
 

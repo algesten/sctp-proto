@@ -868,6 +868,55 @@ fn test_local_reset_does_not_overtake_pending_data() -> Result<()> {
 }
 
 #[test]
+fn test_reset_sender_last_tsn_wraps_at_zero() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association {
+        state: AssociationState::Established,
+        my_next_tsn: 0,
+        ..Default::default()
+    };
+    a.send_reset_request(stream_id)?;
+
+    let _ = a.gather_outbound(Instant::now());
+
+    let reset = a
+        .reconfigs
+        .get(&a.active_reconfig.unwrap())
+        .unwrap()
+        .param_a
+        .as_ref()
+        .and_then(|param| param.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+        .unwrap();
+    assert_eq!(
+        reset.sender_last_tsn,
+        u32::MAX,
+        "the TSN preceding zero must wrap to u32::MAX"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_reset_request_sequence_number_wraps() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association {
+        state: AssociationState::Established,
+        my_next_tsn: 1,
+        my_next_rsn: u32::MAX,
+        ..Default::default()
+    };
+    a.send_reset_request(stream_id)?;
+
+    let _ = a.gather_outbound(Instant::now());
+
+    assert_eq!(a.active_reconfig, Some(u32::MAX));
+    assert_eq!(
+        a.my_next_rsn, 0,
+        "the re-configuration request sequence number must wrap"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_reciprocal_reset_covers_preexisting_pending_data() -> Result<()> {
     let stream_id = 1;
     let mut a = Association {

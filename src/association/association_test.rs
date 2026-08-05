@@ -1325,6 +1325,14 @@ fn test_successive_resets_preserve_each_unread_generation() -> Result<()> {
     }
     assert_eq!(finished, 1);
 
+    assert!(
+        core::iter::from_fn(|| a.poll()).any(|event| matches!(
+            event,
+            Event::Stream(StreamEvent::Readable { id }) if id == stream_id
+        )),
+        "generation B must advertise readability before its Finished event"
+    );
+
     let second = a.stream(stream_id)?.read()?.unwrap();
     let mut payload = [0; 5];
     assert_eq!(second.read(&mut payload)?, payload.len());
@@ -1434,6 +1442,123 @@ fn test_i_forward_tsn_skip_is_applied_to_reset_successor() -> Result<()> {
 }
 
 #[test]
+fn test_forward_tsn_during_in_progress_reset_applies_to_old_generation() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association {
+        state: AssociationState::Established,
+        peer_last_tsn: 0,
+        my_next_tsn: 1,
+        max_receive_buffer_size: 1024,
+        max_receive_message_size: 1024,
+        max_payload_size: 1200,
+        use_forward_tsn: true,
+        ..Default::default()
+    };
+    assert!(
+        a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
+            .is_some()
+    );
+    let reset: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 7,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: 1,
+        stream_identifiers: vec![stream_id],
+    });
+    a.handle_reconfig_param(&reset, &mut vec![])?;
+
+    // The reset has not reached its TSN boundary yet, so this skip belongs to
+    // the old generation even though the association-level cumulative TSN
+    // advances beyond that boundary.
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 2,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: stream_id,
+            sequence: 0,
+        }],
+    })?;
+
+    a.handle_data(&ChunkPayloadData {
+        tsn: 3,
+        stream_identifier: stream_id,
+        stream_sequence_number: 0,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"new"),
+        ..Default::default()
+    })?;
+    let successor = a.stream(stream_id)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(successor.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"new");
+    Ok(())
+}
+
+fn association_with_queued_second_reset() -> Result<Association> {
+    let mut a = association_with_retiring_boundary_data()?;
+    let second_reset: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 8,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: 2,
+        stream_identifiers: vec![1],
+    });
+    a.handle_reconfig_param(&second_reset, &mut vec![])?;
+    assert!(a.reconfig_requests.contains_key(&8));
+    Ok(a)
+}
+
+fn assert_generation_c_ssn_zero_is_readable(mut a: Association) -> Result<()> {
+    let old = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(old.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"old");
+
+    a.handle_data(&ChunkPayloadData {
+        tsn: 4,
+        stream_identifier: 1,
+        stream_sequence_number: 0,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"gen-c"),
+        ..Default::default()
+    })?;
+    let generation_c = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 5];
+    assert_eq!(generation_c.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"gen-c");
+    Ok(())
+}
+
+#[test]
+fn test_forward_tsn_skip_is_scoped_to_queued_reset_generation() -> Result<()> {
+    let mut a = association_with_queued_second_reset()?;
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        // TSN 2 is generation B's abandoned SSN 0. TSN 3 belongs to an
+        // unrelated stream, so the aggregate cumulative point cannot identify
+        // which stream generation the per-stream SSN describes.
+        new_cumulative_tsn: 3,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 1,
+            sequence: 0,
+        }],
+    })?;
+    assert_generation_c_ssn_zero_is_readable(a)
+}
+
+#[test]
+fn test_i_forward_tsn_skip_is_scoped_to_queued_reset_generation() -> Result<()> {
+    let mut a = association_with_queued_second_reset()?;
+    a.handle_i_forward_tsn(&ChunkIForwardTsn {
+        new_cumulative_tsn: 3,
+        streams: vec![ChunkIForwardTsnStream {
+            identifier: 1,
+            unordered: false,
+            mid: 0,
+        }],
+    })?;
+    assert_generation_c_ssn_zero_is_readable(a)
+}
+
+#[test]
 fn test_unread_retiring_stream_does_not_block_unrelated_events() -> Result<()> {
     let mut a = association_with_retiring_boundary_data()?;
     assert!(
@@ -1479,6 +1604,110 @@ fn test_stop_discards_unread_retiring_data_and_unblocks_finished() -> Result<()>
         a.poll(),
         Some(Event::Stream(StreamEvent::Finished { id: 1 }))
     ));
+    Ok(())
+}
+
+#[test]
+fn test_stop_does_not_reopen_read_half_on_deferred_successor() -> Result<()> {
+    let mut a = association_with_retiring_boundary_data()?;
+    a.handle_data(&ChunkPayloadData {
+        tsn: 2,
+        stream_identifier: 1,
+        stream_sequence_number: 0,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"successor"),
+        ..Default::default()
+    })?;
+
+    let mut stream = a.stream(1)?;
+    stream.stop()?;
+    assert_eq!(stream.read().unwrap_err(), Error::ErrStreamClosed);
+    Ok(())
+}
+
+#[test]
+fn test_stop_before_reset_boundary_does_not_leave_finished_blocked() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association {
+        state: AssociationState::Established,
+        peer_last_tsn: 0,
+        my_next_tsn: 1,
+        max_receive_buffer_size: 1024,
+        max_receive_message_size: 1024,
+        max_payload_size: 1200,
+        ..Default::default()
+    };
+    for id in [stream_id, 2] {
+        assert!(
+            a.create_stream(id, false, PayloadProtocolIdentifier::Binary)
+                .is_some()
+        );
+    }
+
+    // TSN 2 is readable but cannot advance the cumulative point past missing
+    // TSN 1, leaving time for the application to stop the read half.
+    a.handle_data(&ChunkPayloadData {
+        tsn: 2,
+        stream_identifier: stream_id,
+        stream_sequence_number: 0,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"discard"),
+        ..Default::default()
+    })?;
+    let reset: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 7,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: 2,
+        stream_identifiers: vec![stream_id],
+    });
+    a.handle_reconfig_param(&reset, &mut vec![])?;
+    a.stream(stream_id)?.stop()?;
+
+    a.handle_data(&ChunkPayloadData {
+        tsn: 1,
+        stream_identifier: 2,
+        stream_sequence_number: 0,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"gap"),
+        ..Default::default()
+    })?;
+
+    assert!(a.stream(stream_id).is_err());
+    assert!(
+        core::iter::from_fn(|| a.poll()).any(|event| matches!(
+            event,
+            Event::Stream(StreamEvent::Finished { id }) if id == stream_id
+        )),
+        "a stopped read half cannot be left waiting for an impossible drain"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_oversized_deferred_successor_is_rejected_before_old_read() -> Result<()> {
+    let mut a = association_with_retiring_boundary_data()?;
+    a.max_receive_message_size = 3;
+
+    let error = a
+        .handle_data(&ChunkPayloadData {
+            tsn: 2,
+            stream_identifier: 1,
+            stream_sequence_number: 0,
+            beginning_fragment: true,
+            ending_fragment: true,
+            user_data: Bytes::from_static(b"too-big"),
+            ..Default::default()
+        })
+        .unwrap_err();
+    assert_eq!(error, Error::ErrInboundPacketTooLarge);
+
+    let old = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(old.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"old");
     Ok(())
 }
 

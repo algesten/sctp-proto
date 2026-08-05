@@ -319,13 +319,16 @@ impl<'a> Stream<'a> {
         // stop() promises that future reads are not permitted. If a reset was
         // preserving unread boundary DATA, discard that old generation now so
         // its Finished event and unrelated association events cannot stall.
-        if self
+        while self
             .association
             .retiring_streams
             .contains_key(&self.stream_identifier)
         {
             self.association
                 .finish_retiring_stream(self.stream_identifier)?;
+            if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
+                s.state = ((s.state as u8) & 0x2).into();
+            }
         }
 
         Ok(())

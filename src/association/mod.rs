@@ -31,7 +31,9 @@ use crate::param::param_outgoing_reset_request::ParamOutgoingResetRequest;
 use crate::param::param_reconfig_response::{ParamReconfigResponse, ReconfigResult};
 use crate::param::param_state_cookie::ParamStateCookie;
 use crate::param::param_supported_extensions::ParamSupportedExtensions;
-use crate::queue::{payload_queue::PayloadQueue, pending_queue::PendingQueue};
+use crate::queue::{
+    payload_queue::PayloadQueue, pending_queue::PendingQueue, reassembly_queue::ReassemblyQueue,
+};
 use crate::shared::{AssociationEventInner, AssociationId, EndpointEvent, EndpointEventInner};
 use crate::util::{sna16lt, sna32gt, sna32gte, sna32lt, sna32lte};
 use crate::{AssociationEvent, Payload, Side, Transmit};
@@ -157,7 +159,9 @@ impl PendingResetCompletions {
 
 #[derive(Debug, Copy, Clone)]
 struct DeferredForwardTsn {
-    new_cumulative_tsn: u32,
+    /// The reset boundary ending the generation this update belongs to.
+    /// None identifies the active tail generation after all accepted resets.
+    generation_boundary: Option<u32>,
     last_ssn: u16,
 }
 
@@ -639,7 +643,11 @@ impl Association {
                                 stream_event,
                                 StreamEvent::ResetComplete { .. } | StreamEvent::ResetFailed { .. }
                             ) && self.delivered_stream_finishes.contains(&stream_id);
-                        if !terminal_for_delivered_generation {
+                        let readable_current_generation = matches!(
+                            stream_event,
+                            StreamEvent::Opened { .. } | StreamEvent::Readable { .. }
+                        );
+                        if !terminal_for_delivered_generation && !readable_current_generation {
                             continue;
                         }
                     }
@@ -1254,12 +1262,14 @@ impl Association {
             return;
         }
 
-        let has_unread_data = self
-            .streams
-            .get(&stream_identifier)
-            .is_some_and(|stream| stream.get_num_bytes_in_reassembly_queue() != 0);
+        let has_readable_data = self.streams.get(&stream_identifier).is_some_and(|stream| {
+            matches!(
+                stream.state,
+                RecvSendState::Readable | RecvSendState::ReadWritable
+            ) && stream.get_num_bytes_in_reassembly_queue() != 0
+        });
 
-        if !has_unread_data {
+        if !has_readable_data {
             self.unregister_stream(stream_identifier, true);
             return;
         }
@@ -1776,35 +1786,29 @@ impl Association {
         self.retiring_streams
             .get(&stream_identifier)
             .and_then(|boundaries| boundaries.front().copied())
-            .or_else(|| {
-                self.reconfig_requests
-                    .values()
-                    .find(|request| Self::reset_request_affects_stream(request, stream_identifier))
-                    .map(|request| request.sender_last_tsn)
-            })
     }
 
-    fn forward_tsn_applies_to_current_generation(
-        &self,
-        stream_identifier: StreamId,
-        new_cumulative_tsn: u32,
-    ) -> bool {
-        self.current_reset_boundary(stream_identifier)
-            .is_none_or(|boundary| sna32lte(new_cumulative_tsn, boundary))
+    fn pending_reset_boundary(&self, stream_identifier: StreamId) -> Option<u32> {
+        self.reconfig_requests
+            .values()
+            .find(|request| Self::reset_request_affects_stream(request, stream_identifier))
+            .map(|request| request.sender_last_tsn)
     }
 
-    fn apply_or_defer_ordered_forward_tsn(
-        &mut self,
-        stream_identifier: StreamId,
-        new_cumulative_tsn: u32,
-        last_ssn: u16,
-    ) {
-        if !self.forward_tsn_applies_to_current_generation(stream_identifier, new_cumulative_tsn) {
+    fn forward_tsn_applies_to_current_generation(&self, stream_identifier: StreamId) -> bool {
+        let current_boundary = self.current_reset_boundary(stream_identifier);
+        current_boundary.is_none()
+            || current_boundary == self.pending_reset_boundary(stream_identifier)
+    }
+
+    fn apply_or_defer_ordered_forward_tsn(&mut self, stream_identifier: StreamId, last_ssn: u16) {
+        if !self.forward_tsn_applies_to_current_generation(stream_identifier) {
+            let generation_boundary = self.pending_reset_boundary(stream_identifier);
             self.deferred_forward_tsns
                 .entry(stream_identifier)
                 .or_default()
                 .push_back(DeferredForwardTsn {
-                    new_cumulative_tsn,
+                    generation_boundary,
                     last_ssn,
                 });
             return;
@@ -1821,10 +1825,7 @@ impl Association {
             .keys()
             .copied()
             .filter(|stream_identifier| {
-                self.forward_tsn_applies_to_current_generation(
-                    *stream_identifier,
-                    new_cumulative_tsn,
-                )
+                self.forward_tsn_applies_to_current_generation(*stream_identifier)
             })
             .collect();
         for stream_identifier in stream_ids {
@@ -1845,9 +1846,7 @@ impl Association {
             .get(&stream_identifier)
             .into_iter()
             .flatten()
-            .filter(|update| {
-                boundary.is_none_or(|boundary| sna32lte(update.new_cumulative_tsn, boundary))
-            })
+            .filter(|update| update.generation_boundary == boundary)
             .copied()
             .collect();
 
@@ -1856,9 +1855,7 @@ impl Association {
         }
 
         if let Some(updates) = self.deferred_forward_tsns.get_mut(&stream_identifier) {
-            updates.retain(|update| {
-                boundary.is_some_and(|boundary| sna32gt(update.new_cumulative_tsn, boundary))
-            });
+            updates.retain(|update| update.generation_boundary != boundary);
             if updates.is_empty() {
                 self.deferred_forward_tsns.remove(&stream_identifier);
             }
@@ -1877,7 +1874,7 @@ impl Association {
         boundary: u32,
     ) {
         if let Some(updates) = self.deferred_forward_tsns.get_mut(&stream_identifier) {
-            updates.retain(|update| sna32gt(update.new_cumulative_tsn, boundary));
+            updates.retain(|update| update.generation_boundary != Some(boundary));
             if updates.is_empty() {
                 self.deferred_forward_tsns.remove(&stream_identifier);
             }
@@ -1927,6 +1924,63 @@ impl Association {
             self.deferred_reset_data.remove(&chunk.tsn);
         }
 
+        Ok(())
+    }
+
+    fn deferred_generation_bounds(
+        &self,
+        stream_identifier: StreamId,
+        tsn: u32,
+    ) -> Option<(u32, Option<u32>)> {
+        let retirement_boundaries = self.retiring_streams.get(&stream_identifier);
+        let pending_boundary = self
+            .reconfig_requests
+            .values()
+            .find(|request| Self::reset_request_affects_stream(request, stream_identifier))
+            .map(|request| request.sender_last_tsn);
+
+        let mut boundaries: Vec<u32> = retirement_boundaries
+            .into_iter()
+            .flat_map(|boundaries| boundaries.iter().copied())
+            .collect();
+        if boundaries.is_empty() {
+            boundaries.extend(pending_boundary);
+        }
+
+        let mut lower = *boundaries.first()?;
+        for upper in boundaries.into_iter().skip(1) {
+            if sna32lte(tsn, upper) {
+                return Some((lower, Some(upper)));
+            }
+            lower = upper;
+        }
+        Some((lower, None))
+    }
+
+    fn validate_deferred_reset_data(&self, d: &ChunkPayloadData) -> Result<()> {
+        let Some((lower, upper)) = self.deferred_generation_bounds(d.stream_identifier, d.tsn)
+        else {
+            return Ok(());
+        };
+
+        let mut chunks: Vec<ChunkPayloadData> = self
+            .deferred_reset_data
+            .values()
+            .filter(|chunk| {
+                chunk.stream_identifier == d.stream_identifier
+                    && sna32gt(chunk.tsn, lower)
+                    && upper.is_none_or(|upper| sna32lte(chunk.tsn, upper))
+            })
+            .cloned()
+            .collect();
+        chunks.sort_unstable_by_key(|chunk| chunk.tsn.wrapping_sub(lower));
+
+        let mut validation_queue =
+            ReassemblyQueue::new(d.stream_identifier, self.max_receive_message_size);
+        for chunk in chunks {
+            validation_queue.push(chunk)?;
+        }
+        validation_queue.push(d.clone())?;
         Ok(())
     }
 
@@ -2007,6 +2061,7 @@ impl Association {
         let immediate_sack = d.immediate_sack;
 
         if defer_stream_data {
+            self.validate_deferred_reset_data(d)?;
             if self.payload_queue.push(d.clone(), self.peer_last_tsn) {
                 self.deferred_reset_data.insert(d.tsn, d.clone());
             }
@@ -2229,11 +2284,7 @@ impl Association {
         // corresponding streams so that the abandoned chunks can be removed
         // from the reassemblyQueue.
         for forwarded in &c.streams {
-            self.apply_or_defer_ordered_forward_tsn(
-                forwarded.identifier,
-                c.new_cumulative_tsn,
-                forwarded.sequence,
-            );
+            self.apply_or_defer_ordered_forward_tsn(forwarded.identifier, forwarded.sequence);
         }
 
         // TSN may be forewared for unordered chunks. ForwardTSN chunk does not
@@ -2291,21 +2342,14 @@ impl Association {
         // Handle per-stream entries using the explicit unordered flag
         for forwarded in &c.streams {
             if forwarded.unordered {
-                if self.forward_tsn_applies_to_current_generation(
-                    forwarded.identifier,
-                    c.new_cumulative_tsn,
-                ) {
+                if self.forward_tsn_applies_to_current_generation(forwarded.identifier) {
                     if let Some(s) = self.streams.get_mut(&forwarded.identifier) {
                         s.handle_forward_tsn_for_unordered(c.new_cumulative_tsn);
                     }
                 }
             } else {
                 // MID maps to SSN for ordered streams; truncate to u16
-                self.apply_or_defer_ordered_forward_tsn(
-                    forwarded.identifier,
-                    c.new_cumulative_tsn,
-                    forwarded.mid as u16,
-                );
+                self.apply_or_defer_ordered_forward_tsn(forwarded.identifier, forwarded.mid as u16);
             }
         }
 

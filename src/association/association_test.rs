@@ -165,6 +165,33 @@ fn test_reconfig_retransmission_failure_is_terminal() {
 }
 
 #[test]
+fn test_ambiguous_reset_failure_keeps_existing_stream_quarantined() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association {
+        state: AssociationState::Established,
+        my_next_tsn: 1,
+        ..Default::default()
+    };
+    assert!(
+        a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
+            .is_some()
+    );
+
+    a.stream(stream_id)?.stop()?;
+    let _ = a.gather_outbound(Instant::now());
+    assert!(a.active_reconfig.is_some());
+
+    a.on_retransmission_failure(Timer::Reconfig);
+
+    assert!(a.failed_reset_streams.contains(&stream_id));
+    assert!(
+        !a.stream(stream_id)?.is_writable(),
+        "an unacknowledged reset may have succeeded at the peer, so old SSNs remain unsafe"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_denied_reset_emits_terminal_event_and_remains_quarantined() -> Result<()> {
     let rsn = 7;
     let stream_id = 1;

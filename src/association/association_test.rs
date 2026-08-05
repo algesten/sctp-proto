@@ -726,6 +726,32 @@ fn test_reset_completion_does_not_reopen_finished_write_half() -> Result<()> {
 }
 
 #[test]
+fn test_successful_outgoing_reset_restarts_stream_sequence_number() -> Result<()> {
+    let stream_id = 1;
+    let rsn = 7;
+    let mut a = Association::default();
+    assert!(
+        a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
+            .is_some()
+    );
+    a.streams.get_mut(&stream_id).unwrap().sequence_number = 9;
+    insert_active_reset(&mut a, rsn, stream_id);
+
+    let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+        reconfig_response_sequence_number: rsn,
+        result: ReconfigResult::SuccessPerformed,
+    });
+    a.handle_reconfig_param(&response, &mut vec![])?;
+
+    assert_eq!(
+        a.streams.get(&stream_id).unwrap().sequence_number,
+        0,
+        "RFC 6525 section 5.2.7 H4 requires the affected outgoing SSN to reset"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_only_one_buffered_reconfig_is_sent_when_timer_is_idle() {
     let mut a = Association {
         state: AssociationState::Established,

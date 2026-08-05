@@ -1558,6 +1558,177 @@ fn test_i_forward_tsn_skip_is_scoped_to_queued_reset_generation() -> Result<()> 
     assert_generation_c_ssn_zero_is_readable(a)
 }
 
+fn assert_later_reset_claims_tail_forward_tsn(mut a: Association) -> Result<()> {
+    let second_reset: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 8,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: 2,
+        stream_identifiers: vec![1],
+    });
+    a.handle_reconfig_param(&second_reset, &mut vec![])?;
+
+    let old = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(old.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"old");
+
+    a.handle_data(&ChunkPayloadData {
+        tsn: 3,
+        stream_identifier: 1,
+        stream_sequence_number: 0,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"gen-c"),
+        ..Default::default()
+    })?;
+    let generation_c = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 5];
+    assert_eq!(generation_c.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"gen-c");
+    Ok(())
+}
+
+#[test]
+fn test_later_reset_claims_tail_forward_tsn_generation() -> Result<()> {
+    let mut a = association_with_retiring_boundary_data()?;
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 2,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 1,
+            sequence: 0,
+        }],
+    })?;
+    assert_later_reset_claims_tail_forward_tsn(a)
+}
+
+#[test]
+fn test_later_reset_claims_tail_i_forward_tsn_generation() -> Result<()> {
+    let mut a = association_with_retiring_boundary_data()?;
+    a.handle_i_forward_tsn(&ChunkIForwardTsn {
+        new_cumulative_tsn: 2,
+        streams: vec![ChunkIForwardTsnStream {
+            identifier: 1,
+            unordered: false,
+            mid: 0,
+        }],
+    })?;
+    assert_later_reset_claims_tail_forward_tsn(a)
+}
+
+fn association_with_complete_deferred_successor() -> Result<Association> {
+    let mut a = association_with_retiring_boundary_data()?;
+    a.handle_data(&ChunkPayloadData {
+        tsn: 2,
+        stream_identifier: 1,
+        stream_sequence_number: 0,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"received"),
+        ..Default::default()
+    })?;
+    Ok(a)
+}
+
+fn assert_received_message_survives_forward_tsn(mut a: Association) -> Result<()> {
+    let old = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(old.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"old");
+
+    let received = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 8];
+    assert_eq!(received.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"received");
+    Ok(())
+}
+
+#[test]
+fn test_forward_tsn_preserves_complete_deferred_message() -> Result<()> {
+    let mut a = association_with_complete_deferred_successor()?;
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        // SSN 0 was received completely; only the following SSN 1 was
+        // abandoned. RFC 3758 requires the stranded complete message to be
+        // made available when the skip advances the ordered stream.
+        new_cumulative_tsn: 3,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 1,
+            sequence: 1,
+        }],
+    })?;
+    assert_received_message_survives_forward_tsn(a)
+}
+
+#[test]
+fn test_i_forward_tsn_preserves_complete_deferred_message() -> Result<()> {
+    let mut a = association_with_complete_deferred_successor()?;
+    a.handle_i_forward_tsn(&ChunkIForwardTsn {
+        new_cumulative_tsn: 3,
+        streams: vec![ChunkIForwardTsnStream {
+            identifier: 1,
+            unordered: false,
+            mid: 1,
+        }],
+    })?;
+    assert_received_message_survives_forward_tsn(a)
+}
+
+fn association_with_deferred_unordered_fragment() -> Result<Association> {
+    let mut a = association_with_retiring_boundary_data()?;
+    a.streams.get_mut(&1).unwrap().unordered = true;
+    a.handle_data(&ChunkPayloadData {
+        tsn: 2,
+        stream_identifier: 1,
+        unordered: true,
+        beginning_fragment: true,
+        ending_fragment: false,
+        user_data: Bytes::from_static(b"orphan"),
+        ..Default::default()
+    })?;
+    Ok(a)
+}
+
+fn assert_abandoned_unordered_fragment_is_discarded(mut a: Association) -> Result<()> {
+    let old = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(old.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"old");
+
+    assert_eq!(
+        a.streams
+            .get(&1)
+            .unwrap()
+            .get_num_bytes_in_reassembly_queue(),
+        0,
+        "an abandoned partial unordered message must not survive replay"
+    );
+    assert_eq!(a.get_my_receiver_window_credit(), a.max_receive_buffer_size);
+    Ok(())
+}
+
+#[test]
+fn test_forward_tsn_discards_deferred_unordered_fragment() -> Result<()> {
+    let mut a = association_with_deferred_unordered_fragment()?;
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 3,
+        streams: vec![],
+    })?;
+    assert_abandoned_unordered_fragment_is_discarded(a)
+}
+
+#[test]
+fn test_i_forward_tsn_discards_deferred_unordered_fragment() -> Result<()> {
+    let mut a = association_with_deferred_unordered_fragment()?;
+    a.handle_i_forward_tsn(&ChunkIForwardTsn {
+        new_cumulative_tsn: 3,
+        streams: vec![ChunkIForwardTsnStream {
+            identifier: 1,
+            unordered: true,
+            mid: 0,
+        }],
+    })?;
+    assert_abandoned_unordered_fragment_is_discarded(a)
+}
+
 #[test]
 fn test_unread_retiring_stream_does_not_block_unrelated_events() -> Result<()> {
     let mut a = association_with_retiring_boundary_data()?;
@@ -1623,6 +1794,136 @@ fn test_stop_does_not_reopen_read_half_on_deferred_successor() -> Result<()> {
     let mut stream = a.stream(1)?;
     stream.stop()?;
     assert_eq!(stream.read().unwrap_err(), Error::ErrStreamClosed);
+    Ok(())
+}
+
+#[test]
+fn test_stop_discards_deferred_successor_bytes_and_notifications() -> Result<()> {
+    let mut a = association_with_retiring_boundary_data()?;
+    while a.poll().is_some() {}
+    a.handle_data(&ChunkPayloadData {
+        tsn: 2,
+        stream_identifier: 1,
+        stream_sequence_number: 0,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"successor"),
+        ..Default::default()
+    })?;
+
+    a.stream(1)?.stop()?;
+
+    assert_eq!(
+        a.streams
+            .get(&1)
+            .unwrap()
+            .get_num_bytes_in_reassembly_queue(),
+        0,
+        "stop must not strand bytes in a write-only successor"
+    );
+    assert_eq!(a.get_my_receiver_window_credit(), a.max_receive_buffer_size);
+    assert!(
+        !core::iter::from_fn(|| a.poll()).any(|event| matches!(
+            event,
+            Event::Stream(StreamEvent::Opened { id } | StreamEvent::Readable { id }) if id == 1
+        )),
+        "stop must not advertise an unreadable successor"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_finish_remains_closed_across_deferred_successor() -> Result<()> {
+    let mut a = association_with_retiring_boundary_data()?;
+    a.handle_data(&ChunkPayloadData {
+        tsn: 2,
+        stream_identifier: 1,
+        stream_sequence_number: 0,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"successor"),
+        ..Default::default()
+    })?;
+    a.stream(1)?.finish()?;
+
+    let old = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(old.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"old");
+    assert_eq!(a.streams.get(&1).unwrap().state, RecvSendState::Readable);
+
+    let successor = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 9];
+    assert_eq!(successor.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"successor");
+    Ok(())
+}
+
+#[test]
+fn test_close_remains_closed_across_deferred_successor() -> Result<()> {
+    let mut a = association_with_retiring_boundary_data()?;
+    a.handle_data(&ChunkPayloadData {
+        tsn: 2,
+        stream_identifier: 1,
+        stream_sequence_number: 0,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"successor"),
+        ..Default::default()
+    })?;
+
+    a.stream(1)?.close()?;
+
+    let successor = a.streams.get(&1).unwrap();
+    assert_eq!(successor.state, RecvSendState::Closed);
+    assert_eq!(successor.get_num_bytes_in_reassembly_queue(), 0);
+    assert_eq!(a.get_my_receiver_window_credit(), a.max_receive_buffer_size);
+    Ok(())
+}
+
+#[test]
+fn test_duplicate_stream_ids_retire_only_one_generation() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association {
+        state: AssociationState::Established,
+        peer_last_tsn: 0,
+        my_next_tsn: 1,
+        max_receive_buffer_size: 1024,
+        max_receive_message_size: 1024,
+        max_payload_size: 1200,
+        ..Default::default()
+    };
+    assert!(
+        a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
+            .is_some()
+    );
+    a.handle_data(&ChunkPayloadData {
+        tsn: 1,
+        stream_identifier: stream_id,
+        stream_sequence_number: 0,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"old"),
+        ..Default::default()
+    })?;
+
+    let reset: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 7,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: 1,
+        stream_identifiers: vec![stream_id, stream_id],
+    });
+    a.handle_reconfig_param(&reset, &mut vec![])?;
+
+    assert_eq!(a.retiring_streams.get(&stream_id).unwrap().len(), 1);
+    assert_eq!(a.pending_reset_completions.0.get(&stream_id), Some(&1));
+    assert_eq!(
+        a.reconfigs
+            .values()
+            .flat_map(Association::reconfig_stream_ids)
+            .collect::<Vec<_>>(),
+        vec![stream_id]
+    );
     Ok(())
 }
 

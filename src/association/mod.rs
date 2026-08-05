@@ -205,6 +205,10 @@ pub struct Association {
     /// Application-initiated resets waiting for the active request to finish.
     pending_reset_streams: VecDeque<StreamId>,
     reconfig_requests: FxHashMap<u32, ParamOutgoingResetRequest>,
+    /// DATA received above an InProgress reset boundary. The chunks remain in
+    /// `payload_queue` for TSN accounting but are withheld from stream
+    /// reassembly until the reset creates the next stream generation.
+    deferred_reset_tsns: FxHashSet<u32>,
     max_completed_reconfig_rsn: Option<u32>,
     /// Re-configuration Request Sequence Number most recently accepted from
     /// the peer, initialized to the peer's initial TSN minus one.
@@ -304,6 +308,7 @@ impl Default for Association {
             active_reconfig: None,
             pending_reset_streams: VecDeque::default(),
             reconfig_requests: FxHashMap::default(),
+            deferred_reset_tsns: FxHashSet::default(),
             max_completed_reconfig_rsn: None,
             peer_last_reconfig_rsn: 0,
             pending_reset_completions: PendingResetCompletions::default(),
@@ -824,6 +829,7 @@ impl Association {
             self.pending_reset_streams.clear();
             self.reconfigs.clear();
             self.reconfig_requests.clear();
+            self.deferred_reset_tsns.clear();
             self.control_queue.clear();
             self.active_reconfig = None;
             self.will_retransmit_reconfig = false;
@@ -998,8 +1004,15 @@ impl Association {
                 .iter()
                 .chain(c.param_b.iter())
                 .find_map(|p| p.as_any().downcast_ref::<ParamOutgoingResetRequest>())
-                .is_some_and(|p| p.stream_identifiers.contains(&stream_id))
+                .is_some_and(|p| Self::reset_request_affects_stream(p, stream_id))
         })
+    }
+
+    fn reset_request_affects_stream(
+        request: &ParamOutgoingResetRequest,
+        stream_id: StreamId,
+    ) -> bool {
+        request.stream_identifiers.is_empty() || request.stream_identifiers.contains(&stream_id)
     }
 
     /// Whether the current generation of a stream id is unsafe to send or reuse.
@@ -1064,9 +1077,14 @@ impl Association {
 
     fn reconfig_has_pending_data(&self, rsn: u32) -> bool {
         self.reconfigs.get(&rsn).is_some_and(|c| {
-            Self::reconfig_stream_ids(c)
-                .iter()
-                .any(|id| self.pending_queue.contains_stream(*id))
+            let stream_ids = Self::reconfig_stream_ids(c);
+            if stream_ids.is_empty() {
+                !self.pending_queue.is_empty()
+            } else {
+                stream_ids
+                    .iter()
+                    .any(|id| self.pending_queue.contains_stream(*id))
+            }
         })
     }
 
@@ -1567,6 +1585,49 @@ impl Association {
         Ok(vec![])
     }
 
+    fn data_is_above_pending_reset(&self, d: &ChunkPayloadData) -> bool {
+        self.reconfig_requests.values().any(|request| {
+            Self::reset_request_affects_stream(request, d.stream_identifier)
+                && sna32gt(d.tsn, request.sender_last_tsn)
+        })
+    }
+
+    fn deliver_deferred_reset_data(&mut self, d: &ChunkPayloadData) -> Result<()> {
+        if self.get_or_create_stream(d.stream_identifier).is_none() {
+            debug!("[{}] discard {}", self.side, d.stream_sequence_number);
+            return Ok(());
+        }
+
+        if let Some(stream) = self.streams.get_mut(&d.stream_identifier) {
+            let queued = stream.handle_data(d)?;
+            self.events.push_back(Event::DatagramReceived);
+            if queued && stream.reassembly_queue.is_readable() {
+                self.events.push_back(Event::Stream(StreamEvent::Readable {
+                    id: d.stream_identifier,
+                }));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn release_deferred_reset_data(&mut self) -> Result<()> {
+        let ready: Vec<ChunkPayloadData> = self
+            .deferred_reset_tsns
+            .iter()
+            .filter_map(|tsn| self.payload_queue.get(*tsn))
+            .filter(|chunk| !self.data_is_above_pending_reset(chunk))
+            .cloned()
+            .collect();
+
+        for chunk in ready {
+            self.deliver_deferred_reset_data(&chunk)?;
+            self.deferred_reset_tsns.remove(&chunk.tsn);
+        }
+
+        Ok(())
+    }
+
     fn handle_data(&mut self, d: &ChunkPayloadData) -> Result<Vec<Packet>> {
         trace!(
             "[{}] DATA: tsn={} immediateSack={} len={}",
@@ -1579,7 +1640,21 @@ impl Association {
 
         let can_push = self.payload_queue.can_push(d, self.peer_last_tsn);
         let mut stream_handle_data = false;
-        if can_push {
+        let mut defer_stream_data = false;
+        if can_push && self.data_is_above_pending_reset(d) {
+            if self.get_my_receiver_window_credit() > 0 {
+                defer_stream_data = true;
+            } else if let Some(last_tsn) = self.payload_queue.get_last_tsn_received() {
+                if sna32lt(d.tsn, *last_tsn) {
+                    debug!(
+                        "[{}] receive buffer full, but accepted deferred \
+                        reset DATA as missing chunk tsn={} ssn={}",
+                        self.side, d.tsn, d.stream_sequence_number
+                    );
+                    defer_stream_data = true;
+                }
+            }
+        } else if can_push {
             if self.get_or_create_stream(d.stream_identifier).is_some() {
                 if self.get_my_receiver_window_credit() > 0 {
                     // Pass the new chunk to stream level as soon as it arrives
@@ -1612,7 +1687,11 @@ impl Association {
 
         let immediate_sack = d.immediate_sack;
 
-        if stream_handle_data {
+        if defer_stream_data {
+            if self.payload_queue.push(d.clone(), self.peer_last_tsn) {
+                self.deferred_reset_tsns.insert(d.tsn);
+            }
+        } else if stream_handle_data {
             if let Some(s) = self.streams.get_mut(&d.stream_identifier) {
                 let queued = s.handle_data(d)?;
                 // Only commit to payload_queue after reassembly accepts the chunk
@@ -1820,8 +1899,11 @@ impl Association {
 
         // Advance peer_last_tsn
         while sna32lt(self.peer_last_tsn, c.new_cumulative_tsn) {
-            self.payload_queue.pop(self.peer_last_tsn + 1); // may not exist
-            self.peer_last_tsn += 1;
+            let next_tsn = self.peer_last_tsn.wrapping_add(1);
+            if let Some(chunk) = self.payload_queue.pop(next_tsn) {
+                self.deferred_reset_tsns.remove(&chunk.tsn);
+            }
+            self.peer_last_tsn = next_tsn;
         }
 
         // Report new peer_last_tsn value and abandoned largest SSN value to
@@ -1842,7 +1924,10 @@ impl Association {
             s.handle_forward_tsn_for_unordered(c.new_cumulative_tsn);
         }
 
-        self.handle_peer_last_tsn_and_acknowledgement(false)
+        let mut reply = vec![];
+        self.reevaluate_pending_reset_requests(&mut reply)?;
+        reply.extend(self.handle_peer_last_tsn_and_acknowledgement(false)?);
+        Ok(reply)
     }
 
     /// Handle I-FORWARD-TSN (RFC 8260) — identical to FORWARD-TSN but with
@@ -1877,8 +1962,11 @@ impl Association {
 
         // Advance peer_last_tsn
         while sna32lt(self.peer_last_tsn, c.new_cumulative_tsn) {
-            self.payload_queue.pop(self.peer_last_tsn + 1);
-            self.peer_last_tsn += 1;
+            let next_tsn = self.peer_last_tsn.wrapping_add(1);
+            if let Some(chunk) = self.payload_queue.pop(next_tsn) {
+                self.deferred_reset_tsns.remove(&chunk.tsn);
+            }
+            self.peer_last_tsn = next_tsn;
         }
 
         // Handle per-stream entries using the explicit unordered flag
@@ -1900,7 +1988,10 @@ impl Association {
             s.handle_forward_tsn_for_unordered(c.new_cumulative_tsn);
         }
 
-        self.handle_peer_last_tsn_and_acknowledgement(false)
+        let mut reply = vec![];
+        self.reevaluate_pending_reset_requests(&mut reply)?;
+        reply.extend(self.handle_peer_last_tsn_and_acknowledgement(false)?);
+        Ok(reply)
     }
 
     fn handle_shutdown(&mut self, _: &ChunkShutdown) -> Result<Vec<Packet>> {
@@ -1950,6 +2041,19 @@ impl Association {
         Ok(vec![])
     }
 
+    fn reevaluate_pending_reset_requests(&mut self, reply: &mut Vec<Packet>) -> Result<()> {
+        let requests: Vec<ParamOutgoingResetRequest> =
+            self.reconfig_requests.values().cloned().collect();
+        for request in requests {
+            let seq = request.reconfig_request_sequence_number;
+            self.reset_streams_if_any(&request, false, reply)?;
+            if !self.reconfig_requests.contains_key(&seq) {
+                self.max_completed_reconfig_rsn = Some(seq);
+            }
+        }
+        Ok(())
+    }
+
     /// A common routine for handle_data and handle_forward_tsn routines
     fn handle_peer_last_tsn_and_acknowledgement(
         &mut self,
@@ -1965,18 +2069,14 @@ impl Association {
         // Meaning, if peer_last_tsn+1 points to a chunk that is received,
         // advance peer_last_tsn until peer_last_tsn+1 points to unreceived chunk.
         //debug!("[{}] peer_last_tsn = {}", self.side, self.peer_last_tsn);
-        while self.payload_queue.pop(self.peer_last_tsn + 1).is_some() {
-            self.peer_last_tsn += 1;
+        while let Some(chunk) = self.payload_queue.pop(self.peer_last_tsn.wrapping_add(1)) {
+            self.peer_last_tsn = self.peer_last_tsn.wrapping_add(1);
             //debug!("[{}] peer_last_tsn = {}", self.side, self.peer_last_tsn);
 
-            let rst_reqs: Vec<ParamOutgoingResetRequest> =
-                self.reconfig_requests.values().cloned().collect();
-            for rst_req in rst_reqs {
-                let seq = rst_req.reconfig_request_sequence_number;
-                self.reset_streams_if_any(&rst_req, false, &mut reply)?;
-                if !self.reconfig_requests.contains_key(&seq) {
-                    self.max_completed_reconfig_rsn = Some(seq);
-                }
+            self.reevaluate_pending_reset_requests(&mut reply)?;
+
+            if self.deferred_reset_tsns.remove(&chunk.tsn) {
+                self.deliver_deferred_reset_data(&chunk)?;
             }
         }
 
@@ -2397,10 +2497,17 @@ impl Association {
                 "[{}] resetStream(): senderLastTSN={} <= peer_last_tsn={}",
                 self.side, p.sender_last_tsn, self.peer_last_tsn
             );
-            for id in &p.stream_identifiers {
-                if self.streams.contains_key(id) {
-                    sis_to_reset.push(*id);
-                    self.unregister_stream(*id, true);
+            let mut stream_ids = if p.stream_identifiers.is_empty() {
+                self.streams.keys().copied().collect::<Vec<_>>()
+            } else {
+                p.stream_identifiers.clone()
+            };
+            stream_ids.sort_unstable();
+
+            for id in stream_ids {
+                if self.streams.contains_key(&id) {
+                    sis_to_reset.push(id);
+                    self.unregister_stream(id, true);
                 }
             }
             self.reconfig_requests
@@ -2440,6 +2547,10 @@ impl Association {
 
             let p = self.create_packet(vec![Box::new(c)]);
             reply.push(p);
+        }
+
+        if performed {
+            self.release_deferred_reset_data()?;
         }
 
         // Respond to every request that arrived, fresh, retransmitted
@@ -2529,6 +2640,11 @@ impl Association {
         for s in self.streams.values() {
             bytes_queued += s.get_num_bytes_in_reassembly_queue() as u32;
         }
+        for tsn in &self.deferred_reset_tsns {
+            if let Some(chunk) = self.payload_queue.get(*tsn) {
+                bytes_queued += chunk.user_data.len() as u32;
+            }
+        }
 
         self.max_receive_buffer_size.saturating_sub(bytes_queued)
     }
@@ -2574,13 +2690,20 @@ impl Association {
     ) -> Vec<Bytes> {
         if !self.control_queue.is_empty() {
             let mut buffered = VecDeque::new();
+            let mut request_blocked = false;
             let queued = core::mem::take(&mut self.control_queue);
             for p in queued {
                 let outgoing_rsn = Self::packet_reconfig_request_rsn(&p);
 
+                if outgoing_rsn.is_some() && request_blocked {
+                    buffered.push_back(p);
+                    continue;
+                }
+
                 if outgoing_rsn.is_some_and(|rsn| {
                     self.active_reconfig.is_some() && self.active_reconfig != Some(rsn)
                 }) {
+                    request_blocked = true;
                     buffered.push_back(p);
                     continue;
                 }
@@ -2588,6 +2711,7 @@ impl Association {
                 // The reset boundary cannot be fixed until all already-queued
                 // DATA for the affected streams has received a TSN.
                 if outgoing_rsn.is_some_and(|rsn| self.reconfig_has_pending_data(rsn)) {
+                    request_blocked = true;
                     buffered.push_back(p);
                     continue;
                 }
@@ -2609,6 +2733,7 @@ impl Association {
                         warn!("[{}] failed to serialize a control packet", self.side);
                         // A queued request owns reset state and must not be lost.
                         if outgoing_rsn.is_some() {
+                            request_blocked = true;
                             buffered.push_back(p);
                         }
                     }

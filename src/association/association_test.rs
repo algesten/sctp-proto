@@ -1097,6 +1097,149 @@ fn test_reciprocal_reset_covers_preexisting_pending_data() -> Result<()> {
 }
 
 #[test]
+fn test_data_above_deferred_reset_boundary_waits_for_new_generation() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association {
+        state: AssociationState::Established,
+        peer_last_tsn: 0,
+        my_next_tsn: 1,
+        max_receive_buffer_size: 1024,
+        max_receive_message_size: 1024,
+        max_payload_size: 1200,
+        ..Default::default()
+    };
+    assert!(
+        a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
+            .is_some()
+    );
+
+    let request: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 7,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: 1,
+        stream_identifiers: vec![stream_id],
+    });
+    a.handle_reconfig_param(&request, &mut vec![])?;
+    assert!(a.reconfig_requests.contains_key(&7));
+
+    // TSN 2 belongs to the post-reset generation, but arrives while TSN 1 is
+    // still missing and the reset therefore remains InProgress.
+    a.handle_data(&ChunkPayloadData {
+        tsn: 2,
+        stream_identifier: stream_id,
+        stream_sequence_number: 0,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"new"),
+        ..Default::default()
+    })?;
+
+    assert!(
+        a.poll().is_none(),
+        "post-reset DATA must not notify the old stream generation"
+    );
+    assert!(
+        a.stream(stream_id)?.read()?.is_none(),
+        "post-reset DATA must not be readable before the reset boundary arrives"
+    );
+
+    // Once TSN 1 arrives, the old generation is reset and held TSN 2 is
+    // delivered into a newly created generation whose SSN starts at zero.
+    a.handle_data(&ChunkPayloadData {
+        tsn: 1,
+        stream_identifier: stream_id,
+        stream_sequence_number: 0,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"old"),
+        ..Default::default()
+    })?;
+
+    let message = a.stream(stream_id)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(message.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"new");
+    Ok(())
+}
+
+#[test]
+fn test_empty_reset_stream_list_resets_all_streams() -> Result<()> {
+    let mut a = Association {
+        my_next_tsn: 1,
+        ..Default::default()
+    };
+    for stream_id in [1, 2] {
+        assert!(
+            a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
+                .is_some()
+        );
+    }
+
+    let request: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 7,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: a.peer_last_tsn,
+        stream_identifiers: vec![],
+    });
+    let mut reply = vec![];
+    a.handle_reconfig_param(&request, &mut reply)?;
+
+    assert!(
+        a.streams.is_empty(),
+        "an omitted stream list means all streams"
+    );
+    let mut reciprocal_ids = a
+        .reconfigs
+        .values()
+        .next()
+        .map(Association::reconfig_stream_ids)
+        .unwrap_or_default();
+    reciprocal_ids.sort_unstable();
+    assert_eq!(reciprocal_ids, vec![1, 2]);
+    Ok(())
+}
+
+#[test]
+fn test_blocked_reconfig_does_not_allow_later_rsn_to_overtake() {
+    let mut a = Association {
+        state: AssociationState::Established,
+        my_next_tsn: 1,
+        cwnd: 0,
+        rwnd: 0,
+        mtu: 1400,
+        ..Default::default()
+    };
+    a.pending_queue.push(ChunkPayloadData {
+        stream_identifier: 1,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"pending"),
+        ..Default::default()
+    });
+    a.inflight_queue.push_no_check(ChunkPayloadData {
+        tsn: 0,
+        stream_identifier: 2,
+        user_data: Bytes::from_static(b"inflight"),
+        ..Default::default()
+    });
+    insert_queued_reset(&mut a, 7, 1);
+    insert_queued_reset(&mut a, 8, 2);
+
+    let _ = a.gather_outbound(Instant::now());
+    assert!(
+        a.active_reconfig.is_none(),
+        "RSN 8 must not overtake RSN 7 while RSN 7 waits for its DATA boundary"
+    );
+    assert_eq!(a.control_queue.len(), 2);
+
+    a.cwnd = 1400;
+    a.rwnd = 1400;
+    let _ = a.gather_outbound(Instant::now());
+    assert_eq!(a.active_reconfig, Some(7));
+    assert_eq!(a.control_queue.len(), 1);
+}
+
+#[test]
 fn test_retransmission_does_not_send_buffered_reconfigs() {
     let mut a = Association {
         state: AssociationState::Established,

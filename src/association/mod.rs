@@ -31,9 +31,9 @@ use crate::param::param_outgoing_reset_request::ParamOutgoingResetRequest;
 use crate::param::param_reconfig_response::{ParamReconfigResponse, ReconfigResult};
 use crate::param::param_state_cookie::ParamStateCookie;
 use crate::param::param_supported_extensions::ParamSupportedExtensions;
-use crate::queue::{
-    payload_queue::PayloadQueue, pending_queue::PendingQueue, reassembly_queue::ReassemblyQueue,
-};
+use crate::queue::payload_queue::PayloadQueue;
+use crate::queue::pending_queue::PendingQueue;
+use crate::queue::reassembly_queue::ReassemblyQueue;
 use crate::shared::{AssociationEventInner, AssociationId, EndpointEvent, EndpointEventInner};
 use crate::util::{sna16lt, sna32gt, sna32gte, sna32lt, sna32lte};
 use crate::{AssociationEvent, Payload, Side, Transmit};
@@ -158,11 +158,17 @@ impl PendingResetCompletions {
 }
 
 #[derive(Debug, Copy, Clone)]
+enum DeferredForwardTsnKind {
+    Ordered { last_ssn: u16 },
+    Unordered { new_cumulative_tsn: u32 },
+}
+
+#[derive(Debug, Copy, Clone)]
 struct DeferredForwardTsn {
     /// The reset boundary ending the generation this update belongs to.
     /// None identifies the active tail generation after all accepted resets.
     generation_boundary: Option<u32>,
-    last_ssn: u16,
+    kind: DeferredForwardTsnKind,
 }
 
 ///Association represents an SCTP association
@@ -1258,6 +1264,13 @@ impl Association {
     fn retire_stream(&mut self, stream_identifier: StreamId, sender_last_tsn: u32) {
         if let Some(boundaries) = self.retiring_streams.get_mut(&stream_identifier) {
             boundaries.push_back(sender_last_tsn);
+            if let Some(updates) = self.deferred_forward_tsns.get_mut(&stream_identifier) {
+                for update in updates {
+                    if update.generation_boundary.is_none() {
+                        update.generation_boundary = Some(sender_last_tsn);
+                    }
+                }
+            }
             self.queue_stream_finished(stream_identifier, false);
             return;
         }
@@ -1286,6 +1299,11 @@ impl Association {
             return Ok(());
         }
 
+        let inherited_state = self
+            .streams
+            .get(&stream_identifier)
+            .map(|stream| stream.state)
+            .unwrap_or(RecvSendState::ReadWritable);
         if let Some(mut stream) = self.streams.remove(&stream_identifier) {
             stream.state = RecvSendState::Closed;
         }
@@ -1305,7 +1323,9 @@ impl Association {
 
             let Some(next_boundary) = next_boundary else {
                 self.retiring_streams.remove(&stream_identifier);
-                return self.release_deferred_reset_data();
+                let result = self.release_deferred_reset_data();
+                self.inherit_stream_state(stream_identifier, inherited_state);
+                return result;
             };
 
             self.release_deferred_generation_data(
@@ -1313,6 +1333,7 @@ impl Association {
                 completed_boundary,
                 next_boundary,
             )?;
+            self.inherit_stream_state(stream_identifier, inherited_state);
 
             let has_unread_data = self
                 .streams
@@ -1329,6 +1350,55 @@ impl Association {
                 stream.state = RecvSendState::Closed;
             }
             self.discard_deferred_forward_tsns_through(stream_identifier, next_boundary);
+        }
+    }
+
+    fn inherit_stream_state(
+        &mut self,
+        stream_identifier: StreamId,
+        inherited_state: RecvSendState,
+    ) {
+        if let Some(stream) = self.streams.get_mut(&stream_identifier) {
+            stream.state = ((stream.state as u8) & (inherited_state as u8)).into();
+        }
+    }
+
+    /// Close every retained incoming generation without replaying its DATA.
+    /// The current StreamState is kept so an application-owned write half and
+    /// its configuration survive a read-side stop.
+    pub(crate) fn discard_retiring_streams(&mut self, stream_identifier: StreamId) {
+        let Some(boundaries) = self.retiring_streams.remove(&stream_identifier) else {
+            return;
+        };
+
+        for _ in boundaries {
+            self.ready_stream_finishes.insert(stream_identifier);
+        }
+        let discarded_tsns: Vec<u32> = self
+            .deferred_reset_data
+            .iter()
+            .filter_map(|(tsn, chunk)| {
+                (chunk.stream_identifier == stream_identifier).then_some(*tsn)
+            })
+            .collect();
+        for tsn in discarded_tsns {
+            self.payload_queue.mark_as_acked(tsn);
+        }
+        self.deferred_reset_data
+            .retain(|_, chunk| chunk.stream_identifier != stream_identifier);
+        self.deferred_forward_tsns.remove(&stream_identifier);
+        self.events.retain(|event| {
+            !matches!(
+                event,
+                Event::Stream(
+                    StreamEvent::Opened { id } | StreamEvent::Readable { id }
+                ) if *id == stream_identifier
+            )
+        });
+
+        if let Some(stream) = self.streams.get_mut(&stream_identifier) {
+            stream.reassembly_queue =
+                ReassemblyQueue::new(stream_identifier, self.max_receive_message_size);
         }
     }
 
@@ -1809,29 +1879,54 @@ impl Association {
                 .or_default()
                 .push_back(DeferredForwardTsn {
                     generation_boundary,
-                    last_ssn,
+                    kind: DeferredForwardTsnKind::Ordered { last_ssn },
+                });
+            return;
+        }
+
+        let became_readable = self
+            .streams
+            .get_mut(&stream_identifier)
+            .is_some_and(|stream| {
+                let was_readable = stream.reassembly_queue.is_readable();
+                stream.reassembly_queue.forward_tsn_for_ordered(last_ssn);
+                !was_readable && stream.reassembly_queue.is_readable()
+            });
+        if became_readable {
+            self.events.push_back(Event::Stream(StreamEvent::Readable {
+                id: stream_identifier,
+            }));
+        }
+    }
+
+    fn apply_or_defer_unordered_forward_tsn(
+        &mut self,
+        stream_identifier: StreamId,
+        new_cumulative_tsn: u32,
+    ) {
+        if !self.forward_tsn_applies_to_current_generation(stream_identifier) {
+            let generation_boundary = self.pending_reset_boundary(stream_identifier);
+            self.deferred_forward_tsns
+                .entry(stream_identifier)
+                .or_default()
+                .push_back(DeferredForwardTsn {
+                    generation_boundary,
+                    kind: DeferredForwardTsnKind::Unordered { new_cumulative_tsn },
                 });
             return;
         }
 
         if let Some(stream) = self.streams.get_mut(&stream_identifier) {
-            stream.handle_forward_tsn_for_ordered(last_ssn);
+            stream
+                .reassembly_queue
+                .forward_tsn_for_unordered(new_cumulative_tsn);
         }
     }
 
     fn apply_unordered_forward_tsn_to_current_streams(&mut self, new_cumulative_tsn: u32) {
-        let stream_ids: Vec<StreamId> = self
-            .streams
-            .keys()
-            .copied()
-            .filter(|stream_identifier| {
-                self.forward_tsn_applies_to_current_generation(*stream_identifier)
-            })
-            .collect();
+        let stream_ids: Vec<StreamId> = self.streams.keys().copied().collect();
         for stream_identifier in stream_ids {
-            if let Some(stream) = self.streams.get_mut(&stream_identifier) {
-                stream.handle_forward_tsn_for_unordered(new_cumulative_tsn);
-            }
+            self.apply_or_defer_unordered_forward_tsn(stream_identifier, new_cumulative_tsn);
         }
     }
 
@@ -1861,10 +1956,28 @@ impl Association {
             }
         }
 
-        if let Some(stream) = self.streams.get_mut(&stream_identifier) {
+        let became_readable = if let Some(stream) = self.streams.get_mut(&stream_identifier) {
+            let was_readable = stream.reassembly_queue.is_readable();
             for update in ready {
-                stream.handle_forward_tsn_for_ordered(update.last_ssn);
+                match update.kind {
+                    DeferredForwardTsnKind::Ordered { last_ssn } => {
+                        stream.reassembly_queue.forward_tsn_for_ordered(last_ssn);
+                    }
+                    DeferredForwardTsnKind::Unordered { new_cumulative_tsn } => {
+                        stream
+                            .reassembly_queue
+                            .forward_tsn_for_unordered(new_cumulative_tsn);
+                    }
+                }
             }
+            !was_readable && stream.reassembly_queue.is_readable()
+        } else {
+            false
+        };
+        if became_readable {
+            self.events.push_back(Event::Stream(StreamEvent::Readable {
+                id: stream_identifier,
+            }));
         }
     }
 
@@ -1886,7 +1999,6 @@ impl Association {
             debug!("[{}] discard {}", self.side, d.stream_sequence_number);
             return Ok(());
         }
-        self.apply_deferred_forward_tsns(d.stream_identifier);
 
         if let Some(stream) = self.streams.get_mut(&d.stream_identifier) {
             let queued = stream.handle_data(d)?;
@@ -1923,6 +2035,7 @@ impl Association {
             self.deliver_deferred_reset_data(&chunk)?;
             self.deferred_reset_data.remove(&chunk.tsn);
         }
+        self.apply_deferred_forward_tsns(stream_identifier);
 
         Ok(())
     }
@@ -1991,10 +2104,15 @@ impl Association {
             .filter(|chunk| !self.data_is_above_pending_reset(chunk))
             .cloned()
             .collect();
+        let stream_ids: FxHashSet<StreamId> =
+            ready.iter().map(|chunk| chunk.stream_identifier).collect();
 
         for chunk in ready {
             self.deliver_deferred_reset_data(&chunk)?;
             self.deferred_reset_data.remove(&chunk.tsn);
+        }
+        for stream_identifier in stream_ids {
+            self.apply_deferred_forward_tsns(stream_identifier);
         }
 
         Ok(())
@@ -2342,11 +2460,10 @@ impl Association {
         // Handle per-stream entries using the explicit unordered flag
         for forwarded in &c.streams {
             if forwarded.unordered {
-                if self.forward_tsn_applies_to_current_generation(forwarded.identifier) {
-                    if let Some(s) = self.streams.get_mut(&forwarded.identifier) {
-                        s.handle_forward_tsn_for_unordered(c.new_cumulative_tsn);
-                    }
-                }
+                self.apply_or_defer_unordered_forward_tsn(
+                    forwarded.identifier,
+                    c.new_cumulative_tsn,
+                );
             } else {
                 // MID maps to SSN for ordered streams; truncate to u16
                 self.apply_or_defer_ordered_forward_tsn(forwarded.identifier, forwarded.mid as u16);
@@ -2910,6 +3027,7 @@ impl Association {
                 p.stream_identifiers.clone()
             };
             stream_ids.sort_unstable();
+            stream_ids.dedup();
 
             for id in stream_ids {
                 if self.streams.contains_key(&id) {

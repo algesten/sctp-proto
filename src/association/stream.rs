@@ -319,16 +319,13 @@ impl<'a> Stream<'a> {
         // stop() promises that future reads are not permitted. If a reset was
         // preserving unread boundary DATA, discard that old generation now so
         // its Finished event and unrelated association events cannot stall.
-        while self
+        if self
             .association
             .retiring_streams
             .contains_key(&self.stream_identifier)
         {
             self.association
-                .finish_retiring_stream(self.stream_identifier)?;
-            if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
-                s.state = ((s.state as u8) & 0x2).into();
-            }
+                .discard_retiring_streams(self.stream_identifier);
         }
 
         Ok(())
@@ -520,27 +517,6 @@ impl StreamState {
 
     pub(crate) fn handle_data(&mut self, pd: &ChunkPayloadData) -> Result<bool> {
         self.reassembly_queue.push(pd.clone())
-    }
-
-    pub(crate) fn handle_forward_tsn_for_ordered(&mut self, ssn: u16) {
-        if self.unordered {
-            return; // unordered chunks are handled by handleForwardUnordered method
-        }
-
-        // Remove all chunks older than or equal to the new TSN from
-        // the reassembly_queue.
-        self.reassembly_queue.forward_tsn_for_ordered(ssn);
-    }
-
-    pub(crate) fn handle_forward_tsn_for_unordered(&mut self, new_cumulative_tsn: u32) {
-        if !self.unordered {
-            return; // ordered chunks are handled by handleForwardTSNOrdered method
-        }
-
-        // Remove all chunks older than or equal to the new TSN from
-        // the reassembly_queue.
-        self.reassembly_queue
-            .forward_tsn_for_unordered(new_cumulative_tsn);
     }
 
     fn packetize(

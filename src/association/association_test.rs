@@ -74,6 +74,22 @@ fn insert_queued_reset(a: &mut Association, rsn: u32, stream_id: StreamId) {
     a.control_queue.push_back(packet);
 }
 
+fn reconfig_response_result(packets: &[Packet], rsn: u32) -> Option<ReconfigResult> {
+    packets.iter().find_map(|packet| {
+        packet.chunks.iter().find_map(|chunk| {
+            let reconfig = chunk.as_any().downcast_ref::<ChunkReconfig>()?;
+            reconfig
+                .param_a
+                .iter()
+                .chain(reconfig.param_b.iter())
+                .find_map(|param| {
+                    let response = param.as_any().downcast_ref::<ParamReconfigResponse>()?;
+                    (response.reconfig_response_sequence_number == rsn).then_some(response.result)
+                })
+        })
+    })
+}
+
 #[test]
 fn test_reconfig_in_progress_timeout_does_not_consume_retry_budget() -> Result<()> {
     let now = Instant::now();
@@ -1143,8 +1159,9 @@ fn test_data_above_deferred_reset_boundary_waits_for_new_generation() -> Result<
         "post-reset DATA must not be readable before the reset boundary arrives"
     );
 
-    // Once TSN 1 arrives, the old generation is reset and held TSN 2 is
-    // delivered into a newly created generation whose SSN starts at zero.
+    // Once TSN 1 arrives, its payload remains readable as the last message of
+    // the old generation. Held TSN 2 is released only after that generation is
+    // drained, into a newly created generation whose SSN starts at zero.
     a.handle_data(&ChunkPayloadData {
         tsn: 1,
         stream_identifier: stream_id,
@@ -1158,7 +1175,155 @@ fn test_data_above_deferred_reset_boundary_waits_for_new_generation() -> Result<
     let message = a.stream(stream_id)?.read()?.unwrap();
     let mut payload = [0; 3];
     assert_eq!(message.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"old");
+
+    let message = a.stream(stream_id)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(message.read(&mut payload)?, payload.len());
     assert_eq!(&payload, b"new");
+    Ok(())
+}
+
+#[test]
+fn test_reset_boundary_data_remains_readable_before_finished() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association {
+        state: AssociationState::Established,
+        peer_last_tsn: 0,
+        my_next_tsn: 1,
+        max_receive_buffer_size: 1024,
+        max_receive_message_size: 1024,
+        max_payload_size: 1200,
+        ..Default::default()
+    };
+    assert!(
+        a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
+            .is_some()
+    );
+
+    let request: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 7,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: 1,
+        stream_identifiers: vec![stream_id],
+    });
+    a.handle_reconfig_param(&request, &mut vec![])?;
+
+    a.handle_data(&ChunkPayloadData {
+        tsn: 1,
+        stream_identifier: stream_id,
+        stream_sequence_number: 0,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"last"),
+        ..Default::default()
+    })?;
+
+    loop {
+        match a.poll() {
+            Some(Event::Stream(StreamEvent::Readable { id })) if id == stream_id => break,
+            Some(Event::Stream(StreamEvent::Finished { id })) if id == stream_id => {
+                panic!("Finished must not overtake readable boundary DATA")
+            }
+            Some(_) => {}
+            None => panic!("missing Readable event for boundary DATA"),
+        }
+    }
+
+    assert!(
+        a.poll().is_none(),
+        "Finished must remain hidden until the readable boundary DATA is drained"
+    );
+
+    let message = a.stream(stream_id)?.read()?.unwrap();
+    let mut payload = [0; 4];
+    assert_eq!(message.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"last");
+    assert!(matches!(
+        core::iter::from_fn(|| a.poll()).find(|event| matches!(
+            event,
+            Event::Stream(StreamEvent::Finished { id }) if *id == stream_id
+        )),
+        Some(Event::Stream(StreamEvent::Finished { id })) if id == stream_id
+    ));
+    Ok(())
+}
+
+#[test]
+fn test_future_peer_reconfig_sequence_is_rejected() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association {
+        peer_last_tsn: 0,
+        peer_last_reconfig_rsn: 40,
+        peer_reconfig_rsn_initialized: true,
+        my_next_tsn: 1,
+        ..Default::default()
+    };
+    assert!(
+        a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
+            .is_some()
+    );
+
+    let future: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 42,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: a.peer_last_tsn,
+        stream_identifiers: vec![stream_id],
+    });
+    let mut reply = vec![];
+    a.handle_reconfig_param(&future, &mut reply)?;
+
+    assert_eq!(
+        reconfig_response_result(&reply, 42),
+        Some(ReconfigResult::ErrorBadSequenceNumber)
+    );
+    assert_eq!(a.peer_last_reconfig_rsn, 40);
+    assert!(a.max_completed_reconfig_rsn.is_none());
+    assert!(a.streams.contains_key(&stream_id));
+
+    let expected: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 41,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: a.peer_last_tsn,
+        stream_identifiers: vec![stream_id],
+    });
+    a.handle_reconfig_param(&expected, &mut vec![])?;
+    assert!(!a.streams.contains_key(&stream_id));
+    assert_eq!(a.max_completed_reconfig_rsn, Some(41));
+    Ok(())
+}
+
+#[test]
+fn test_peer_reconfig_sequence_accepts_wrap_to_zero() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association {
+        peer_last_tsn: 0,
+        peer_last_reconfig_rsn: u32::MAX,
+        peer_reconfig_rsn_initialized: true,
+        my_next_tsn: 1,
+        ..Default::default()
+    };
+    assert!(
+        a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
+            .is_some()
+    );
+
+    let request: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 0,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: a.peer_last_tsn,
+        stream_identifiers: vec![stream_id],
+    });
+    let mut reply = vec![];
+    a.handle_reconfig_param(&request, &mut reply)?;
+
+    assert_ne!(
+        reconfig_response_result(&reply, 0),
+        Some(ReconfigResult::ErrorBadSequenceNumber)
+    );
+    assert_eq!(a.peer_last_reconfig_rsn, 0);
+    assert_eq!(a.max_completed_reconfig_rsn, Some(0));
+    assert!(!a.streams.contains_key(&stream_id));
     Ok(())
 }
 

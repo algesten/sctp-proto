@@ -150,13 +150,25 @@ impl<'a> Stream<'a> {
     /// Returns EOF when the stream is reset or an error if the stream is closed
     /// otherwise.
     pub fn read_sctp(&mut self) -> Result<Option<Chunks>> {
-        if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
-            if s.state == RecvSendState::ReadWritable || s.state == RecvSendState::Readable {
-                return Ok(s.reassembly_queue.read());
-            }
+        let (message, drained) =
+            if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
+                if s.state != RecvSendState::ReadWritable && s.state != RecvSendState::Readable {
+                    return Err(Error::ErrStreamClosed);
+                }
+
+                let message = s.reassembly_queue.read();
+                let drained = message.is_some() && s.reassembly_queue.get_num_bytes() == 0;
+                (message, drained)
+            } else {
+                return Err(Error::ErrStreamClosed);
+            };
+
+        if drained {
+            self.association
+                .finish_retiring_stream(self.stream_identifier)?;
         }
 
-        Err(Error::ErrStreamClosed)
+        Ok(message)
     }
 
     /// write_sctp writes len(p) bytes from p to the DTLS connection

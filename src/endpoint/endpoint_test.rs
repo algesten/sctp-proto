@@ -2736,10 +2736,17 @@ fn test_assoc_reset_inprogress_completed_via_tsn_advance_then_retransmit() -> Re
     }
     pair.drive();
 
-    // The reset should have completed via TSN advance — stream 1 gone.
+    // The boundary DATA must remain readable even though the reset completed.
+    // Draining it retires the old stream generation.
+    let boundary_data = pair
+        .server_stream(server_ch, si)?
+        .read()?
+        .expect("boundary DATA should survive the reset");
+    assert_eq!(boundary_data.len(), b"payload".len());
+
     assert!(
         pair.server_stream(server_ch, si).is_err(),
-        "stream should be reset after TSN advance completes the InProgress request"
+        "stream should retire after its boundary DATA is drained"
     );
 
     // Step 3: Reopen stream 1 with the same ID.
@@ -2847,10 +2854,17 @@ fn test_assoc_reset_inprogress_reconfig_retransmission() -> Result<()> {
     // Let everything settle.
     pair.drive();
 
-    // The reset should have completed — stream 1 should be gone.
+    // The boundary DATA must remain readable even though the reset completed.
+    // Draining it retires the old stream generation.
+    let boundary_data = pair
+        .server_stream(server_ch, si)?
+        .read()?
+        .expect("boundary DATA should survive the reset");
+    assert_eq!(boundary_data.len(), b"payload".len());
+
     assert!(
         pair.server_stream(server_ch, si).is_err(),
-        "stream should be reset after InProgress retransmission completes"
+        "stream should retire after its boundary DATA is drained"
     );
 
     Ok(())

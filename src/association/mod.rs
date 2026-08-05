@@ -205,19 +205,25 @@ pub struct Association {
     /// Application-initiated resets waiting for the active request to finish.
     pending_reset_streams: VecDeque<StreamId>,
     reconfig_requests: FxHashMap<u32, ParamOutgoingResetRequest>,
-    /// DATA received above an InProgress reset boundary. The chunks remain in
-    /// `payload_queue` for TSN accounting but are withheld from stream
-    /// reassembly until the reset creates the next stream generation.
-    deferred_reset_tsns: FxHashSet<u32>,
+    /// DATA received above an InProgress reset boundary. A copy is retained
+    /// after cumulative TSN processing removes it from `payload_queue`, so it
+    /// can remain withheld until the old stream generation is drained.
+    deferred_reset_data: FxHashMap<u32, ChunkPayloadData>,
     max_completed_reconfig_rsn: Option<u32>,
     /// Re-configuration Request Sequence Number most recently accepted from
     /// the peer, initialized to the peer's initial TSN minus one.
     peer_last_reconfig_rsn: u32,
-    /// Stream ids for which `StreamEvent::Finished` has fired but whose terminal
+    /// Whether `peer_last_reconfig_rsn` has been initialized from an INIT or a
+    /// first request in test/manual construction.
+    peer_reconfig_rsn_initialized: bool,
+    /// Stream ids for which `StreamEvent::Finished` is queued but whose terminal
     /// reset event is still awaited.
     pending_reset_completions: PendingResetCompletions,
     /// Stream ids whose latest completed reset was unsuccessful.
     failed_reset_streams: FxHashSet<StreamId>,
+    /// Old stream generations that have received their final TSN but still
+    /// contain application-readable data.
+    retiring_streams: FxHashSet<StreamId>,
 
     // Non-RFC internal data
     remote_addr: SocketAddr,
@@ -308,11 +314,13 @@ impl Default for Association {
             active_reconfig: None,
             pending_reset_streams: VecDeque::default(),
             reconfig_requests: FxHashMap::default(),
-            deferred_reset_tsns: FxHashSet::default(),
+            deferred_reset_data: FxHashMap::default(),
             max_completed_reconfig_rsn: None,
             peer_last_reconfig_rsn: 0,
+            peer_reconfig_rsn_initialized: false,
             pending_reset_completions: PendingResetCompletions::default(),
             failed_reset_streams: FxHashSet::default(),
+            retiring_streams: FxHashSet::default(),
 
             // Non-RFC internal data
             remote_addr: SocketAddr::from_str("0.0.0.0:0").unwrap(),
@@ -579,6 +587,15 @@ impl Association {
     /// - a call was made to `handle_timeout`
     #[must_use]
     pub fn poll(&mut self) -> Option<Event> {
+        // A reset boundary can become cumulative after its DATA was made
+        // readable. Keep Finished (and every later event) behind that DATA so
+        // its documented "no more data can be read" guarantee remains true.
+        if let Some(Event::Stream(StreamEvent::Finished { id })) = self.events.front()
+            && self.retiring_streams.contains(id)
+        {
+            return None;
+        }
+
         if let Some(x) = self.events.pop_front() {
             return Some(x);
         }
@@ -826,10 +843,11 @@ impl Association {
             // AssociationLost stops any pending  ResetComplete.
             self.pending_reset_completions.clear();
             self.failed_reset_streams.clear();
+            self.retiring_streams.clear();
             self.pending_reset_streams.clear();
             self.reconfigs.clear();
             self.reconfig_requests.clear();
-            self.deferred_reset_tsns.clear();
+            self.deferred_reset_data.clear();
             self.control_queue.clear();
             self.active_reconfig = None;
             self.will_retransmit_reconfig = false;
@@ -1019,6 +1037,7 @@ impl Association {
     fn stream_reset_blocked(&self, stream_id: StreamId) -> bool {
         self.pending_reset_completions.contains(&stream_id)
             || self.failed_reset_streams.contains(&stream_id)
+            || self.retiring_streams.contains(&stream_id)
             || self.stream_reset_in_progress(stream_id)
     }
 
@@ -1144,6 +1163,39 @@ impl Association {
         }
     }
 
+    /// Queue the end of an incoming stream generation while preserving any
+    /// already-acknowledged DATA until the application drains it.
+    fn retire_stream(&mut self, stream_identifier: StreamId) {
+        let has_unread_data = self
+            .streams
+            .get(&stream_identifier)
+            .is_some_and(|stream| stream.get_num_bytes_in_reassembly_queue() != 0);
+
+        if !has_unread_data {
+            self.unregister_stream(stream_identifier, true);
+            return;
+        }
+
+        if self.retiring_streams.insert(stream_identifier) {
+            self.events.push_back(Event::Stream(StreamEvent::Finished {
+                id: stream_identifier,
+            }));
+            self.pending_reset_completions.insert(stream_identifier);
+        }
+    }
+
+    /// Drop a drained old generation and release DATA held for its successor.
+    pub(crate) fn finish_retiring_stream(&mut self, stream_identifier: StreamId) -> Result<()> {
+        if !self.retiring_streams.remove(&stream_identifier) {
+            return Ok(());
+        }
+
+        if let Some(mut stream) = self.streams.remove(&stream_identifier) {
+            stream.state = RecvSendState::Closed;
+        }
+        self.release_deferred_reset_data()
+    }
+
     /// set_state atomically sets the state of the Association.
     fn set_state(&mut self, new_state: AssociationState) {
         if new_state != self.state {
@@ -1178,6 +1230,7 @@ impl Association {
         // RFC 6525 §4: the peer's first request sequence number is its initial
         // TSN, so A4's initial response value is one less than that.
         self.peer_last_reconfig_rsn = initial_tsn.wrapping_sub(1);
+        self.peer_reconfig_rsn_initialized = true;
 
         self.rwnd = advertised_receiver_window_credit;
         debug!("[{}] initial rwnd={}", self.side, self.rwnd);
@@ -1586,10 +1639,11 @@ impl Association {
     }
 
     fn data_is_above_pending_reset(&self, d: &ChunkPayloadData) -> bool {
-        self.reconfig_requests.values().any(|request| {
-            Self::reset_request_affects_stream(request, d.stream_identifier)
-                && sna32gt(d.tsn, request.sender_last_tsn)
-        })
+        self.retiring_streams.contains(&d.stream_identifier)
+            || self.reconfig_requests.values().any(|request| {
+                Self::reset_request_affects_stream(request, d.stream_identifier)
+                    && sna32gt(d.tsn, request.sender_last_tsn)
+            })
     }
 
     fn deliver_deferred_reset_data(&mut self, d: &ChunkPayloadData) -> Result<()> {
@@ -1613,16 +1667,15 @@ impl Association {
 
     fn release_deferred_reset_data(&mut self) -> Result<()> {
         let ready: Vec<ChunkPayloadData> = self
-            .deferred_reset_tsns
-            .iter()
-            .filter_map(|tsn| self.payload_queue.get(*tsn))
+            .deferred_reset_data
+            .values()
             .filter(|chunk| !self.data_is_above_pending_reset(chunk))
             .cloned()
             .collect();
 
         for chunk in ready {
             self.deliver_deferred_reset_data(&chunk)?;
-            self.deferred_reset_tsns.remove(&chunk.tsn);
+            self.deferred_reset_data.remove(&chunk.tsn);
         }
 
         Ok(())
@@ -1689,7 +1742,7 @@ impl Association {
 
         if defer_stream_data {
             if self.payload_queue.push(d.clone(), self.peer_last_tsn) {
-                self.deferred_reset_tsns.insert(d.tsn);
+                self.deferred_reset_data.insert(d.tsn, d.clone());
             }
         } else if stream_handle_data {
             if let Some(s) = self.streams.get_mut(&d.stream_identifier) {
@@ -1901,7 +1954,7 @@ impl Association {
         while sna32lt(self.peer_last_tsn, c.new_cumulative_tsn) {
             let next_tsn = self.peer_last_tsn.wrapping_add(1);
             if let Some(chunk) = self.payload_queue.pop(next_tsn) {
-                self.deferred_reset_tsns.remove(&chunk.tsn);
+                self.deferred_reset_data.remove(&chunk.tsn);
             }
             self.peer_last_tsn = next_tsn;
         }
@@ -1964,7 +2017,7 @@ impl Association {
         while sna32lt(self.peer_last_tsn, c.new_cumulative_tsn) {
             let next_tsn = self.peer_last_tsn.wrapping_add(1);
             if let Some(chunk) = self.payload_queue.pop(next_tsn) {
-                self.deferred_reset_tsns.remove(&chunk.tsn);
+                self.deferred_reset_data.remove(&chunk.tsn);
             }
             self.peer_last_tsn = next_tsn;
         }
@@ -2075,8 +2128,11 @@ impl Association {
 
             self.reevaluate_pending_reset_requests(&mut reply)?;
 
-            if self.deferred_reset_tsns.remove(&chunk.tsn) {
-                self.deliver_deferred_reset_data(&chunk)?;
+            if let Some(deferred) = self.deferred_reset_data.get(&chunk.tsn).cloned() {
+                if !self.data_is_above_pending_reset(&deferred) {
+                    self.deliver_deferred_reset_data(&deferred)?;
+                    self.deferred_reset_data.remove(&chunk.tsn);
+                }
             }
         }
 
@@ -2130,20 +2186,41 @@ impl Association {
             {
                 // Retransmission of an already-completed request. Resend the response
                 // but do NOT reprocess stream resets (stream IDs may have been reused).
-                let packet = self.create_packet(vec![Box::new(ChunkReconfig {
-                    param_a: Some(Box::new(ParamReconfigResponse {
-                        reconfig_response_sequence_number: seq,
-                        result: ReconfigResult::SuccessPerformed,
-                    })),
-                    param_b: None,
-                })]);
-                reply.push(packet);
+                self.push_reconfig_response(reply, seq, ReconfigResult::SuccessPerformed);
                 return Ok(());
             }
-            self.peer_last_reconfig_rsn = seq;
-            self.reconfig_requests
-                .insert(p.reconfig_request_sequence_number, p.clone());
-            self.reset_streams_if_any(p, true, reply)?;
+
+            if !self.reconfig_requests.contains_key(&seq) {
+                // RFC 6525 section 5.2.2 E4: only the next expected peer
+                // request sequence number may start a new operation. A request
+                // already deferred in reconfig_requests is a retransmission and
+                // remains eligible for re-evaluation.
+                if !self.reconfig_requests.is_empty() {
+                    self.push_reconfig_response(
+                        reply,
+                        seq,
+                        ReconfigResult::ErrorRequestAlreadyInProgress,
+                    );
+                    return Ok(());
+                }
+
+                if self.peer_reconfig_rsn_initialized
+                    && seq != self.peer_last_reconfig_rsn.wrapping_add(1)
+                {
+                    self.push_reconfig_response(reply, seq, ReconfigResult::ErrorBadSequenceNumber);
+                    return Ok(());
+                }
+
+                self.peer_last_reconfig_rsn = seq;
+                self.peer_reconfig_rsn_initialized = true;
+                self.reconfig_requests.insert(seq, p.clone());
+            }
+
+            // Re-evaluate the original request for this RSN. This prevents a
+            // retransmission with altered stream identifiers or TSN boundary
+            // from changing an operation that is already in progress.
+            let request = self.reconfig_requests.get(&seq).cloned().unwrap();
+            self.reset_streams_if_any(&request, true, reply)?;
             // Update watermark only after successful completion (request
             // removed from reconfig_requests by reset_streams_if_any).
             if !self.reconfig_requests.contains_key(&seq) {
@@ -2182,6 +2259,21 @@ impl Association {
         } else {
             Err(Error::ErrParameterType)
         }
+    }
+
+    fn push_reconfig_response(
+        &self,
+        reply: &mut Vec<Packet>,
+        sequence_number: u32,
+        result: ReconfigResult,
+    ) {
+        reply.push(self.create_packet(vec![Box::new(ChunkReconfig {
+            param_a: Some(Box::new(ParamReconfigResponse {
+                reconfig_response_sequence_number: sequence_number,
+                result,
+            })),
+            param_b: None,
+        })]));
     }
 
     fn process_selective_ack(
@@ -2507,7 +2599,7 @@ impl Association {
             for id in stream_ids {
                 if self.streams.contains_key(&id) {
                     sis_to_reset.push(id);
-                    self.unregister_stream(id, true);
+                    self.retire_stream(id);
                 }
             }
             self.reconfig_requests
@@ -2640,10 +2732,8 @@ impl Association {
         for s in self.streams.values() {
             bytes_queued += s.get_num_bytes_in_reassembly_queue() as u32;
         }
-        for tsn in &self.deferred_reset_tsns {
-            if let Some(chunk) = self.payload_queue.get(*tsn) {
-                bytes_queued += chunk.user_data.len() as u32;
-            }
+        for chunk in self.deferred_reset_data.values() {
+            bytes_queued += chunk.user_data.len() as u32;
         }
 
         self.max_receive_buffer_size.saturating_sub(bytes_queued)

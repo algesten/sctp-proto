@@ -1884,6 +1884,50 @@ fn test_reordered_successor_waits_before_consuming_repeated_old_forward_tsn() ->
 }
 
 #[test]
+fn test_successor_forward_tsn_releases_covered_out_of_order_message() -> Result<()> {
+    let mut a = association_with_queued_second_reset()?;
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 2,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 1,
+            sequence: 0,
+        }],
+    })?;
+    a.handle_data(&ChunkPayloadData {
+        tsn: 5,
+        stream_identifier: 1,
+        stream_sequence_number: 1,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"one"),
+        ..Default::default()
+    })?;
+
+    // The sender did not receive the gap acknowledgement for TSN 5 and
+    // abandons both missing SSN 0 and the already-complete SSN 1.
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 5,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 1,
+            sequence: 1,
+        }],
+    })?;
+
+    let old = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(old.read(&mut payload)?, payload.len());
+
+    let successor = a
+        .stream(1)?
+        .read()?
+        .expect("the successor skip must release the complete covered message");
+    let mut payload = [0; 3];
+    assert_eq!(successor.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"one");
+    Ok(())
+}
+
+#[test]
 fn test_i_forward_tsn_skip_is_scoped_to_queued_reset_generation() -> Result<()> {
     let mut a = association_with_queued_second_reset()?;
     a.handle_i_forward_tsn(&ChunkIForwardTsn {

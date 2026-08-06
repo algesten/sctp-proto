@@ -1,4 +1,5 @@
 use super::{chunk_header::*, chunk_type::*, *};
+use crate::param::param_type::ParamType;
 use crate::param::{param_header::*, *};
 use crate::util::get_padding_size;
 
@@ -106,7 +107,26 @@ impl Chunk for ChunkReconfig {
     }
 
     fn check(&self) -> Result<()> {
-        Ok(())
+        let param_a = self
+            .param_a
+            .as_ref()
+            .ok_or(Error::ErrChunkReconfigInvalidParamA)?;
+        let Some(param_b) = &self.param_b else {
+            return Ok(());
+        };
+
+        let combination = (param_a.header().typ, param_b.header().typ);
+        if matches!(
+            combination,
+            (ParamType::OutSsnResetReq, ParamType::IncSsnResetReq)
+                | (ParamType::AddOutStreamsReq, ParamType::AddIncStreamsReq)
+                | (ParamType::ReconfigResp, ParamType::OutSsnResetReq)
+                | (ParamType::ReconfigResp, ParamType::ReconfigResp)
+        ) {
+            Ok(())
+        } else {
+            Err(Error::ErrChunkReconfigInvalidParamCombination)
+        }
     }
 
     fn value_length(&self) -> usize {

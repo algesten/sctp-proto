@@ -216,6 +216,10 @@ pub struct Association {
     // Reconfig
     my_next_rsn: u32,
     reconfigs: FxHashMap<u32, ChunkReconfig>,
+    /// Stream ids semantically covered by an outgoing reset. Reset-all stays
+    /// compact on the wire, so its completion ids cannot be recovered from the
+    /// serialized parameter itself.
+    reconfig_reset_streams: FxHashMap<u32, Vec<StreamId>>,
     /// The one request whose Re-configuration Timer is running.
     active_reconfig: Option<u32>,
     /// Application-initiated resets waiting for the active request to finish.
@@ -245,7 +249,7 @@ pub struct Association {
     /// Finished events already delivered to the application and therefore
     /// eligible to be followed by one terminal reset event.
     delivered_stream_finishes: PendingResetCompletions,
-    /// Ordered Forward-TSN updates that belong to a successor hidden behind a
+    /// Forward-TSN updates that belong to a successor hidden behind a
     /// still-readable stream generation.
     deferred_forward_tsns: FxHashMap<StreamId, VecDeque<DeferredForwardTsn>>,
 
@@ -335,6 +339,7 @@ impl Default for Association {
             // Reconfig
             my_next_rsn: 0,
             reconfigs: FxHashMap::default(),
+            reconfig_reset_streams: FxHashMap::default(),
             active_reconfig: None,
             pending_reset_streams: VecDeque::default(),
             reconfig_requests: FxHashMap::default(),
@@ -935,6 +940,7 @@ impl Association {
             self.deferred_forward_tsns.clear();
             self.pending_reset_streams.clear();
             self.reconfigs.clear();
+            self.reconfig_reset_streams.clear();
             self.reconfig_requests.clear();
             self.deferred_reset_data.clear();
             self.control_queue.clear();
@@ -1074,8 +1080,18 @@ impl Association {
             // Requests are serialized, so a success supersedes any older failure
             // for the same stream id. A newer pending generation still blocks reuse.
             self.failed_reset_streams.remove(&id);
-            if !self.stream_reset_blocked(id) {
-                if let Some(stream) = self.streams.get_mut(&id) {
+            let reset_blocked = self.stream_reset_blocked(id);
+            if !reset_blocked {
+                let application_closed = notify
+                    && self.streams.get(&id).is_some_and(|stream| {
+                        matches!(
+                            stream.state,
+                            RecvSendState::Closed | RecvSendState::Writable
+                        )
+                    });
+                if application_closed {
+                    self.unregister_stream(id, false);
+                } else if let Some(stream) = self.streams.get_mut(&id) {
                     // RFC 6525 section 5.2.7 H4 resets the outgoing SSN. Do not
                     // alter `state`: a protocol reset must never undo an
                     // application-level `Stream::finish()`.
@@ -1216,11 +1232,15 @@ impl Association {
             return false;
         }
 
-        let ids = self
+        let fallback_ids = self
             .reconfigs
             .remove(&rsn)
             .map(|c| Self::reconfig_stream_ids(&c))
             .unwrap_or_default();
+        let ids = self
+            .reconfig_reset_streams
+            .remove(&rsn)
+            .unwrap_or(fallback_ids);
         self.active_reconfig = None;
         self.will_retransmit_reconfig = false;
         self.timers.stop(Timer::Reconfig);
@@ -1871,41 +1891,22 @@ impl Association {
             || current_boundary == self.pending_reset_boundary(stream_identifier)
     }
 
-    fn repeated_ordered_forward_tsn_boundary(
-        &self,
-        stream_identifier: StreamId,
-        last_ssn: u16,
-    ) -> Option<u32> {
-        let boundaries = self.retiring_streams.get(&stream_identifier)?;
-        self.deferred_forward_tsns
-            .get(&stream_identifier)?
-            .iter()
-            .rev()
-            .find_map(|update| match update {
-                DeferredForwardTsn {
-                    generation_boundary: Some(boundary),
-                    kind:
-                        DeferredForwardTsnKind::Ordered {
-                            last_ssn: previous_ssn,
-                        },
-                } if *previous_ssn == last_ssn && boundaries.contains(boundary) => Some(*boundary),
-                _ => None,
-            })
-    }
-
     fn apply_or_defer_ordered_forward_tsn(&mut self, stream_identifier: StreamId, last_ssn: u16) {
         if !self.forward_tsn_applies_to_current_generation(stream_identifier) {
-            let generation_boundary =
-                self.pending_reset_boundary(stream_identifier).or_else(|| {
-                    self.repeated_ordered_forward_tsn_boundary(stream_identifier, last_ssn)
-                });
+            let generation_boundary = self.pending_reset_boundary(stream_identifier);
+            let kind = DeferredForwardTsnKind::Ordered { last_ssn };
             self.deferred_forward_tsns
                 .entry(stream_identifier)
                 .or_default()
                 .push_back(DeferredForwardTsn {
                     generation_boundary,
-                    kind: DeferredForwardTsnKind::Ordered { last_ssn },
+                    kind,
                 });
+            self.prune_deferred_reset_data_for_forward_tsn(
+                stream_identifier,
+                generation_boundary,
+                kind,
+            );
             return;
         }
 
@@ -1931,13 +1932,41 @@ impl Association {
     ) {
         if !self.forward_tsn_applies_to_current_generation(stream_identifier) {
             let generation_boundary = self.pending_reset_boundary(stream_identifier);
-            self.deferred_forward_tsns
-                .entry(stream_identifier)
-                .or_default()
-                .push_back(DeferredForwardTsn {
-                    generation_boundary,
-                    kind: DeferredForwardTsnKind::Unordered { new_cumulative_tsn },
-                });
+            let effective_cumulative_tsn = {
+                let updates = self
+                    .deferred_forward_tsns
+                    .entry(stream_identifier)
+                    .or_default();
+                if let Some(previous_cumulative_tsn) = updates.iter_mut().find_map(|update| {
+                    if update.generation_boundary != generation_boundary {
+                        return None;
+                    }
+                    match &mut update.kind {
+                        DeferredForwardTsnKind::Unordered { new_cumulative_tsn } => {
+                            Some(new_cumulative_tsn)
+                        }
+                        DeferredForwardTsnKind::Ordered { .. } => None,
+                    }
+                }) {
+                    if sna32lt(*previous_cumulative_tsn, new_cumulative_tsn) {
+                        *previous_cumulative_tsn = new_cumulative_tsn;
+                    }
+                    *previous_cumulative_tsn
+                } else {
+                    updates.push_back(DeferredForwardTsn {
+                        generation_boundary,
+                        kind: DeferredForwardTsnKind::Unordered { new_cumulative_tsn },
+                    });
+                    new_cumulative_tsn
+                }
+            };
+            self.prune_deferred_reset_data_for_forward_tsn(
+                stream_identifier,
+                generation_boundary,
+                DeferredForwardTsnKind::Unordered {
+                    new_cumulative_tsn: effective_cumulative_tsn,
+                },
+            );
             return;
         }
 
@@ -2019,6 +2048,66 @@ impl Association {
         }
     }
 
+    /// Release receive-window credit for incomplete successor messages that a
+    /// deferred Forward-TSN has abandoned. Complete messages remain available
+    /// when that stream generation is eventually exposed to the application.
+    fn prune_deferred_reset_data_for_forward_tsn(
+        &mut self,
+        stream_identifier: StreamId,
+        generation_boundary: Option<u32>,
+        kind: DeferredForwardTsnKind,
+    ) {
+        let mut chunks: Vec<ChunkPayloadData> = self
+            .deferred_reset_data
+            .values()
+            .filter(|chunk| {
+                chunk.stream_identifier == stream_identifier
+                    && self
+                        .deferred_generation_bounds(stream_identifier, chunk.tsn)
+                        .is_some_and(|(_, upper)| upper == generation_boundary)
+            })
+            .cloned()
+            .collect();
+        if chunks.is_empty() {
+            return;
+        }
+
+        chunks.sort_unstable_by_key(|chunk| {
+            self.deferred_generation_bounds(stream_identifier, chunk.tsn)
+                .map(|(lower, _)| chunk.tsn.wrapping_sub(lower))
+                .unwrap_or_default()
+        });
+        let targeted_tsns: FxHashSet<u32> = chunks.iter().map(|chunk| chunk.tsn).collect();
+
+        let mut queue = ReassemblyQueue::new(stream_identifier, self.max_receive_message_size);
+        for chunk in chunks {
+            // These chunks were validated before being retained. If rebuilding
+            // their generation unexpectedly fails, keep the data conservatively.
+            if queue.push(chunk).is_err() {
+                return;
+            }
+        }
+        match kind {
+            DeferredForwardTsnKind::Ordered { last_ssn } => {
+                queue.forward_tsn_for_ordered(last_ssn);
+            }
+            DeferredForwardTsnKind::Unordered { new_cumulative_tsn } => {
+                queue.forward_tsn_for_unordered(new_cumulative_tsn);
+            }
+        }
+
+        let retained_tsns: FxHashSet<u32> = queue
+            .ordered
+            .iter()
+            .chain(&queue.unordered)
+            .flat_map(|chunks| chunks.chunks.iter())
+            .chain(queue.unordered_chunks.iter())
+            .map(|chunk| chunk.tsn)
+            .collect();
+        self.deferred_reset_data
+            .retain(|tsn, _| !targeted_tsns.contains(tsn) || retained_tsns.contains(tsn));
+    }
+
     fn deliver_deferred_reset_data(&mut self, d: &ChunkPayloadData) -> Result<()> {
         if self.get_or_create_stream(d.stream_identifier).is_none() {
             debug!("[{}] discard {}", self.side, d.stream_sequence_number);
@@ -2081,8 +2170,10 @@ impl Association {
             .into_iter()
             .flat_map(|boundaries| boundaries.iter().copied())
             .collect();
-        if boundaries.is_empty() {
-            boundaries.extend(pending_boundary);
+        if let Some(pending_boundary) = pending_boundary {
+            if boundaries.last().copied() != Some(pending_boundary) {
+                boundaries.push(pending_boundary);
+            }
         }
 
         let mut lower = *boundaries.first()?;
@@ -2171,7 +2262,6 @@ impl Association {
             }
         } else if can_push {
             if self.get_or_create_stream(d.stream_identifier).is_some() {
-                self.apply_deferred_forward_tsns(d.stream_identifier);
                 if self.get_my_receiver_window_credit() > 0 {
                     // Pass the new chunk to stream level as soon as it arrives
                     stream_handle_data = true;
@@ -2220,6 +2310,10 @@ impl Association {
                     }))
                 }
             }
+            // A deferred skip may describe this successor generation. Queue
+            // DATA first so a complete message reusing the skipped SSN remains
+            // readable, while a genuinely abandoned SSN can still be advanced.
+            self.apply_deferred_forward_tsns(d.stream_identifier);
         }
 
         self.handle_peer_last_tsn_and_acknowledgement(immediate_sack)
@@ -2431,7 +2525,7 @@ impl Association {
             self.apply_or_defer_ordered_forward_tsn(forwarded.identifier, forwarded.sequence);
         }
 
-        // TSN may be forewared for unordered chunks. ForwardTSN chunk does not
+        // TSN may be forwarded for unordered chunks. ForwardTSN chunk does not
         // report which stream identifier it skipped for unordered chunks.
         // Therefore, we need to broadcast this event to all existing streams for
         // unordered chunks.
@@ -2699,6 +2793,7 @@ impl Association {
             // without counting toward the retransmission limit.
             if p.result == ReconfigResult::InProgress {
                 if self.reconfigs.contains_key(&rsn) {
+                    self.will_retransmit_reconfig = false;
                     // Pause without resetting the existing retry count. The outbound
                     // poll starts it again and the next expiry is exempted by H2.
                     self.timers.set(Timer::Reconfig, None);
@@ -3084,13 +3179,16 @@ impl Association {
         if !sis_to_reset.is_empty() {
             let rsn = self.generate_next_rsn();
             let tsn = self.my_next_tsn.wrapping_sub(1);
+            let reset_all = p.stream_identifiers.is_empty();
+            self.reconfig_reset_streams
+                .insert(rsn, sis_to_reset.clone());
 
             let c = ChunkReconfig {
                 param_a: Some(Box::new(ParamOutgoingResetRequest {
                     reconfig_request_sequence_number: rsn,
                     reconfig_response_sequence_number: p.reconfig_request_sequence_number,
                     sender_last_tsn: tsn,
-                    stream_identifiers: sis_to_reset,
+                    stream_identifiers: if reset_all { vec![] } else { sis_to_reset },
                 })),
                 ..Default::default()
             };
@@ -3392,6 +3490,7 @@ impl Association {
                 self.side, rsn, tsn, stream_ids
             );
 
+            self.reconfig_reset_streams.insert(rsn, stream_ids.clone());
             let c = ChunkReconfig {
                 param_a: Some(Box::new(ParamOutgoingResetRequest {
                     reconfig_request_sequence_number: rsn,

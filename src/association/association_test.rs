@@ -1811,8 +1811,8 @@ fn assert_abandoned_unordered_fragment_is_discarded(mut a: Association) -> Resul
     assert_eq!(
         a.streams
             .get(&1)
-            .unwrap()
-            .get_num_bytes_in_reassembly_queue(),
+            .map(StreamState::get_num_bytes_in_reassembly_queue)
+            .unwrap_or_default(),
         0,
         "an abandoned partial unordered message must not survive replay"
     );
@@ -2374,14 +2374,24 @@ fn test_empty_reset_stream_list_resets_all_streams() -> Result<()> {
         a.streams.is_empty(),
         "an omitted stream list means all streams"
     );
-    let mut reciprocal_ids = a
+    let reciprocal_ids = a
         .reconfigs
         .values()
         .next()
         .map(Association::reconfig_stream_ids)
         .unwrap_or_default();
-    reciprocal_ids.sort_unstable();
-    assert_eq!(reciprocal_ids, vec![1, 2]);
+    assert!(
+        reciprocal_ids.is_empty(),
+        "reset-all must remain compact on the wire"
+    );
+    let mut completion_ids = a
+        .reconfig_reset_streams
+        .values()
+        .next()
+        .cloned()
+        .unwrap_or_default();
+    completion_ids.sort_unstable();
+    assert_eq!(completion_ids, vec![1, 2]);
     Ok(())
 }
 

@@ -1,5 +1,7 @@
 # Unreleased
 
+# 0.10.3
+
   * Fix stream reset completion, failure reporting, and request serialization #54
 
 # 0.10.2

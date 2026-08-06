@@ -15,6 +15,16 @@ use log::{debug, error, trace};
 /// Identifier for a stream within a particular association
 pub type StreamId = u16;
 
+/// Why a stream reset did not complete successfully.
+#[non_exhaustive]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum StreamResetError {
+    /// The peer explicitly denied the reset request.
+    Denied,
+    /// The reset failed because of a protocol error or exhausted retransmissions.
+    Failed,
+}
+
 /// Application events about streams
 #[non_exhaustive]
 #[derive(Debug, PartialEq, Eq)]
@@ -42,18 +52,30 @@ pub enum StreamEvent {
     ///
     /// No more data can be read from or written to it.
     ///
-    /// Once this fires, [`StreamEvent::ResetComplete`] for the same id is
-    /// guaranteed to eventually follow, unless the association closes first.
+    /// Once this fires, either [`StreamEvent::ResetComplete`] or
+    /// [`StreamEvent::ResetFailed`] for the same id is guaranteed to eventually
+    /// follow, unless the association closes first.
     Finished {
         /// Which stream has been finished
         id: StreamId,
     },
-    /// The reset handshake involving this stream id has fully
-    /// completed and the id can be reused and
-    /// `[Association::open_stream]` stop failing.
+    /// A reset handshake involving this stream id completed successfully.
+    ///
+    /// The id can be reused unless a newer reset for the same id has since
+    /// started or failed.
     ResetComplete {
-        /// Which stream id has become reusable
+        /// Which stream id completed its reset.
         id: StreamId,
+    },
+    /// A reset handshake involving this stream id did not complete.
+    ///
+    /// The id remains unavailable for reuse until a later reset succeeds or
+    /// the association closes.
+    ResetFailed {
+        /// Which stream id failed to reset.
+        id: StreamId,
+        /// Why the reset did not complete.
+        reason: StreamResetError,
     },
     /// The peer asked us to stop sending on an outgoing stream
     Stopped {
@@ -128,13 +150,25 @@ impl<'a> Stream<'a> {
     /// Returns EOF when the stream is reset or an error if the stream is closed
     /// otherwise.
     pub fn read_sctp(&mut self) -> Result<Option<Chunks>> {
-        if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
-            if s.state == RecvSendState::ReadWritable || s.state == RecvSendState::Readable {
-                return Ok(s.reassembly_queue.read());
-            }
+        let (message, drained) =
+            if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
+                if s.state != RecvSendState::ReadWritable && s.state != RecvSendState::Readable {
+                    return Err(Error::ErrStreamClosed);
+                }
+
+                let message = s.reassembly_queue.read();
+                let drained = message.is_some() && s.reassembly_queue.get_num_bytes() == 0;
+                (message, drained)
+            } else {
+                return Err(Error::ErrStreamClosed);
+            };
+
+        if drained {
+            self.association
+                .finish_retiring_stream(self.stream_identifier)?;
         }
 
-        Err(Error::ErrStreamClosed)
+        Ok(message)
     }
 
     /// write_sctp writes len(p) bytes from p to the DTLS connection
@@ -234,6 +268,16 @@ impl<'a> Stream<'a> {
     }
 
     pub fn is_writable(&self) -> bool {
+        // RFC 6525 section 5.1.2 A1 forbids assigning new SSNs while an
+        // Outgoing SSN Reset Request for this stream is pending. A failed
+        // reset also quarantines the outgoing direction because the peer may
+        // already have reset its corresponding incoming stream.
+        if self
+            .association
+            .stream_reset_blocked(self.stream_identifier)
+        {
+            return false;
+        }
         if let Some(s) = self.association.streams.get(&self.stream_identifier) {
             s.state == RecvSendState::Writable || s.state == RecvSendState::ReadWritable
         } else {
@@ -245,8 +289,13 @@ impl<'a> Stream<'a> {
     /// Future calls to read are not permitted after calling stop.
     ///    
     /// NOTE: a stream closed without a queued reset never produces
-    /// `StreamEvent::Finished` / `StreamEvent::ResetComplete`.
+    /// `StreamEvent::Finished` followed by `StreamEvent::ResetComplete` or
+    /// `StreamEvent::ResetFailed`.
     pub fn stop(&mut self) -> Result<()> {
+        let retiring = self
+            .association
+            .retiring_streams
+            .contains_key(&self.stream_identifier);
         let reset = self
             .association
             .streams
@@ -255,7 +304,12 @@ impl<'a> Stream<'a> {
                 s.state == RecvSendState::Readable || s.state == RecvSendState::ReadWritable
             });
 
-        if reset {
+        if reset
+            && !retiring
+            && !self
+                .association
+                .stream_reset_in_progress(self.stream_identifier)
+        {
             // Reset the outgoing stream
             // https://tools.ietf.org/html/rfc6525
             //
@@ -269,6 +323,14 @@ impl<'a> Stream<'a> {
 
         if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
             s.state = ((s.state as u8) & 0x2).into();
+        }
+
+        // stop() promises that future reads are not permitted. If a reset was
+        // preserving unread boundary DATA, discard that old generation now so
+        // its Finished event and unrelated association events cannot stall.
+        if retiring {
+            self.association
+                .discard_retiring_streams(self.stream_identifier);
         }
 
         Ok(())
@@ -460,27 +522,6 @@ impl StreamState {
 
     pub(crate) fn handle_data(&mut self, pd: &ChunkPayloadData) -> Result<bool> {
         self.reassembly_queue.push(pd.clone())
-    }
-
-    pub(crate) fn handle_forward_tsn_for_ordered(&mut self, ssn: u16) {
-        if self.unordered {
-            return; // unordered chunks are handled by handleForwardUnordered method
-        }
-
-        // Remove all chunks older than or equal to the new TSN from
-        // the reassembly_queue.
-        self.reassembly_queue.forward_tsn_for_ordered(ssn);
-    }
-
-    pub(crate) fn handle_forward_tsn_for_unordered(&mut self, new_cumulative_tsn: u32) {
-        if !self.unordered {
-            return; // ordered chunks are handled by handleForwardTSNOrdered method
-        }
-
-        // Remove all chunks older than or equal to the new TSN from
-        // the reassembly_queue.
-        self.reassembly_queue
-            .forward_tsn_for_unordered(new_cumulative_tsn);
     }
 
     fn packetize(

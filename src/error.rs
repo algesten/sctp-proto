@@ -78,6 +78,8 @@ pub enum Error {
     ErrParamPacketTooShort,
     #[error("outgoing SSN reset request parameter too short")]
     ErrSsnResetRequestParamTooShort,
+    #[error("outgoing SSN reset request parameter has an invalid length")]
+    ErrSsnResetRequestParamInvalidLength,
     #[error("reconfig response parameter too short")]
     ErrReconfigRespParamTooShort,
     #[error("invalid algorithm type")]
@@ -117,6 +119,8 @@ pub enum Error {
     ErrChunkTypeNotReconfig,
     #[error("ChunkReconfig has invalid ParamA")]
     ErrChunkReconfigInvalidParamA,
+    #[error("ChunkReconfig has an unsupported parameter combination")]
+    ErrChunkReconfigInvalidParamCombination,
 
     #[error("failed to parse param type")]
     ErrChunkParseParamTypeFailed,

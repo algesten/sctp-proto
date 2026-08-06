@@ -31,11 +31,13 @@ use crate::param::param_outgoing_reset_request::ParamOutgoingResetRequest;
 use crate::param::param_reconfig_response::{ParamReconfigResponse, ReconfigResult};
 use crate::param::param_state_cookie::ParamStateCookie;
 use crate::param::param_supported_extensions::ParamSupportedExtensions;
-use crate::queue::{payload_queue::PayloadQueue, pending_queue::PendingQueue};
+use crate::queue::payload_queue::PayloadQueue;
+use crate::queue::pending_queue::PendingQueue;
+use crate::queue::reassembly_queue::ReassemblyQueue;
 use crate::shared::{AssociationEventInner, AssociationId, EndpointEvent, EndpointEventInner};
 use crate::util::{sna16lt, sna32gt, sna32gte, sna32lt, sna32lte};
 use crate::{AssociationEvent, Payload, Side, Transmit};
-use stream::{ReliabilityType, Stream, StreamEvent, StreamId, StreamState};
+use stream::{ReliabilityType, Stream, StreamEvent, StreamId, StreamResetError, StreamState};
 use timer::{ACK_INTERVAL, RtoManager, Timer, TimerTable};
 
 use crate::association::stream::RecvSendState;
@@ -52,7 +54,7 @@ use core::str::FromStr;
 use core::time::Duration;
 use log::{debug, error, trace, warn};
 use rand::random;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 use std::time::Instant;
 use thiserror::Error;
@@ -121,8 +123,8 @@ pub enum Event {
     DatagramReceived,
 }
 
-/// Multiset of stream ids owing a [`StreamEvent::ResetComplete`].
-/// Each `Finished` for an id arms one completion, a re-created id is a distinct
+/// Multiset of stream ids owing a terminal reset event.
+/// Each `Finished` for an id arms one result, a re-created id is a distinct
 /// generation and owes its own.
 #[derive(Debug, Default)]
 struct PendingResetCompletions(FxHashMap<StreamId, usize>);
@@ -138,18 +140,40 @@ impl PendingResetCompletions {
     }
 
     /// Consume one armed completion for this id.
-    fn take_one(&mut self, id: StreamId) {
+    fn take_one(&mut self, id: StreamId) -> bool {
         if let Some(count) = self.0.get_mut(&id) {
             *count -= 1;
             if *count == 0 {
                 self.0.remove(&id);
             }
+            true
+        } else {
+            false
         }
     }
 
     fn clear(&mut self) {
         self.0.clear();
     }
+}
+
+#[derive(Debug, Copy, Clone)]
+enum DeferredForwardTsnKind {
+    Ordered {
+        last_ssn: u16,
+        new_cumulative_tsn: u32,
+    },
+    Unordered {
+        new_cumulative_tsn: u32,
+    },
+}
+
+#[derive(Debug, Copy, Clone)]
+struct DeferredForwardTsn {
+    /// The reset boundary ending the generation this update belongs to.
+    /// None identifies the active tail generation after all accepted resets.
+    generation_boundary: Option<u32>,
+    kind: DeferredForwardTsnKind,
 }
 
 ///Association represents an SCTP association
@@ -197,11 +221,42 @@ pub struct Association {
     // Reconfig
     my_next_rsn: u32,
     reconfigs: FxHashMap<u32, ChunkReconfig>,
+    /// Stream ids semantically covered by an outgoing reset. Reset-all stays
+    /// compact on the wire, so its completion ids cannot be recovered from the
+    /// serialized parameter itself.
+    reconfig_reset_streams: FxHashMap<u32, Vec<StreamId>>,
+    /// The one request whose Re-configuration Timer is running.
+    active_reconfig: Option<u32>,
+    /// Application-initiated resets waiting for the active request to finish.
+    pending_reset_streams: VecDeque<StreamId>,
     reconfig_requests: FxHashMap<u32, ParamOutgoingResetRequest>,
+    /// DATA received above an InProgress reset boundary. A copy is retained
+    /// after cumulative TSN processing removes it from `payload_queue`, so it
+    /// can remain withheld until the old stream generation is drained.
+    deferred_reset_data: FxHashMap<u32, ChunkPayloadData>,
     max_completed_reconfig_rsn: Option<u32>,
-    /// Stream ids for which `StreamEvent::Finished` has fired but whose
-    /// `StreamEvent::ResetComplete` is still awaited.
+    /// Re-configuration Request Sequence Number most recently accepted from
+    /// the peer, initialized to the peer's initial TSN minus one.
+    peer_last_reconfig_rsn: u32,
+    /// Whether `peer_last_reconfig_rsn` has been initialized from an INIT or a
+    /// first request in test/manual construction.
+    peer_reconfig_rsn_initialized: bool,
+    /// Stream ids for which `StreamEvent::Finished` is queued but whose terminal
+    /// reset event is still awaited.
     pending_reset_completions: PendingResetCompletions,
+    /// Stream ids whose latest completed reset was unsuccessful.
+    failed_reset_streams: FxHashSet<StreamId>,
+    /// Reset boundaries for generations that cannot finish until an older
+    /// application-readable generation with the same stream id is drained.
+    retiring_streams: FxHashMap<StreamId, VecDeque<u32>>,
+    /// Number of queued Finished events whose generation has actually drained.
+    ready_stream_finishes: PendingResetCompletions,
+    /// Finished events already delivered to the application and therefore
+    /// eligible to be followed by one terminal reset event.
+    delivered_stream_finishes: PendingResetCompletions,
+    /// Forward-TSN updates that belong to a successor hidden behind a
+    /// still-readable stream generation.
+    deferred_forward_tsns: FxHashMap<StreamId, VecDeque<DeferredForwardTsn>>,
 
     // Non-RFC internal data
     remote_addr: SocketAddr,
@@ -289,9 +344,20 @@ impl Default for Association {
             // Reconfig
             my_next_rsn: 0,
             reconfigs: FxHashMap::default(),
+            reconfig_reset_streams: FxHashMap::default(),
+            active_reconfig: None,
+            pending_reset_streams: VecDeque::default(),
             reconfig_requests: FxHashMap::default(),
+            deferred_reset_data: FxHashMap::default(),
             max_completed_reconfig_rsn: None,
+            peer_last_reconfig_rsn: 0,
+            peer_reconfig_rsn_initialized: false,
             pending_reset_completions: PendingResetCompletions::default(),
+            failed_reset_streams: FxHashSet::default(),
+            retiring_streams: FxHashMap::default(),
+            ready_stream_finishes: PendingResetCompletions::default(),
+            delivered_stream_finishes: PendingResetCompletions::default(),
+            deferred_forward_tsns: FxHashMap::default(),
 
             // Non-RFC internal data
             remote_addr: SocketAddr::from_str("0.0.0.0:0").unwrap(),
@@ -558,7 +624,75 @@ impl Association {
     /// - a call was made to `handle_timeout`
     #[must_use]
     pub fn poll(&mut self) -> Option<Event> {
-        if let Some(x) = self.events.pop_front() {
+        // A reset boundary can become cumulative after its DATA was made
+        // readable. Keep events for that stream generation behind Finished,
+        // while allowing unrelated association and stream events to progress.
+        let mut blocked_streams = FxHashSet::default();
+        let mut selected = None;
+        for (index, event) in self.events.iter().enumerate() {
+            if let Event::Stream(StreamEvent::Finished { id }) = event {
+                if self.state != AssociationState::Closed
+                    && !self.ready_stream_finishes.contains(id)
+                {
+                    blocked_streams.insert(*id);
+                    continue;
+                }
+            }
+
+            if let Event::Stream(stream_event) = event {
+                let stream_id = match stream_event {
+                    StreamEvent::Opened { id }
+                    | StreamEvent::Readable { id }
+                    | StreamEvent::Writable { id }
+                    | StreamEvent::Finished { id }
+                    | StreamEvent::ResetComplete { id }
+                    | StreamEvent::ResetFailed { id, .. }
+                    | StreamEvent::Stopped { id, .. }
+                    | StreamEvent::BufferedAmountLow { id }
+                    | StreamEvent::BufferedAmountHigh { id } => Some(*id),
+                    StreamEvent::Available => None,
+                };
+                if let Some(stream_id) = stream_id {
+                    if blocked_streams.contains(&stream_id) {
+                        let terminal_for_delivered_generation =
+                            matches!(
+                                stream_event,
+                                StreamEvent::ResetComplete { .. } | StreamEvent::ResetFailed { .. }
+                            ) && self.delivered_stream_finishes.contains(&stream_id);
+                        let readable_current_generation = matches!(
+                            stream_event,
+                            StreamEvent::Opened { .. } | StreamEvent::Readable { .. }
+                        );
+                        if !terminal_for_delivered_generation && !readable_current_generation {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            selected = Some(index);
+            break;
+        }
+
+        if let Some(index) = selected {
+            let x = self
+                .events
+                .remove(index)
+                .expect("selected event must exist");
+            match &x {
+                Event::Stream(StreamEvent::Finished { id }) => {
+                    self.ready_stream_finishes.take_one(*id);
+                    if self.state != AssociationState::Closed {
+                        self.delivered_stream_finishes.insert(*id);
+                    }
+                }
+                Event::Stream(
+                    StreamEvent::ResetComplete { id } | StreamEvent::ResetFailed { id, .. },
+                ) => {
+                    self.delivered_stream_finishes.take_one(*id);
+                }
+                _ => {}
+            }
             return Some(x);
         }
 
@@ -804,6 +938,19 @@ impl Association {
 
             // AssociationLost stops any pending  ResetComplete.
             self.pending_reset_completions.clear();
+            self.failed_reset_streams.clear();
+            self.retiring_streams.clear();
+            self.ready_stream_finishes.clear();
+            self.delivered_stream_finishes.clear();
+            self.deferred_forward_tsns.clear();
+            self.pending_reset_streams.clear();
+            self.reconfigs.clear();
+            self.reconfig_reset_streams.clear();
+            self.reconfig_requests.clear();
+            self.deferred_reset_data.clear();
+            self.control_queue.clear();
+            self.active_reconfig = None;
+            self.will_retransmit_reconfig = false;
 
             self.events.push_back(Event::AssociationLost {
                 reason: AssociationError::AssociationClosed,
@@ -850,7 +997,7 @@ impl Association {
             return Err(Error::ErrStreamAlreadyExist);
         }
 
-        if self.has_pending_reset_for_stream(stream_identifier) {
+        if self.stream_reset_blocked(stream_identifier) {
             return Err(Error::ErrStreamResetPending);
         }
 
@@ -930,20 +1077,50 @@ impl Association {
         self.set_max_send_message_size(value)
     }
 
-    /// Push [`StreamEvent::ResetComplete`] for each candidate id whose reset
-    /// handshake has completed, `Finished` must have been already fired for it
-    /// and no pending outgoing RE-CONFIG names it.
+    /// Push one [`StreamEvent::ResetComplete`] for each candidate id whose reset
+    /// handshake has completed and `Finished` has already been fired for it.
     fn emit_reset_complete(&mut self, ids: impl IntoIterator<Item = StreamId>) {
         for id in ids {
-            // An id with a reset still pending must stay armed,
-            // so only disarm once nothing is pending.
-            if self.pending_reset_completions.contains(&id)
-                && !self.has_pending_reset_for_stream(id)
-            {
-                self.pending_reset_completions.take_one(id);
+            let notify = self.pending_reset_completions.take_one(id);
+            // Requests are serialized, so a success supersedes any older failure
+            // for the same stream id. A newer pending generation still blocks reuse.
+            self.failed_reset_streams.remove(&id);
+            let reset_blocked = self.stream_reset_blocked(id);
+            if !reset_blocked {
+                let application_closed = notify
+                    && self.streams.get(&id).is_some_and(|stream| {
+                        matches!(
+                            stream.state,
+                            RecvSendState::Closed | RecvSendState::Writable
+                        )
+                    });
+                if application_closed {
+                    self.unregister_stream(id, false);
+                } else if let Some(stream) = self.streams.get_mut(&id) {
+                    // RFC 6525 section 5.2.7 H4 resets the outgoing SSN. Do not
+                    // alter `state`: a protocol reset must never undo an
+                    // application-level `Stream::finish()`.
+                    stream.sequence_number = 0;
+                }
+            }
+            if notify {
                 self.events
                     .push_back(Event::Stream(StreamEvent::ResetComplete { id }));
             }
+        }
+    }
+
+    /// Report a terminal reset failure and keep the stream id quarantined.
+    fn emit_reset_failed(
+        &mut self,
+        ids: impl IntoIterator<Item = StreamId>,
+        reason: StreamResetError,
+    ) {
+        for id in ids {
+            self.pending_reset_completions.take_one(id);
+            self.failed_reset_streams.insert(id);
+            self.events
+                .push_back(Event::Stream(StreamEvent::ResetFailed { id, reason }));
         }
     }
 
@@ -952,10 +1129,135 @@ impl Association {
     fn has_pending_reset_for_stream(&self, stream_id: StreamId) -> bool {
         self.reconfigs.values().any(|c| {
             c.param_a
-                .as_ref()
-                .and_then(|p| p.as_any().downcast_ref::<ParamOutgoingResetRequest>())
-                .is_some_and(|p| p.stream_identifiers.contains(&stream_id))
+                .iter()
+                .chain(c.param_b.iter())
+                .find_map(|p| p.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+                .is_some_and(|p| Self::reset_request_affects_stream(p, stream_id))
         })
+    }
+
+    fn reset_request_affects_stream(
+        request: &ParamOutgoingResetRequest,
+        stream_id: StreamId,
+    ) -> bool {
+        request.stream_identifiers.is_empty() || request.stream_identifiers.contains(&stream_id)
+    }
+
+    /// Whether the current generation of a stream id is unsafe to send or reuse.
+    fn stream_reset_blocked(&self, stream_id: StreamId) -> bool {
+        self.pending_reset_completions.contains(&stream_id)
+            || self.failed_reset_streams.contains(&stream_id)
+            || self.retiring_streams.contains_key(&stream_id)
+            || self.stream_reset_in_progress(stream_id)
+    }
+
+    /// Whether a request currently prevents assigning new SSNs for this stream.
+    fn stream_reset_in_progress(&self, stream_id: StreamId) -> bool {
+        self.pending_reset_streams.contains(&stream_id)
+            || self.has_pending_reset_for_stream(stream_id)
+    }
+
+    fn reconfig_stream_ids(c: &ChunkReconfig) -> Vec<StreamId> {
+        c.param_a
+            .iter()
+            .chain(c.param_b.iter())
+            .find_map(|p| p.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+            .map(|p| p.stream_identifiers.clone())
+            .unwrap_or_default()
+    }
+
+    fn packet_reconfig_request_rsn(packet: &Packet) -> Option<u32> {
+        packet.chunks.iter().find_map(|chunk| {
+            let reconfig = chunk.as_any().downcast_ref::<ChunkReconfig>()?;
+            reconfig
+                .param_a
+                .iter()
+                .chain(reconfig.param_b.iter())
+                .find_map(|param| {
+                    param
+                        .as_any()
+                        .downcast_ref::<ParamOutgoingResetRequest>()
+                        .map(|request| request.reconfig_request_sequence_number)
+                })
+        })
+    }
+
+    fn reconfig_with_sender_last_tsn(c: &ChunkReconfig, sender_last_tsn: u32) -> ChunkReconfig {
+        fn update(
+            param: &Option<Box<dyn Param + Send + Sync>>,
+            sender_last_tsn: u32,
+        ) -> Option<Box<dyn Param + Send + Sync>> {
+            param.as_ref().map(|param| {
+                if let Some(request) = param.as_any().downcast_ref::<ParamOutgoingResetRequest>() {
+                    let mut request = request.clone();
+                    request.sender_last_tsn = sender_last_tsn;
+                    Box::new(request) as Box<dyn Param + Send + Sync>
+                } else {
+                    param.clone()
+                }
+            })
+        }
+
+        ChunkReconfig {
+            param_a: update(&c.param_a, sender_last_tsn),
+            param_b: update(&c.param_b, sender_last_tsn),
+        }
+    }
+
+    fn reconfig_has_pending_data(&self, rsn: u32) -> bool {
+        self.reconfigs.get(&rsn).is_some_and(|c| {
+            let stream_ids = Self::reconfig_stream_ids(c);
+            if stream_ids.is_empty() {
+                !self.pending_queue.is_empty()
+            } else {
+                stream_ids
+                    .iter()
+                    .any(|id| self.pending_queue.contains_stream(*id))
+            }
+        })
+    }
+
+    fn refresh_unsent_reconfig(&mut self, rsn: u32) -> Option<Packet> {
+        let sender_last_tsn = self.my_next_tsn.wrapping_sub(1);
+        let reconfig = self
+            .reconfigs
+            .get(&rsn)
+            .map(|c| Self::reconfig_with_sender_last_tsn(c, sender_last_tsn))?;
+        self.reconfigs.insert(rsn, reconfig.clone());
+        Some(self.create_packet(vec![Box::new(reconfig)]))
+    }
+
+    /// Finish the one request associated with the running Re-configuration Timer.
+    fn finish_reconfig(
+        &mut self,
+        rsn: u32,
+        outcome: core::result::Result<(), StreamResetError>,
+    ) -> bool {
+        if self.active_reconfig != Some(rsn) {
+            return false;
+        }
+
+        let fallback_ids = self
+            .reconfigs
+            .remove(&rsn)
+            .map(|c| Self::reconfig_stream_ids(&c))
+            .unwrap_or_default();
+        let ids = self
+            .reconfig_reset_streams
+            .remove(&rsn)
+            .unwrap_or(fallback_ids);
+        self.active_reconfig = None;
+        self.will_retransmit_reconfig = false;
+        self.timers.stop(Timer::Reconfig);
+
+        match outcome {
+            Ok(()) => self.emit_reset_complete(ids),
+            Err(reason) => self.emit_reset_failed(ids, reason),
+        }
+
+        // A buffered request or locally queued reset can now become active.
+        self.awake_write_loop();
+        true
     }
 
     /// unregister_stream un-registers a stream from the association
@@ -965,13 +1267,175 @@ impl Association {
             debug!("[{}] unregister_stream {}", self.side, stream_identifier);
             s.state = RecvSendState::Closed;
             if emit_stream_finished {
-                self.events.push_back(Event::Stream(StreamEvent::Finished {
-                    id: stream_identifier,
-                }));
-                // Every Finished owes a ResetComplete once the handshake
-                // complete, even if the peer re-creates the stream id first.
-                self.pending_reset_completions.insert(stream_identifier);
+                self.queue_stream_finished(stream_identifier, true);
             }
+        }
+    }
+
+    fn queue_stream_finished(&mut self, stream_identifier: StreamId, ready: bool) {
+        self.events.push_back(Event::Stream(StreamEvent::Finished {
+            id: stream_identifier,
+        }));
+        // Every Finished owes a terminal reset event, even if the peer
+        // re-creates the stream id before the handshake completes.
+        self.pending_reset_completions.insert(stream_identifier);
+        if ready {
+            self.ready_stream_finishes.insert(stream_identifier);
+        }
+    }
+
+    /// Queue the end of an incoming stream generation while preserving any
+    /// already-acknowledged DATA until the application drains it.
+    fn retire_stream(&mut self, stream_identifier: StreamId, sender_last_tsn: u32) {
+        if let Some(boundaries) = self.retiring_streams.get_mut(&stream_identifier) {
+            boundaries.push_back(sender_last_tsn);
+            if let Some(updates) = self.deferred_forward_tsns.get_mut(&stream_identifier) {
+                for update in updates {
+                    if update.generation_boundary.is_none() {
+                        update.generation_boundary = Some(sender_last_tsn);
+                    }
+                }
+            }
+            self.queue_stream_finished(stream_identifier, false);
+            return;
+        }
+
+        let has_readable_data = self.streams.get(&stream_identifier).is_some_and(|stream| {
+            matches!(
+                stream.state,
+                RecvSendState::Readable | RecvSendState::ReadWritable
+            ) && stream.get_num_bytes_in_reassembly_queue() != 0
+        });
+
+        if !has_readable_data {
+            self.deferred_forward_tsns.remove(&stream_identifier);
+            self.unregister_stream(stream_identifier, true);
+            return;
+        }
+
+        if let Some(updates) = self.deferred_forward_tsns.get_mut(&stream_identifier) {
+            for update in updates {
+                if update.generation_boundary.is_none() {
+                    update.generation_boundary = Some(sender_last_tsn);
+                }
+            }
+        }
+        let mut boundaries = VecDeque::new();
+        boundaries.push_back(sender_last_tsn);
+        self.retiring_streams.insert(stream_identifier, boundaries);
+        self.queue_stream_finished(stream_identifier, false);
+    }
+
+    /// Drop a drained old generation and release DATA held for its successor.
+    pub(crate) fn finish_retiring_stream(&mut self, stream_identifier: StreamId) -> Result<()> {
+        if !self.retiring_streams.contains_key(&stream_identifier) {
+            return Ok(());
+        }
+
+        let inherited_state = self
+            .streams
+            .get(&stream_identifier)
+            .map(|stream| stream.state)
+            .unwrap_or(RecvSendState::ReadWritable);
+        if let Some(mut stream) = self.streams.remove(&stream_identifier) {
+            stream.state = RecvSendState::Closed;
+        }
+
+        loop {
+            let (completed_boundary, next_boundary) = {
+                let boundaries = self
+                    .retiring_streams
+                    .get_mut(&stream_identifier)
+                    .expect("retiring stream must retain a boundary");
+                let completed = boundaries
+                    .pop_front()
+                    .expect("retiring stream must have a current generation");
+                (completed, boundaries.front().copied())
+            };
+            self.discard_deferred_forward_tsns_through(stream_identifier, completed_boundary);
+            self.ready_stream_finishes.insert(stream_identifier);
+
+            let Some(next_boundary) = next_boundary else {
+                self.retiring_streams.remove(&stream_identifier);
+                let result = self.release_deferred_reset_data();
+                self.inherit_stream_state(stream_identifier, inherited_state);
+                return result;
+            };
+
+            self.release_deferred_generation_data(
+                stream_identifier,
+                completed_boundary,
+                next_boundary,
+            )?;
+            self.inherit_stream_state(stream_identifier, inherited_state);
+
+            let has_unread_data = self
+                .streams
+                .get(&stream_identifier)
+                .is_some_and(|stream| stream.get_num_bytes_in_reassembly_queue() != 0);
+            if has_unread_data {
+                return Ok(());
+            }
+
+            // This generation contained no deliverable DATA. Its already-queued
+            // Finished event can become ready immediately, and any forwarding
+            // state scoped to it must not leak into the following generation.
+            if let Some(mut stream) = self.streams.remove(&stream_identifier) {
+                stream.state = RecvSendState::Closed;
+            }
+            self.discard_deferred_forward_tsns_through(stream_identifier, next_boundary);
+        }
+    }
+
+    fn inherit_stream_state(
+        &mut self,
+        stream_identifier: StreamId,
+        inherited_state: RecvSendState,
+    ) {
+        if let Some(stream) = self.streams.get_mut(&stream_identifier) {
+            stream.state = ((stream.state as u8) & (inherited_state as u8)).into();
+        }
+    }
+
+    /// Close every retained incoming generation without replaying its DATA.
+    /// The current StreamState is kept so an application-owned write half and
+    /// its configuration survive a read-side stop.
+    pub(crate) fn discard_retiring_streams(&mut self, stream_identifier: StreamId) {
+        let Some(boundaries) = self.retiring_streams.remove(&stream_identifier) else {
+            return;
+        };
+
+        for _ in boundaries {
+            self.ready_stream_finishes.insert(stream_identifier);
+        }
+        let discarded_tsns: Vec<u32> = self
+            .deferred_reset_data
+            .iter()
+            .filter_map(|(tsn, chunk)| {
+                (chunk.stream_identifier == stream_identifier).then_some(*tsn)
+            })
+            .collect();
+        for tsn in discarded_tsns {
+            self.payload_queue.mark_as_acked(tsn);
+        }
+        self.deferred_reset_data
+            .retain(|_, chunk| chunk.stream_identifier != stream_identifier);
+        self.deferred_forward_tsns.remove(&stream_identifier);
+        self.events.retain(|event| {
+            !matches!(
+                event,
+                Event::Stream(
+                    StreamEvent::Opened { id } | StreamEvent::Readable { id }
+                ) if *id == stream_identifier
+            )
+        });
+
+        if let Some(stream) = self.streams.get_mut(&stream_identifier) {
+            stream.reassembly_queue =
+                ReassemblyQueue::new(stream_identifier, self.max_receive_message_size);
+        }
+        if !self.stream_reset_blocked(stream_identifier) {
+            self.unregister_stream(stream_identifier, false);
         }
     }
 
@@ -1006,6 +1470,10 @@ impl Association {
     ) {
         // RFC 4960 §13.2: peer_last_tsn is the peer's initial TSN minus one.
         self.peer_last_tsn = initial_tsn.wrapping_sub(1);
+        // RFC 6525 §4: the peer's first request sequence number is its initial
+        // TSN, so A4's initial response value is one less than that.
+        self.peer_last_reconfig_rsn = initial_tsn.wrapping_sub(1);
+        self.peer_reconfig_rsn_initialized = true;
 
         self.rwnd = advertised_receiver_window_credit;
         debug!("[{}] initial rwnd={}", self.side, self.rwnd);
@@ -1413,6 +1881,477 @@ impl Association {
         Ok(vec![])
     }
 
+    fn data_is_above_pending_reset(&self, d: &ChunkPayloadData) -> bool {
+        self.retiring_streams.contains_key(&d.stream_identifier)
+            || self.reconfig_requests.values().any(|request| {
+                Self::reset_request_affects_stream(request, d.stream_identifier)
+                    && sna32gt(d.tsn, request.sender_last_tsn)
+            })
+    }
+
+    fn current_reset_boundary(&self, stream_identifier: StreamId) -> Option<u32> {
+        self.retiring_streams
+            .get(&stream_identifier)
+            .and_then(|boundaries| boundaries.front().copied())
+    }
+
+    fn pending_reset_boundary(&self, stream_identifier: StreamId) -> Option<u32> {
+        self.reconfig_requests
+            .values()
+            .find(|request| Self::reset_request_affects_stream(request, stream_identifier))
+            .map(|request| request.sender_last_tsn)
+    }
+
+    fn forward_tsn_applies_to_current_generation(&self, stream_identifier: StreamId) -> bool {
+        let current_boundary = self.current_reset_boundary(stream_identifier);
+        current_boundary.is_none()
+            || current_boundary == self.pending_reset_boundary(stream_identifier)
+    }
+
+    fn apply_or_defer_ordered_forward_tsn(
+        &mut self,
+        stream_identifier: StreamId,
+        last_ssn: u16,
+        new_cumulative_tsn: u32,
+    ) {
+        if !self.forward_tsn_applies_to_current_generation(stream_identifier) {
+            let generation_boundary = self.pending_reset_boundary(stream_identifier);
+            let kind = {
+                let updates = self
+                    .deferred_forward_tsns
+                    .entry(stream_identifier)
+                    .or_default();
+                let previous = updates.iter_mut().find(|update| {
+                    if update.generation_boundary != generation_boundary {
+                        return false;
+                    }
+                    let DeferredForwardTsnKind::Ordered {
+                        last_ssn: previous_ssn,
+                        ..
+                    } = update.kind
+                    else {
+                        return false;
+                    };
+                    previous_ssn == last_ssn
+                        || (generation_boundary.is_some() && sna16lt(previous_ssn, last_ssn))
+                });
+
+                if let Some(previous) = previous {
+                    let DeferredForwardTsnKind::Ordered {
+                        last_ssn: previous_ssn,
+                        new_cumulative_tsn: previous_cumulative_tsn,
+                    } = &mut previous.kind
+                    else {
+                        unreachable!();
+                    };
+                    if sna16lt(*previous_ssn, last_ssn) {
+                        *previous_ssn = last_ssn;
+                    }
+                    if sna32lt(*previous_cumulative_tsn, new_cumulative_tsn) {
+                        *previous_cumulative_tsn = new_cumulative_tsn;
+                    }
+                    previous.kind
+                } else {
+                    let kind = DeferredForwardTsnKind::Ordered {
+                        last_ssn,
+                        new_cumulative_tsn,
+                    };
+                    updates.push_back(DeferredForwardTsn {
+                        generation_boundary,
+                        kind,
+                    });
+                    kind
+                }
+            };
+            self.prune_deferred_reset_data_for_forward_tsn(
+                stream_identifier,
+                generation_boundary,
+                kind,
+            );
+            return;
+        }
+
+        let became_readable = self
+            .streams
+            .get_mut(&stream_identifier)
+            .is_some_and(|stream| {
+                let was_readable = stream.reassembly_queue.is_readable();
+                stream.reassembly_queue.forward_tsn_for_ordered(last_ssn);
+                !was_readable && stream.reassembly_queue.is_readable()
+            });
+        if became_readable {
+            self.events.push_back(Event::Stream(StreamEvent::Readable {
+                id: stream_identifier,
+            }));
+        }
+    }
+
+    fn apply_or_defer_unordered_forward_tsn(
+        &mut self,
+        stream_identifier: StreamId,
+        new_cumulative_tsn: u32,
+    ) {
+        if !self.forward_tsn_applies_to_current_generation(stream_identifier) {
+            let generation_boundary = self.pending_reset_boundary(stream_identifier);
+            let effective_cumulative_tsn = {
+                let updates = self
+                    .deferred_forward_tsns
+                    .entry(stream_identifier)
+                    .or_default();
+                if let Some(previous_cumulative_tsn) = updates.iter_mut().find_map(|update| {
+                    if update.generation_boundary != generation_boundary {
+                        return None;
+                    }
+                    match &mut update.kind {
+                        DeferredForwardTsnKind::Unordered { new_cumulative_tsn } => {
+                            Some(new_cumulative_tsn)
+                        }
+                        DeferredForwardTsnKind::Ordered { .. } => None,
+                    }
+                }) {
+                    if sna32lt(*previous_cumulative_tsn, new_cumulative_tsn) {
+                        *previous_cumulative_tsn = new_cumulative_tsn;
+                    }
+                    *previous_cumulative_tsn
+                } else {
+                    updates.push_back(DeferredForwardTsn {
+                        generation_boundary,
+                        kind: DeferredForwardTsnKind::Unordered { new_cumulative_tsn },
+                    });
+                    new_cumulative_tsn
+                }
+            };
+            self.prune_deferred_reset_data_for_forward_tsn(
+                stream_identifier,
+                generation_boundary,
+                DeferredForwardTsnKind::Unordered {
+                    new_cumulative_tsn: effective_cumulative_tsn,
+                },
+            );
+            return;
+        }
+
+        if let Some(stream) = self.streams.get_mut(&stream_identifier) {
+            stream
+                .reassembly_queue
+                .forward_tsn_for_unordered(new_cumulative_tsn);
+        }
+    }
+
+    fn apply_unordered_forward_tsn_to_current_streams(&mut self, new_cumulative_tsn: u32) {
+        let stream_ids: Vec<StreamId> = self.streams.keys().copied().collect();
+        for stream_identifier in stream_ids {
+            self.apply_or_defer_unordered_forward_tsn(stream_identifier, new_cumulative_tsn);
+        }
+    }
+
+    fn deferred_forward_tsn_application(
+        &self,
+        stream_identifier: StreamId,
+        update: DeferredForwardTsn,
+    ) -> Option<(DeferredForwardTsnKind, bool)> {
+        match update.kind {
+            DeferredForwardTsnKind::Ordered {
+                last_ssn,
+                new_cumulative_tsn,
+            } => self.streams.get(&stream_identifier).and_then(|stream| {
+                stream
+                    .reassembly_queue
+                    .applicable_forward_tsn_for_ordered_bounded(
+                        last_ssn,
+                        new_cumulative_tsn,
+                        self.peer_last_tsn,
+                    )
+                    .map(|applicable_last_ssn| {
+                        (
+                            DeferredForwardTsnKind::Ordered {
+                                last_ssn: applicable_last_ssn,
+                                new_cumulative_tsn,
+                            },
+                            applicable_last_ssn == last_ssn,
+                        )
+                    })
+            }),
+            DeferredForwardTsnKind::Unordered { .. } => Some((update.kind, true)),
+        }
+    }
+
+    fn apply_deferred_forward_tsns(&mut self, stream_identifier: StreamId) {
+        if !self.streams.contains_key(&stream_identifier) {
+            return;
+        }
+
+        let boundary = self.current_reset_boundary(stream_identifier);
+        let Some(updates) = self.deferred_forward_tsns.get(&stream_identifier) else {
+            return;
+        };
+        let mut removals = Vec::with_capacity(updates.len());
+        let mut ready = vec![];
+        for update in updates {
+            let application = if update.generation_boundary == boundary {
+                self.deferred_forward_tsn_application(stream_identifier, *update)
+            } else {
+                None
+            };
+            let remove = application.is_some_and(|(_, remove)| remove);
+            removals.push(remove);
+            if let Some((kind, _)) = application {
+                ready.push(kind);
+            }
+        }
+
+        if ready.is_empty() {
+            return;
+        }
+
+        let mut index = 0;
+        if let Some(updates) = self.deferred_forward_tsns.get_mut(&stream_identifier) {
+            updates.retain(|_| {
+                let retain = !removals[index];
+                index += 1;
+                retain
+            });
+        }
+        if self
+            .deferred_forward_tsns
+            .get(&stream_identifier)
+            .is_some_and(VecDeque::is_empty)
+        {
+            self.deferred_forward_tsns.remove(&stream_identifier);
+        }
+
+        let became_readable = if let Some(stream) = self.streams.get_mut(&stream_identifier) {
+            let was_readable = stream.reassembly_queue.is_readable();
+            for kind in ready {
+                match kind {
+                    DeferredForwardTsnKind::Ordered {
+                        last_ssn,
+                        new_cumulative_tsn,
+                    } => {
+                        stream
+                            .reassembly_queue
+                            .forward_tsn_for_ordered_bounded(last_ssn, new_cumulative_tsn);
+                    }
+                    DeferredForwardTsnKind::Unordered { new_cumulative_tsn } => {
+                        stream
+                            .reassembly_queue
+                            .forward_tsn_for_unordered(new_cumulative_tsn);
+                    }
+                }
+            }
+            !was_readable && stream.reassembly_queue.is_readable()
+        } else {
+            false
+        };
+        if became_readable {
+            self.events.push_back(Event::Stream(StreamEvent::Readable {
+                id: stream_identifier,
+            }));
+        }
+    }
+
+    fn discard_deferred_forward_tsns_through(
+        &mut self,
+        stream_identifier: StreamId,
+        boundary: u32,
+    ) {
+        if let Some(updates) = self.deferred_forward_tsns.get_mut(&stream_identifier) {
+            updates.retain(|update| update.generation_boundary != Some(boundary));
+            if updates.is_empty() {
+                self.deferred_forward_tsns.remove(&stream_identifier);
+            }
+        }
+    }
+
+    /// Release receive-window credit for incomplete successor messages that a
+    /// deferred Forward-TSN has abandoned. Complete messages remain available
+    /// when that stream generation is eventually exposed to the application.
+    fn prune_deferred_reset_data_for_forward_tsn(
+        &mut self,
+        stream_identifier: StreamId,
+        generation_boundary: Option<u32>,
+        kind: DeferredForwardTsnKind,
+    ) {
+        let mut chunks: Vec<ChunkPayloadData> = self
+            .deferred_reset_data
+            .values()
+            .filter(|chunk| {
+                chunk.stream_identifier == stream_identifier
+                    && self
+                        .deferred_generation_bounds(stream_identifier, chunk.tsn)
+                        .is_some_and(|(_, upper)| upper == generation_boundary)
+            })
+            .cloned()
+            .collect();
+        if chunks.is_empty() {
+            return;
+        }
+
+        chunks.sort_unstable_by_key(|chunk| {
+            self.deferred_generation_bounds(stream_identifier, chunk.tsn)
+                .map(|(lower, _)| chunk.tsn.wrapping_sub(lower))
+                .unwrap_or_default()
+        });
+        let targeted_tsns: FxHashSet<u32> = chunks.iter().map(|chunk| chunk.tsn).collect();
+
+        let mut queue = ReassemblyQueue::new(stream_identifier, self.max_receive_message_size);
+        for chunk in chunks {
+            // These chunks were validated before being retained. If rebuilding
+            // their generation unexpectedly fails, keep the data conservatively.
+            if queue.push(chunk).is_err() {
+                return;
+            }
+        }
+        match kind {
+            DeferredForwardTsnKind::Ordered {
+                last_ssn,
+                new_cumulative_tsn,
+            } => {
+                queue.forward_tsn_for_ordered_bounded(last_ssn, new_cumulative_tsn);
+            }
+            DeferredForwardTsnKind::Unordered { new_cumulative_tsn } => {
+                queue.forward_tsn_for_unordered(new_cumulative_tsn);
+            }
+        }
+
+        let retained_tsns: FxHashSet<u32> = queue
+            .ordered
+            .iter()
+            .chain(&queue.unordered)
+            .flat_map(|chunks| chunks.chunks.iter())
+            .chain(queue.unordered_chunks.iter())
+            .map(|chunk| chunk.tsn)
+            .collect();
+        self.deferred_reset_data
+            .retain(|tsn, _| !targeted_tsns.contains(tsn) || retained_tsns.contains(tsn));
+    }
+
+    fn deliver_deferred_reset_data(&mut self, d: &ChunkPayloadData) -> Result<()> {
+        if self.get_or_create_stream(d.stream_identifier).is_none() {
+            debug!("[{}] discard {}", self.side, d.stream_sequence_number);
+            return Ok(());
+        }
+
+        if let Some(stream) = self.streams.get_mut(&d.stream_identifier) {
+            let queued = stream.handle_data(d)?;
+            self.events.push_back(Event::DatagramReceived);
+            if queued && stream.reassembly_queue.is_readable() {
+                self.events.push_back(Event::Stream(StreamEvent::Readable {
+                    id: d.stream_identifier,
+                }));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn release_deferred_generation_data(
+        &mut self,
+        stream_identifier: StreamId,
+        previous_boundary: u32,
+        boundary: u32,
+    ) -> Result<()> {
+        let mut ready: Vec<ChunkPayloadData> = self
+            .deferred_reset_data
+            .values()
+            .filter(|chunk| {
+                chunk.stream_identifier == stream_identifier
+                    && sna32gt(chunk.tsn, previous_boundary)
+                    && sna32lte(chunk.tsn, boundary)
+            })
+            .cloned()
+            .collect();
+        ready.sort_unstable_by_key(|chunk| chunk.tsn.wrapping_sub(previous_boundary));
+
+        for chunk in ready {
+            self.deliver_deferred_reset_data(&chunk)?;
+            self.deferred_reset_data.remove(&chunk.tsn);
+        }
+        self.apply_deferred_forward_tsns(stream_identifier);
+
+        Ok(())
+    }
+
+    fn deferred_generation_bounds(
+        &self,
+        stream_identifier: StreamId,
+        tsn: u32,
+    ) -> Option<(u32, Option<u32>)> {
+        let retirement_boundaries = self.retiring_streams.get(&stream_identifier);
+        let pending_boundary = self
+            .reconfig_requests
+            .values()
+            .find(|request| Self::reset_request_affects_stream(request, stream_identifier))
+            .map(|request| request.sender_last_tsn);
+
+        let mut boundaries: Vec<u32> = retirement_boundaries
+            .into_iter()
+            .flat_map(|boundaries| boundaries.iter().copied())
+            .collect();
+        if let Some(pending_boundary) = pending_boundary {
+            if boundaries.last().copied() != Some(pending_boundary) {
+                boundaries.push(pending_boundary);
+            }
+        }
+
+        let mut lower = *boundaries.first()?;
+        for upper in boundaries.into_iter().skip(1) {
+            if sna32lte(tsn, upper) {
+                return Some((lower, Some(upper)));
+            }
+            lower = upper;
+        }
+        Some((lower, None))
+    }
+
+    fn validate_deferred_reset_data(&self, d: &ChunkPayloadData) -> Result<()> {
+        let Some((lower, upper)) = self.deferred_generation_bounds(d.stream_identifier, d.tsn)
+        else {
+            return Ok(());
+        };
+
+        let mut chunks: Vec<ChunkPayloadData> = self
+            .deferred_reset_data
+            .values()
+            .filter(|chunk| {
+                chunk.stream_identifier == d.stream_identifier
+                    && sna32gt(chunk.tsn, lower)
+                    && upper.is_none_or(|upper| sna32lte(chunk.tsn, upper))
+            })
+            .cloned()
+            .collect();
+        chunks.sort_unstable_by_key(|chunk| chunk.tsn.wrapping_sub(lower));
+
+        let mut validation_queue =
+            ReassemblyQueue::new(d.stream_identifier, self.max_receive_message_size);
+        for chunk in chunks {
+            validation_queue.push(chunk)?;
+        }
+        validation_queue.push(d.clone())?;
+        Ok(())
+    }
+
+    fn release_deferred_reset_data(&mut self) -> Result<()> {
+        let ready: Vec<ChunkPayloadData> = self
+            .deferred_reset_data
+            .values()
+            .filter(|chunk| !self.data_is_above_pending_reset(chunk))
+            .cloned()
+            .collect();
+        let stream_ids: FxHashSet<StreamId> =
+            ready.iter().map(|chunk| chunk.stream_identifier).collect();
+
+        for chunk in ready {
+            self.deliver_deferred_reset_data(&chunk)?;
+            self.deferred_reset_data.remove(&chunk.tsn);
+        }
+        for stream_identifier in stream_ids {
+            self.apply_deferred_forward_tsns(stream_identifier);
+        }
+
+        Ok(())
+    }
+
     fn handle_data(&mut self, d: &ChunkPayloadData) -> Result<Vec<Packet>> {
         trace!(
             "[{}] DATA: tsn={} immediateSack={} len={}",
@@ -1425,7 +2364,21 @@ impl Association {
 
         let can_push = self.payload_queue.can_push(d, self.peer_last_tsn);
         let mut stream_handle_data = false;
-        if can_push {
+        let mut defer_stream_data = false;
+        if can_push && self.data_is_above_pending_reset(d) {
+            if self.get_my_receiver_window_credit() > 0 {
+                defer_stream_data = true;
+            } else if let Some(last_tsn) = self.payload_queue.get_last_tsn_received() {
+                if sna32lt(d.tsn, *last_tsn) {
+                    debug!(
+                        "[{}] receive buffer full, but accepted deferred \
+                        reset DATA as missing chunk tsn={} ssn={}",
+                        self.side, d.tsn, d.stream_sequence_number
+                    );
+                    defer_stream_data = true;
+                }
+            }
+        } else if can_push {
             if self.get_or_create_stream(d.stream_identifier).is_some() {
                 if self.get_my_receiver_window_credit() > 0 {
                     // Pass the new chunk to stream level as soon as it arrives
@@ -1458,7 +2411,12 @@ impl Association {
 
         let immediate_sack = d.immediate_sack;
 
-        if stream_handle_data {
+        if defer_stream_data {
+            self.validate_deferred_reset_data(d)?;
+            if self.payload_queue.push(d.clone(), self.peer_last_tsn) {
+                self.deferred_reset_data.insert(d.tsn, d.clone());
+            }
+        } else if stream_handle_data {
             if let Some(s) = self.streams.get_mut(&d.stream_identifier) {
                 let queued = s.handle_data(d)?;
                 // Only commit to payload_queue after reassembly accepts the chunk
@@ -1470,6 +2428,10 @@ impl Association {
                     }))
                 }
             }
+            // A deferred skip may describe this successor generation. Queue
+            // DATA first so a complete message reusing the skipped SSN remains
+            // readable, while a genuinely abandoned SSN can still be advanced.
+            self.apply_deferred_forward_tsns(d.stream_identifier);
         }
 
         self.handle_peer_last_tsn_and_acknowledgement(immediate_sack)
@@ -1666,29 +2628,36 @@ impl Association {
 
         // Advance peer_last_tsn
         while sna32lt(self.peer_last_tsn, c.new_cumulative_tsn) {
-            self.payload_queue.pop(self.peer_last_tsn + 1); // may not exist
-            self.peer_last_tsn += 1;
+            let next_tsn = self.peer_last_tsn.wrapping_add(1);
+            // Keep the reset-generation copy, if any. Applying the stream
+            // forwarding state after replay discards incomplete messages while
+            // preserving complete DATA already received above a TSN gap.
+            let _ = self.payload_queue.pop(next_tsn);
+            self.peer_last_tsn = next_tsn;
         }
 
         // Report new peer_last_tsn value and abandoned largest SSN value to
         // corresponding streams so that the abandoned chunks can be removed
         // from the reassemblyQueue.
         for forwarded in &c.streams {
-            if let Some(s) = self.streams.get_mut(&forwarded.identifier) {
-                s.handle_forward_tsn_for_ordered(forwarded.sequence);
-            }
+            self.apply_or_defer_ordered_forward_tsn(
+                forwarded.identifier,
+                forwarded.sequence,
+                c.new_cumulative_tsn,
+            );
         }
 
-        // TSN may be forewared for unordered chunks. ForwardTSN chunk does not
+        // TSN may be forwarded for unordered chunks. ForwardTSN chunk does not
         // report which stream identifier it skipped for unordered chunks.
         // Therefore, we need to broadcast this event to all existing streams for
         // unordered chunks.
         // See https://github.com/pion/sctp/issues/106
-        for s in self.streams.values_mut() {
-            s.handle_forward_tsn_for_unordered(c.new_cumulative_tsn);
-        }
+        self.apply_unordered_forward_tsn_to_current_streams(c.new_cumulative_tsn);
 
-        self.handle_peer_last_tsn_and_acknowledgement(false)
+        let mut reply = vec![];
+        self.reevaluate_pending_reset_requests(&mut reply)?;
+        reply.extend(self.handle_peer_last_tsn_and_acknowledgement(false)?);
+        Ok(reply)
     }
 
     /// Handle I-FORWARD-TSN (RFC 8260) — identical to FORWARD-TSN but with
@@ -1723,30 +2692,38 @@ impl Association {
 
         // Advance peer_last_tsn
         while sna32lt(self.peer_last_tsn, c.new_cumulative_tsn) {
-            self.payload_queue.pop(self.peer_last_tsn + 1);
-            self.peer_last_tsn += 1;
+            let next_tsn = self.peer_last_tsn.wrapping_add(1);
+            // Keep the reset-generation copy, if any. Applying the stream
+            // forwarding state after replay discards incomplete messages while
+            // preserving complete DATA already received above a TSN gap.
+            let _ = self.payload_queue.pop(next_tsn);
+            self.peer_last_tsn = next_tsn;
         }
 
         // Handle per-stream entries using the explicit unordered flag
         for forwarded in &c.streams {
             if forwarded.unordered {
-                if let Some(s) = self.streams.get_mut(&forwarded.identifier) {
-                    s.handle_forward_tsn_for_unordered(c.new_cumulative_tsn);
-                }
+                self.apply_or_defer_unordered_forward_tsn(
+                    forwarded.identifier,
+                    c.new_cumulative_tsn,
+                );
             } else {
                 // MID maps to SSN for ordered streams; truncate to u16
-                if let Some(s) = self.streams.get_mut(&forwarded.identifier) {
-                    s.handle_forward_tsn_for_ordered(forwarded.mid as u16);
-                }
+                self.apply_or_defer_ordered_forward_tsn(
+                    forwarded.identifier,
+                    forwarded.mid as u16,
+                    c.new_cumulative_tsn,
+                );
             }
         }
 
         // Broadcast to all unordered streams
-        for s in self.streams.values_mut() {
-            s.handle_forward_tsn_for_unordered(c.new_cumulative_tsn);
-        }
+        self.apply_unordered_forward_tsn_to_current_streams(c.new_cumulative_tsn);
 
-        self.handle_peer_last_tsn_and_acknowledgement(false)
+        let mut reply = vec![];
+        self.reevaluate_pending_reset_requests(&mut reply)?;
+        reply.extend(self.handle_peer_last_tsn_and_acknowledgement(false)?);
+        Ok(reply)
     }
 
     fn handle_shutdown(&mut self, _: &ChunkShutdown) -> Result<Vec<Packet>> {
@@ -1796,6 +2773,19 @@ impl Association {
         Ok(vec![])
     }
 
+    fn reevaluate_pending_reset_requests(&mut self, reply: &mut Vec<Packet>) -> Result<()> {
+        let requests: Vec<ParamOutgoingResetRequest> =
+            self.reconfig_requests.values().cloned().collect();
+        for request in requests {
+            let seq = request.reconfig_request_sequence_number;
+            self.reset_streams_if_any(&request, false, reply)?;
+            if !self.reconfig_requests.contains_key(&seq) {
+                self.max_completed_reconfig_rsn = Some(seq);
+            }
+        }
+        Ok(())
+    }
+
     /// A common routine for handle_data and handle_forward_tsn routines
     fn handle_peer_last_tsn_and_acknowledgement(
         &mut self,
@@ -1811,19 +2801,25 @@ impl Association {
         // Meaning, if peer_last_tsn+1 points to a chunk that is received,
         // advance peer_last_tsn until peer_last_tsn+1 points to unreceived chunk.
         //debug!("[{}] peer_last_tsn = {}", self.side, self.peer_last_tsn);
-        while self.payload_queue.pop(self.peer_last_tsn + 1).is_some() {
-            self.peer_last_tsn += 1;
+        while let Some(chunk) = self.payload_queue.pop(self.peer_last_tsn.wrapping_add(1)) {
+            self.peer_last_tsn = self.peer_last_tsn.wrapping_add(1);
             //debug!("[{}] peer_last_tsn = {}", self.side, self.peer_last_tsn);
 
-            let rst_reqs: Vec<ParamOutgoingResetRequest> =
-                self.reconfig_requests.values().cloned().collect();
-            for rst_req in rst_reqs {
-                let seq = rst_req.reconfig_request_sequence_number;
-                self.reset_streams_if_any(&rst_req, false, &mut reply)?;
-                if !self.reconfig_requests.contains_key(&seq) {
-                    self.max_completed_reconfig_rsn = Some(seq);
+            self.reevaluate_pending_reset_requests(&mut reply)?;
+
+            if let Some(deferred) = self.deferred_reset_data.get(&chunk.tsn).cloned() {
+                if !self.data_is_above_pending_reset(&deferred) {
+                    self.deliver_deferred_reset_data(&deferred)?;
+                    self.deferred_reset_data.remove(&chunk.tsn);
                 }
             }
+        }
+
+        // A resolved TSN gap can disambiguate a deferred ordered skip whose
+        // later SSN arrived first on a reset successor.
+        let stream_ids: Vec<StreamId> = self.deferred_forward_tsns.keys().copied().collect();
+        for stream_identifier in stream_ids {
+            self.apply_deferred_forward_tsns(stream_identifier);
         }
 
         let has_packet_loss = !self.payload_queue.is_empty();
@@ -1861,6 +2857,10 @@ impl Association {
         reply: &mut Vec<Packet>,
     ) -> Result<()> {
         if let Some(p) = raw.as_any().downcast_ref::<ParamOutgoingResetRequest>() {
+            // RFC 6525 section 5.2.2 E1: the response sequence number in an
+            // Outgoing Reset Request implicitly acknowledges our request.
+            self.finish_reconfig(p.reconfig_response_sequence_number, Ok(()));
+
             let seq = p.reconfig_request_sequence_number;
             // Detect retransmission of a completed request. An InProgress request
             // is still in reconfig_requests, so we must let those through for
@@ -1872,19 +2872,41 @@ impl Association {
             {
                 // Retransmission of an already-completed request. Resend the response
                 // but do NOT reprocess stream resets (stream IDs may have been reused).
-                let packet = self.create_packet(vec![Box::new(ChunkReconfig {
-                    param_a: Some(Box::new(ParamReconfigResponse {
-                        reconfig_response_sequence_number: seq,
-                        result: ReconfigResult::SuccessPerformed,
-                    })),
-                    param_b: None,
-                })]);
-                reply.push(packet);
+                self.push_reconfig_response(reply, seq, ReconfigResult::SuccessPerformed);
                 return Ok(());
             }
-            self.reconfig_requests
-                .insert(p.reconfig_request_sequence_number, p.clone());
-            self.reset_streams_if_any(p, true, reply)?;
+
+            if !self.reconfig_requests.contains_key(&seq) {
+                // RFC 6525 section 5.2.2 E4: only the next expected peer
+                // request sequence number may start a new operation. A request
+                // already deferred in reconfig_requests is a retransmission and
+                // remains eligible for re-evaluation.
+                if !self.reconfig_requests.is_empty() {
+                    self.push_reconfig_response(
+                        reply,
+                        seq,
+                        ReconfigResult::ErrorRequestAlreadyInProgress,
+                    );
+                    return Ok(());
+                }
+
+                if self.peer_reconfig_rsn_initialized
+                    && seq != self.peer_last_reconfig_rsn.wrapping_add(1)
+                {
+                    self.push_reconfig_response(reply, seq, ReconfigResult::ErrorBadSequenceNumber);
+                    return Ok(());
+                }
+
+                self.peer_last_reconfig_rsn = seq;
+                self.peer_reconfig_rsn_initialized = true;
+                self.reconfig_requests.insert(seq, p.clone());
+            }
+
+            // Re-evaluate the original request for this RSN. This prevents a
+            // retransmission with altered stream identifiers or TSN boundary
+            // from changing an operation that is already in progress.
+            let request = self.reconfig_requests.get(&seq).cloned().unwrap();
+            self.reset_streams_if_any(&request, true, reply)?;
             // Update watermark only after successful completion (request
             // removed from reconfig_requests by reset_streams_if_any).
             if !self.reconfig_requests.contains_key(&seq) {
@@ -1892,48 +2914,53 @@ impl Association {
             }
             Ok(())
         } else if let Some(p) = raw.as_any().downcast_ref::<ParamReconfigResponse>() {
+            let rsn = p.reconfig_response_sequence_number;
+            // RFC 6525 section 5.2.7 H1: ignore responses unless this RSN owns
+            // the running Re-configuration Timer.
+            if self.active_reconfig != Some(rsn) {
+                return Ok(());
+            }
+
             // In progress result means the peer has deferred the request,
             // not answered it. The request stays outstanding and its timer restarts
             // without counting toward the retransmission limit.
             if p.result == ReconfigResult::InProgress {
-                if self
-                    .reconfigs
-                    .contains_key(&p.reconfig_response_sequence_number)
-                {
-                    self.timers.stop(Timer::Reconfig);
+                if self.reconfigs.contains_key(&rsn) {
+                    self.will_retransmit_reconfig = false;
+                    // Pause without resetting the existing retry count. The outbound
+                    // poll starts it again and the next expiry is exempted by H2.
+                    self.timers.set(Timer::Reconfig, None);
                     self.timers.suppress_error_count(Timer::Reconfig);
+                    self.awake_write_loop();
                 }
                 return Ok(());
             }
-            if let Some(c) = self.reconfigs.remove(&p.reconfig_response_sequence_number) {
-                let ids: Vec<StreamId> = c
-                    .param_a
-                    .as_ref()
-                    .and_then(|pa| pa.as_any().downcast_ref::<ParamOutgoingResetRequest>())
-                    .map(|pa| pa.stream_identifiers.clone())
-                    .unwrap_or_default();
-                match p.result {
-                    ReconfigResult::SuccessNop | ReconfigResult::SuccessPerformed => {
-                        self.emit_reset_complete(ids);
-                    }
-                    // A denied or failed reset ends the handshake without
-                    // making the id reusable, consume the armed completion
-                    // without notifying.
-                    // (InProgress is intercepted early and can never reach this match)
-                    _ => {
-                        for id in ids {
-                            self.pending_reset_completions.take_one(id);
-                        }
-                    }
-                }
-            }
-            if self.reconfigs.is_empty() {
-                self.timers.stop(Timer::Reconfig);
-            }
+
+            let outcome = match p.result {
+                ReconfigResult::SuccessNop | ReconfigResult::SuccessPerformed => Ok(()),
+                ReconfigResult::Denied => Err(StreamResetError::Denied),
+                _ => Err(StreamResetError::Failed),
+            };
+            self.finish_reconfig(rsn, outcome);
             Ok(())
         } else {
             Err(Error::ErrParameterType)
         }
+    }
+
+    fn push_reconfig_response(
+        &self,
+        reply: &mut Vec<Packet>,
+        sequence_number: u32,
+        result: ReconfigResult,
+    ) {
+        reply.push(self.create_packet(vec![Box::new(ChunkReconfig {
+            param_a: Some(Box::new(ParamReconfigResponse {
+                reconfig_response_sequence_number: sequence_number,
+                result,
+            })),
+            param_b: None,
+        })]));
     }
 
     fn process_selective_ack(
@@ -2249,10 +3276,18 @@ impl Association {
                 "[{}] resetStream(): senderLastTSN={} <= peer_last_tsn={}",
                 self.side, p.sender_last_tsn, self.peer_last_tsn
             );
-            for id in &p.stream_identifiers {
-                if self.streams.contains_key(id) {
-                    sis_to_reset.push(*id);
-                    self.unregister_stream(*id, true);
+            let mut stream_ids = if p.stream_identifiers.is_empty() {
+                self.streams.keys().copied().collect::<Vec<_>>()
+            } else {
+                p.stream_identifiers.clone()
+            };
+            stream_ids.sort_unstable();
+            stream_ids.dedup();
+
+            for id in stream_ids {
+                if self.streams.contains_key(&id) {
+                    sis_to_reset.push(id);
+                    self.retire_stream(id, p.sender_last_tsn);
                 }
             }
             self.reconfig_requests
@@ -2265,8 +3300,10 @@ impl Association {
             result = ReconfigResult::InProgress;
         }
 
-        // Answer incoming reset requests with the same reset request,
-        // this is the peer's teardown of its own half.
+        // RFC 8831 section 6.7 closes a bidirectional WebRTC data channel by
+        // resetting the corresponding outgoing stream after its incoming half
+        // is reset. `Stream` models that paired channel, so perform the
+        // reciprocal reset automatically.
         //
         // The reciprocal also keeps each unregistered id pending in
         // `reconfigs`, which is what defers `StreamEvent::ResetComplete`
@@ -2274,26 +3311,35 @@ impl Association {
         // abandoned (on_retransmission_failure).
         if !sis_to_reset.is_empty() {
             let rsn = self.generate_next_rsn();
-            let tsn = self.my_next_tsn - 1;
+            let tsn = self.my_next_tsn.wrapping_sub(1);
+            let reset_all = p.stream_identifiers.is_empty();
+            self.reconfig_reset_streams
+                .insert(rsn, sis_to_reset.clone());
 
             let c = ChunkReconfig {
                 param_a: Some(Box::new(ParamOutgoingResetRequest {
                     reconfig_request_sequence_number: rsn,
                     reconfig_response_sequence_number: p.reconfig_request_sequence_number,
                     sender_last_tsn: tsn,
-                    stream_identifiers: sis_to_reset,
+                    stream_identifiers: if reset_all { vec![] } else { sis_to_reset },
                 })),
                 ..Default::default()
             };
 
-            self.reconfigs.insert(rsn, c.clone()); // store in the map for retransmission
+            // Store before queueing. It becomes the active retransmission entry only
+            // when gather_outbound actually serializes this packet.
+            self.reconfigs.insert(rsn, c.clone());
 
             let p = self.create_packet(vec![Box::new(c)]);
             reply.push(p);
         }
 
+        if performed {
+            self.release_deferred_reset_data()?;
+        }
+
         // Respond to every request that arrived, fresh, retransmitted
-        // or defered by arrival of in-flight data.
+        // or deferred by arrival of in-flight data.
         //
         // Intermediate re-evaluations that still fail due to in-flight data
         // stay silent rather than repeating "In progress" on every advance.
@@ -2379,6 +3425,9 @@ impl Association {
         for s in self.streams.values() {
             bytes_queued += s.get_num_bytes_in_reassembly_queue() as u32;
         }
+        for chunk in self.deferred_reset_data.values() {
+            bytes_queued += chunk.user_data.len() as u32;
+        }
 
         self.max_receive_buffer_size.saturating_sub(bytes_queued)
     }
@@ -2386,24 +3435,17 @@ impl Association {
     /// gather_outbound gathers outgoing packets. The returned bool value set to
     /// false means the association should be closed down after the final send.
     fn gather_outbound(&mut self, now: Instant) -> (Vec<Bytes>, bool) {
-        let mut raw_packets = vec![];
-
-        if !self.control_queue.is_empty() {
-            for p in self.control_queue.drain(..) {
-                if let Ok(raw) = p.marshal() {
-                    raw_packets.push(raw);
-                } else {
-                    warn!("[{}] failed to serialize a control packet", self.side);
-                    continue;
-                }
-            }
-        }
+        let mut raw_packets = self.gather_outbound_control_packets(vec![], now);
 
         let state = self.state();
         match state {
             AssociationState::Established => {
                 raw_packets = self.gather_data_packets_to_retransmit(raw_packets, now);
                 raw_packets = self.gather_outbound_data_and_reconfig_packets(raw_packets, now);
+                // A queued reciprocal reset may have been held back until the
+                // DATA it covers received TSNs above. Give it another chance in
+                // this same poll so DATA and RE-CONFIG can leave together.
+                raw_packets = self.gather_outbound_control_packets(raw_packets, now);
                 raw_packets = self.gather_outbound_fast_retransmission_packets(raw_packets, now);
                 raw_packets = self.gather_outbound_sack_packets(raw_packets);
                 raw_packets = self.gather_outbound_forward_tsn_packets(raw_packets);
@@ -2422,6 +3464,73 @@ impl Association {
             }
             _ => (raw_packets, true),
         }
+    }
+
+    fn gather_outbound_control_packets(
+        &mut self,
+        mut raw_packets: Vec<Bytes>,
+        now: Instant,
+    ) -> Vec<Bytes> {
+        if !self.control_queue.is_empty() {
+            let mut buffered = VecDeque::new();
+            let mut request_blocked = false;
+            let queued = core::mem::take(&mut self.control_queue);
+            for p in queued {
+                let outgoing_rsn = Self::packet_reconfig_request_rsn(&p);
+
+                if outgoing_rsn.is_some() && request_blocked {
+                    buffered.push_back(p);
+                    continue;
+                }
+
+                if outgoing_rsn.is_some_and(|rsn| {
+                    self.active_reconfig.is_some() && self.active_reconfig != Some(rsn)
+                }) {
+                    request_blocked = true;
+                    buffered.push_back(p);
+                    continue;
+                }
+
+                // The reset boundary cannot be fixed until all already-queued
+                // DATA for the affected streams has received a TSN.
+                if outgoing_rsn.is_some_and(|rsn| self.reconfig_has_pending_data(rsn)) {
+                    request_blocked = true;
+                    buffered.push_back(p);
+                    continue;
+                }
+
+                let p = if let Some(rsn) = outgoing_rsn {
+                    self.refresh_unsent_reconfig(rsn).unwrap_or(p)
+                } else {
+                    p
+                };
+
+                match p.marshal() {
+                    Ok(raw) => {
+                        raw_packets.push(raw);
+                        if let Some(rsn) = outgoing_rsn {
+                            self.active_reconfig = Some(rsn);
+                        }
+                    }
+                    Err(_) => {
+                        warn!("[{}] failed to serialize a control packet", self.side);
+                        // A queued request owns reset state and must not be lost.
+                        if outgoing_rsn.is_some() {
+                            request_blocked = true;
+                            buffered.push_back(p);
+                        }
+                    }
+                }
+            }
+            self.control_queue = buffered;
+        }
+
+        if self.active_reconfig.is_some() {
+            self.timers
+                .restart_if_stale(Timer::Reconfig, now, self.rto_mgr.get_rto());
+        }
+
+        raw_packets
     }
 
     fn gather_data_packets_to_retransmit(
@@ -2450,7 +3559,7 @@ impl Association {
     ) -> Vec<Bytes> {
         // Pop unsent data chunks from the pending queue to send as much as
         // cwnd and rwnd allow.
-        let (chunks, sis_to_reset) = self.pop_pending_data_chunks_to_send(now);
+        let chunks = self.pop_pending_data_chunks_to_send(now);
         if !chunks.is_empty() {
             // Start timer. (noop if already started)
             trace!("[{}] T3-rtx timer start (pt1)", self.side);
@@ -2466,15 +3575,11 @@ impl Association {
             }
         }
 
-        if !sis_to_reset.is_empty() || self.will_retransmit_reconfig {
-            if self.will_retransmit_reconfig {
-                self.will_retransmit_reconfig = false;
-                debug!(
-                    "[{}] retransmit {} RECONFIG chunk(s)",
-                    self.side,
-                    self.reconfigs.len()
-                );
-                for c in self.reconfigs.values() {
+        if self.will_retransmit_reconfig {
+            self.will_retransmit_reconfig = false;
+            if let Some(rsn) = self.active_reconfig {
+                debug!("[{}] retransmit RECONFIG rsn={}", self.side, rsn);
+                if let Some(c) = self.reconfigs.get(&rsn) {
                     let p = self.create_packet(vec![Box::new(c.clone())]);
                     if let Ok(raw) = p.marshal() {
                         raw_packets.push(raw);
@@ -2486,51 +3591,67 @@ impl Association {
                     }
                 }
             }
+        }
 
-            if !sis_to_reset.is_empty() {
-                let rsn = self.generate_next_rsn();
-                let tsn = self.my_next_tsn - 1;
-                debug!(
-                    "[{}] sending RECONFIG: rsn={} tsn={} streams={:?}",
-                    self.side,
-                    rsn,
-                    self.my_next_tsn - 1,
-                    sis_to_reset
-                );
-
-                let c = ChunkReconfig {
-                    param_a: Some(Box::new(ParamOutgoingResetRequest {
-                        reconfig_request_sequence_number: rsn,
-                        sender_last_tsn: tsn,
-                        stream_identifiers: sis_to_reset,
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                };
-                self.reconfigs.insert(rsn, c.clone()); // store in the map for retransmission
-
-                let p = self.create_packet(vec![Box::new(c)]);
-                if let Ok(raw) = p.marshal() {
-                    raw_packets.push(raw);
+        // RFC 6525 section 5.1.1 permits only one request in flight. Keep
+        // application resets separate from DATA until that request completes.
+        if self.active_reconfig.is_none()
+            && self.reconfigs.is_empty()
+            && !self.pending_reset_streams.is_empty()
+        {
+            // DATA on an unrelated stream must not starve a reset, nor should
+            // one busy stream hold back ready reset requests for other streams.
+            let pending_queue = &self.pending_queue;
+            let mut stream_ids = vec![];
+            self.pending_reset_streams.retain(|id| {
+                if pending_queue.contains_stream(*id) {
+                    true
                 } else {
-                    warn!(
-                        "[{}] failed to serialize a RECONFIG packet to be transmitted",
-                        self.side
-                    );
+                    stream_ids.push(*id);
+                    false
                 }
+            });
+
+            if stream_ids.is_empty() {
+                return raw_packets;
             }
 
-            if !self.reconfigs.is_empty() {
-                self.timers
-                    .start(Timer::Reconfig, now, self.rto_mgr.get_rto());
+            let rsn = self.generate_next_rsn();
+            let tsn = self.my_next_tsn.wrapping_sub(1);
+            debug!(
+                "[{}] sending RECONFIG: rsn={} tsn={} streams={:?}",
+                self.side, rsn, tsn, stream_ids
+            );
+
+            self.reconfig_reset_streams.insert(rsn, stream_ids.clone());
+            let c = ChunkReconfig {
+                param_a: Some(Box::new(ParamOutgoingResetRequest {
+                    reconfig_request_sequence_number: rsn,
+                    reconfig_response_sequence_number: self.peer_last_reconfig_rsn,
+                    sender_last_tsn: tsn,
+                    stream_identifiers: stream_ids,
+                })),
+                ..Default::default()
+            };
+            self.reconfigs.insert(rsn, c.clone());
+
+            let p = self.create_packet(vec![Box::new(c)]);
+            if let Ok(raw) = p.marshal() {
+                self.active_reconfig = Some(rsn);
+                raw_packets.push(raw);
+            } else {
+                warn!(
+                    "[{}] failed to serialize a RECONFIG packet to be transmitted",
+                    self.side
+                );
+                // Preserve the request for a later serialization attempt.
+                self.control_queue.push_back(p);
             }
         }
 
-        // Ensure the Reconfig timer is running whenever reconfigs are pending.
-        // Reconfigs can be inserted via reset_streams_if_any (incoming reset
-        // response path) without going through the sis_to_reset / retransmit
-        // block above.
-        if !self.reconfigs.is_empty() {
+        // The timer belongs to exactly the request selected above or while
+        // draining the control queue.
+        if self.active_reconfig.is_some() {
             self.timers
                 .restart_if_stale(Timer::Reconfig, now, self.rto_mgr.get_rto());
         }
@@ -2764,12 +3885,8 @@ impl Association {
 
     /// pop_pending_data_chunks_to_send pops chunks from the pending queues as many as
     /// the cwnd and rwnd allows to send.
-    fn pop_pending_data_chunks_to_send(
-        &mut self,
-        now: Instant,
-    ) -> (Vec<ChunkPayloadData>, Vec<u16>) {
+    fn pop_pending_data_chunks_to_send(&mut self, now: Instant) -> Vec<ChunkPayloadData> {
         let mut chunks = vec![];
-        let mut sis_to_reset = vec![]; // stream identifiers to reset
         if !self.pending_queue.is_empty() {
             // RFC 4960 sec 6.1.  Transmission of DATA Chunks
             //   A) At any given time, the data sender MUST NOT transmit new data to
@@ -2780,24 +3897,8 @@ impl Association {
             //      the receiver if allowed by cwnd (see rule B, below).
 
             while let Some(c) = self.pending_queue.peek() {
-                let (beginning_fragment, unordered, data_len, stream_identifier) = (
-                    c.beginning_fragment,
-                    c.unordered,
-                    c.user_data.len(),
-                    c.stream_identifier,
-                );
-
-                if data_len == 0 {
-                    sis_to_reset.push(stream_identifier);
-                    if self
-                        .pending_queue
-                        .pop(beginning_fragment, unordered)
-                        .is_none()
-                    {
-                        error!("[{}] failed to pop from pending queue", self.side);
-                    }
-                    continue;
-                }
+                let (beginning_fragment, unordered, data_len) =
+                    (c.beginning_fragment, c.unordered, c.user_data.len());
 
                 if self.inflight_queue.get_num_bytes() + data_len > self.cwnd as usize {
                     break; // would exceeds cwnd
@@ -2835,7 +3936,7 @@ impl Association {
             }
         }
 
-        (chunks, sis_to_reset)
+        chunks
     }
 
     /// bundle_data_chunks_into_packets packs DATA chunks into packets. It tries to bundle
@@ -2872,14 +3973,14 @@ impl Association {
     /// generate_next_tsn returns the my_next_tsn and increases it. The caller should hold the lock.
     fn generate_next_tsn(&mut self) -> u32 {
         let tsn = self.my_next_tsn;
-        self.my_next_tsn += 1;
+        self.my_next_tsn = self.my_next_tsn.wrapping_add(1);
         tsn
     }
 
     /// generate_next_rsn returns the my_next_rsn and increases it. The caller should hold the lock.
     fn generate_next_rsn(&mut self) -> u32 {
         let rsn = self.my_next_rsn;
-        self.my_next_rsn += 1;
+        self.my_next_rsn = self.my_next_rsn.wrapping_add(1);
         rsn
     }
 
@@ -2945,7 +4046,7 @@ impl Association {
     }
 
     /// create_forward_tsn generates ForwardTSN chunk.
-    /// This method will be be called if use_forward_tsn is set to false.
+    /// This method is called when use_forward_tsn is set to true.
     fn create_forward_tsn(&self) -> ChunkForwardTsn {
         // RFC 3758 Sec 3.5 C4
         let mut stream_map: HashMap<u16, u16> = HashMap::new(); // to report only once per SI
@@ -3042,17 +4143,7 @@ impl Association {
             return Err(Error::ErrResetPacketInStateNotExist);
         }
 
-        // Create DATA chunk which only contains valid stream identifier with
-        // nil userData and use it as a EOS from the stream.
-        let c = ChunkPayloadData {
-            stream_identifier,
-            beginning_fragment: true,
-            ending_fragment: true,
-            user_data: Bytes::new(),
-            ..Default::default()
-        };
-
-        self.pending_queue.push(c);
+        self.pending_reset_streams.push_back(stream_identifier);
         self.awake_write_loop();
 
         Ok(())
@@ -3241,27 +4332,14 @@ impl Association {
             }
 
             Timer::Reconfig => {
-                error!(
-                    "[{}] retransmission failure: Reconfig (clearing {} pending reconfigs)",
-                    self.side,
-                    self.reconfigs.len()
-                );
-                // Abandonment ends the handshake without confirmation from the peer,
-                // ids must not be reported as reusable, consume their armed completions
-                // without emitting ResetComplete.
-                let ids: Vec<StreamId> = self
-                    .reconfigs
-                    .values()
-                    .filter_map(|c| {
-                        c.param_a
-                            .as_ref()
-                            .and_then(|pa| pa.as_any().downcast_ref::<ParamOutgoingResetRequest>())
-                    })
-                    .flat_map(|pa| pa.stream_identifiers.iter().copied())
-                    .collect();
-                self.reconfigs.clear();
-                for id in ids {
-                    self.pending_reset_completions.take_one(id);
+                if let Some(rsn) = self.active_reconfig {
+                    error!(
+                        "[{}] retransmission failure: Reconfig rsn={}",
+                        self.side, rsn
+                    );
+                    self.finish_reconfig(rsn, Err(StreamResetError::Failed));
+                } else {
+                    self.timers.stop(Timer::Reconfig);
                 }
             }
 

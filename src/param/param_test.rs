@@ -157,6 +157,13 @@ fn test_param_outgoing_reset_request_failure() -> Result<()> {
     let tests = vec![
         ("packet too short", CHUNK_RECONFIG_PARAM_A.slice(..8)),
         ("param too short", Bytes::from_static(&[0x0, 0xd, 0x0, 0x4])),
+        (
+            "odd stream identifier bytes",
+            Bytes::from_static(&[
+                0x0, 0xd, 0x0, 0x11, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x2, 0x0, 0x0, 0x0, 0x3,
+                0xff,
+            ]),
+        ),
     ];
 
     for (name, binary) in tests {

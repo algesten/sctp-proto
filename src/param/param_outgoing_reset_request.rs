@@ -54,8 +54,8 @@ impl fmt::Display for ParamOutgoingResetRequest {
             "{} {} {} {} {:?}",
             self.header(),
             self.reconfig_request_sequence_number,
-            self.reconfig_request_sequence_number,
             self.reconfig_response_sequence_number,
+            self.sender_last_tsn,
             self.stream_identifiers
         )
     }
@@ -73,6 +73,10 @@ impl Param for ParamOutgoingResetRequest {
         let header = ParamHeader::unmarshal(raw)?;
         if header.value_length() < PARAM_OUTGOING_RESET_REQUEST_STREAM_IDENTIFIERS_OFFSET {
             return Err(Error::ErrSsnResetRequestParamTooShort);
+        }
+        if (header.value_length() - PARAM_OUTGOING_RESET_REQUEST_STREAM_IDENTIFIERS_OFFSET) % 2 != 0
+        {
+            return Err(Error::ErrSsnResetRequestParamInvalidLength);
         }
 
         let reader =

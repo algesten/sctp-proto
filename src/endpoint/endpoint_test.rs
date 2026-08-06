@@ -9,7 +9,7 @@ use crate::config::generate_snap_token;
 use crate::error::{Error, Result};
 
 use crate::association::state::{AckMode, AssociationState};
-use crate::association::stream::{ReliabilityType, Stream};
+use crate::association::stream::{ReliabilityType, Stream, StreamEvent, StreamResetError};
 use crate::chunk::chunk_abort::ChunkAbort;
 use crate::chunk::chunk_cookie_echo::ChunkCookieEcho;
 use crate::chunk::chunk_error::ChunkError;
@@ -2736,10 +2736,17 @@ fn test_assoc_reset_inprogress_completed_via_tsn_advance_then_retransmit() -> Re
     }
     pair.drive();
 
-    // The reset should have completed via TSN advance — stream 1 gone.
+    // The boundary DATA must remain readable even though the reset completed.
+    // Draining it retires the old stream generation.
+    let boundary_data = pair
+        .server_stream(server_ch, si)?
+        .read()?
+        .expect("boundary DATA should survive the reset");
+    assert_eq!(boundary_data.len(), b"payload".len());
+
     assert!(
         pair.server_stream(server_ch, si).is_err(),
-        "stream should be reset after TSN advance completes the InProgress request"
+        "stream should retire after its boundary DATA is drained"
     );
 
     // Step 3: Reopen stream 1 with the same ID.
@@ -2847,10 +2854,17 @@ fn test_assoc_reset_inprogress_reconfig_retransmission() -> Result<()> {
     // Let everything settle.
     pair.drive();
 
-    // The reset should have completed — stream 1 should be gone.
+    // The boundary DATA must remain readable even though the reset completed.
+    // Draining it retires the old stream generation.
+    let boundary_data = pair
+        .server_stream(server_ch, si)?
+        .read()?
+        .expect("boundary DATA should survive the reset");
+    assert_eq!(boundary_data.len(), b"payload".len());
+
     assert!(
         pair.server_stream(server_ch, si).is_err(),
-        "stream should be reset after InProgress retransmission completes"
+        "stream should retire after its boundary DATA is drained"
     );
 
     Ok(())
@@ -2905,7 +2919,7 @@ fn test_assoc_open_stream_rejects_pending_reset_id() -> Result<()> {
 }
 
 #[test]
-fn test_assoc_reconfig_failure_clears_pending() -> Result<()> {
+fn test_assoc_reconfig_failure_keeps_stream_quarantined() -> Result<()> {
     let si: u16 = 1;
 
     let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
@@ -2946,15 +2960,24 @@ fn test_assoc_reconfig_failure_clears_pending() -> Result<()> {
         pair.server.inbound.clear();
     }
 
-    // After retransmission failure, reconfigs should be cleared and the stream
-    // ID should be available for reuse.
-    let _ = pair
-        .client_conn_mut(client_ch)
-        .open_stream(si, PayloadProtocolIdentifier::Binary)?;
     assert!(
-        pair.client_stream(client_ch, si).is_ok(),
-        "stream 1 should be available after reconfig retransmission failure"
+        core::iter::from_fn(|| pair.client_conn_mut(client_ch).poll()).any(|event| matches!(
+            event,
+            Event::Stream(StreamEvent::ResetFailed {
+                id,
+                reason: StreamResetError::Failed,
+            }) if id == si
+        )),
+        "reset retransmission exhaustion should emit a terminal failure event"
     );
+
+    // The in-flight request is abandoned, but without a terminal success the
+    // stream ID remains quarantined and must not be reused.
+    assert!(matches!(
+        pair.client_conn_mut(client_ch)
+            .open_stream(si, PayloadProtocolIdentifier::Binary),
+        Err(Error::ErrStreamResetPending)
+    ));
 
     Ok(())
 }

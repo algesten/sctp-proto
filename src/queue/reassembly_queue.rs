@@ -175,6 +175,24 @@ impl Chunks {
 
         true
     }
+
+    fn is_missing_tsn_at_or_before(&self, cumulative_tsn: u32) -> bool {
+        let Some(first) = self.chunks.first() else {
+            return false;
+        };
+        if !first.beginning_fragment && sna32lte(first.tsn.wrapping_sub(1), cumulative_tsn) {
+            return true;
+        }
+        if self.chunks.windows(2).any(|pair| {
+            let missing_tsn = pair[0].tsn.wrapping_add(1);
+            missing_tsn != pair[1].tsn && sna32lte(missing_tsn, cumulative_tsn)
+        }) {
+            return true;
+        }
+
+        let last = self.chunks.last().expect("a first chunk exists");
+        !last.ending_fragment && sna32lte(last.tsn.wrapping_add(1), cumulative_tsn)
+    }
 }
 
 #[derive(Default, Debug)]
@@ -455,6 +473,128 @@ impl ReassemblyQueue {
         if sna16lte(self.next_ssn, last_ssn) {
             self.next_ssn = last_ssn.wrapping_add(1);
         }
+    }
+
+    /// Apply an ordered Forward-TSN retained across a stream reset without
+    /// crossing into messages whose TSNs are newer than its cumulative point.
+    pub(crate) fn forward_tsn_for_ordered_bounded(
+        &mut self,
+        last_ssn: u16,
+        new_cumulative_tsn: u32,
+    ) {
+        let first_unaffected_ssn = self
+            .ordered
+            .iter()
+            .filter(|chunks| {
+                sna16lte(chunks.ssn, last_ssn)
+                    && if chunks.is_complete() {
+                        chunks
+                            .chunks
+                            .iter()
+                            .any(|chunk| sna32gt(chunk.tsn, new_cumulative_tsn))
+                    } else {
+                        !chunks.is_missing_tsn_at_or_before(new_cumulative_tsn)
+                    }
+            })
+            .map(|chunks| chunks.ssn)
+            .reduce(|first, candidate| {
+                if sna16lt(candidate, first) {
+                    candidate
+                } else {
+                    first
+                }
+            });
+
+        let is_abandoned_partial = |chunks: &&Chunks| {
+            sna16lte(chunks.ssn, last_ssn)
+                && !chunks.is_complete()
+                && chunks.is_missing_tsn_at_or_before(new_cumulative_tsn)
+        };
+        let num_bytes = self
+            .ordered
+            .iter()
+            .filter(is_abandoned_partial)
+            .flat_map(|chunks| chunks.chunks.iter())
+            .map(|chunk| chunk.user_data.len())
+            .sum();
+        self.subtract_num_bytes(num_bytes);
+        self.ordered.retain(|chunks| {
+            !sna16lte(chunks.ssn, last_ssn)
+                || chunks.is_complete()
+                || !chunks.is_missing_tsn_at_or_before(new_cumulative_tsn)
+        });
+
+        let next_ssn = first_unaffected_ssn.unwrap_or_else(|| last_ssn.wrapping_add(1));
+        if sna16lt(self.next_ssn, next_ssn) {
+            self.next_ssn = next_ssn;
+        }
+    }
+
+    /// The highest prefix of an ambiguous deferred ordered skip that has
+    /// enough TSN context to advance without overtaking a missing successor.
+    pub(crate) fn applicable_forward_tsn_for_ordered_bounded(
+        &self,
+        last_ssn: u16,
+        new_cumulative_tsn: u32,
+        peer_last_tsn: u32,
+    ) -> Option<u16> {
+        if sna16gt(self.next_ssn, last_ssn) {
+            return Some(last_ssn);
+        }
+
+        let is_covered = |chunks: &Chunks| {
+            if chunks.is_complete() {
+                chunks
+                    .chunks
+                    .iter()
+                    .all(|chunk| sna32lte(chunk.tsn, new_cumulative_tsn))
+            } else {
+                chunks.is_missing_tsn_at_or_before(new_cumulative_tsn)
+            }
+        };
+        if self.ordered.iter().any(|chunks| {
+            chunks.ssn == last_ssn && (chunks.ssn == self.next_ssn || is_covered(chunks))
+        }) {
+            return Some(last_ssn);
+        }
+
+        let has_resolved_later_tsn = self
+            .ordered
+            .iter()
+            .filter(|chunks| chunks.ssn == last_ssn || sna16gt(chunks.ssn, last_ssn))
+            .flat_map(|chunks| chunks.chunks.iter())
+            .map(|chunk| chunk.tsn)
+            .reduce(|first, candidate| {
+                if sna32lt(candidate, first) {
+                    candidate
+                } else {
+                    first
+                }
+            })
+            .is_some_and(|first_tsn| sna32lte(first_tsn, peer_last_tsn));
+        if has_resolved_later_tsn {
+            return Some(last_ssn);
+        }
+
+        self.ordered
+            .iter()
+            .filter(|chunks| {
+                (chunks.ssn == self.next_ssn || sna16gt(chunks.ssn, self.next_ssn))
+                    && sna16lt(chunks.ssn, last_ssn)
+                    && (is_covered(chunks)
+                        || chunks
+                            .chunks
+                            .first()
+                            .is_some_and(|chunk| sna32lte(chunk.tsn, peer_last_tsn)))
+            })
+            .map(|chunks| chunks.ssn)
+            .reduce(|last, candidate| {
+                if sna16gt(candidate, last) {
+                    candidate
+                } else {
+                    last
+                }
+            })
     }
 
     /// Remove all fragments in the unordered sets that contains chunks

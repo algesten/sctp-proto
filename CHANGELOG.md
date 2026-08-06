@@ -1,5 +1,7 @@
 # Unreleased
 
+  * Fix stream reset completion, failure reporting, and request serialization #54
+
 # 0.10.2
 
   * Calculate message length accurately in the reassembly queue #50

@@ -1928,6 +1928,63 @@ fn test_successor_forward_tsn_releases_covered_out_of_order_message() -> Result<
 }
 
 #[test]
+fn test_cross_generation_forward_tsn_does_not_skip_uncovered_successor_ssn() -> Result<()> {
+    let mut a = association_with_queued_second_reset()?;
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 2,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 1,
+            sequence: 1,
+        }],
+    })?;
+    a.handle_data(&ChunkPayloadData {
+        tsn: 4,
+        stream_identifier: 1,
+        stream_sequence_number: 0,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"zero"),
+        ..Default::default()
+    })?;
+
+    // A lost SACK can make one FORWARD-TSN span old SSN 1 and successor SSN
+    // 0. The old maximum SSN must not also skip successor SSN 1.
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 4,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 1,
+            sequence: 1,
+        }],
+    })?;
+
+    let old = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(old.read(&mut payload)?, payload.len());
+    let zero = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 4];
+    assert_eq!(zero.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"zero");
+
+    a.handle_data(&ChunkPayloadData {
+        tsn: 5,
+        stream_identifier: 1,
+        stream_sequence_number: 1,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"one"),
+        ..Default::default()
+    })?;
+    let one = a
+        .stream(1)?
+        .read()?
+        .expect("the successor SSN outside the covered TSN range must remain live");
+    let mut payload = [0; 3];
+    assert_eq!(one.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"one");
+    Ok(())
+}
+
+#[test]
 fn test_i_forward_tsn_skip_is_scoped_to_queued_reset_generation() -> Result<()> {
     let mut a = association_with_queued_second_reset()?;
     a.handle_i_forward_tsn(&ChunkIForwardTsn {

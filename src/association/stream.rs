@@ -300,7 +300,11 @@ impl<'a> Stream<'a> {
                 s.state == RecvSendState::Readable || s.state == RecvSendState::ReadWritable
             });
 
-        if reset {
+        if reset
+            && !self
+                .association
+                .stream_reset_in_progress(self.stream_identifier)
+        {
             // Reset the outgoing stream
             // https://tools.ietf.org/html/rfc6525
             //

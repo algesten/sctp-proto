@@ -78,6 +78,8 @@ pub enum Error {
     ErrParamPacketTooShort,
     #[error("outgoing SSN reset request parameter too short")]
     ErrSsnResetRequestParamTooShort,
+    #[error("outgoing SSN reset request parameter has an invalid length")]
+    ErrSsnResetRequestParamInvalidLength,
     #[error("reconfig response parameter too short")]
     ErrReconfigRespParamTooShort,
     #[error("invalid algorithm type")]

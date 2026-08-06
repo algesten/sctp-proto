@@ -1871,9 +1871,34 @@ impl Association {
             || current_boundary == self.pending_reset_boundary(stream_identifier)
     }
 
+    fn repeated_ordered_forward_tsn_boundary(
+        &self,
+        stream_identifier: StreamId,
+        last_ssn: u16,
+    ) -> Option<u32> {
+        let boundaries = self.retiring_streams.get(&stream_identifier)?;
+        self.deferred_forward_tsns
+            .get(&stream_identifier)?
+            .iter()
+            .rev()
+            .find_map(|update| match update {
+                DeferredForwardTsn {
+                    generation_boundary: Some(boundary),
+                    kind:
+                        DeferredForwardTsnKind::Ordered {
+                            last_ssn: previous_ssn,
+                        },
+                } if *previous_ssn == last_ssn && boundaries.contains(boundary) => Some(*boundary),
+                _ => None,
+            })
+    }
+
     fn apply_or_defer_ordered_forward_tsn(&mut self, stream_identifier: StreamId, last_ssn: u16) {
         if !self.forward_tsn_applies_to_current_generation(stream_identifier) {
-            let generation_boundary = self.pending_reset_boundary(stream_identifier);
+            let generation_boundary =
+                self.pending_reset_boundary(stream_identifier).or_else(|| {
+                    self.repeated_ordered_forward_tsn_boundary(stream_identifier, last_ssn)
+                });
             self.deferred_forward_tsns
                 .entry(stream_identifier)
                 .or_default()
@@ -2392,9 +2417,10 @@ impl Association {
         // Advance peer_last_tsn
         while sna32lt(self.peer_last_tsn, c.new_cumulative_tsn) {
             let next_tsn = self.peer_last_tsn.wrapping_add(1);
-            if let Some(chunk) = self.payload_queue.pop(next_tsn) {
-                self.deferred_reset_data.remove(&chunk.tsn);
-            }
+            // Keep the reset-generation copy, if any. Applying the stream
+            // forwarding state after replay discards incomplete messages while
+            // preserving complete DATA already received above a TSN gap.
+            let _ = self.payload_queue.pop(next_tsn);
             self.peer_last_tsn = next_tsn;
         }
 
@@ -2451,9 +2477,10 @@ impl Association {
         // Advance peer_last_tsn
         while sna32lt(self.peer_last_tsn, c.new_cumulative_tsn) {
             let next_tsn = self.peer_last_tsn.wrapping_add(1);
-            if let Some(chunk) = self.payload_queue.pop(next_tsn) {
-                self.deferred_reset_data.remove(&chunk.tsn);
-            }
+            // Keep the reset-generation copy, if any. Applying the stream
+            // forwarding state after replay discards incomplete messages while
+            // preserving complete DATA already received above a TSN gap.
+            let _ = self.payload_queue.pop(next_tsn);
             self.peer_last_tsn = next_tsn;
         }
 
@@ -3045,8 +3072,10 @@ impl Association {
             result = ReconfigResult::InProgress;
         }
 
-        // Answer incoming reset requests with the same reset request,
-        // this is the peer's teardown of its own half.
+        // RFC 8831 section 6.7 closes a bidirectional WebRTC data channel by
+        // resetting the corresponding outgoing stream after its incoming half
+        // is reset. `Stream` models that paired channel, so perform the
+        // reciprocal reset automatically.
         //
         // The reciprocal also keeps each unregistered id pending in
         // `reconfigs`, which is what defers `StreamEvent::ResetComplete`
@@ -3785,7 +3814,7 @@ impl Association {
     }
 
     /// create_forward_tsn generates ForwardTSN chunk.
-    /// This method will be be called if use_forward_tsn is set to false.
+    /// This method is called when use_forward_tsn is set to true.
     fn create_forward_tsn(&self) -> ChunkForwardTsn {
         // RFC 3758 Sec 3.5 C4
         let mut stream_map: HashMap<u16, u16> = HashMap::new(); // to report only once per SI

@@ -2028,6 +2028,46 @@ fn test_successor_forward_tsn_releases_covered_message_before_lost_tail() -> Res
 }
 
 #[test]
+fn test_resolved_successor_prefix_releases_message_before_stale_tail() -> Result<()> {
+    let mut a = association_with_queued_second_reset()?;
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 2,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 1,
+            sequence: 2,
+        }],
+    })?;
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 3,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 1,
+            sequence: 2,
+        }],
+    })?;
+    a.handle_data(&ChunkPayloadData {
+        tsn: 4,
+        stream_identifier: 1,
+        stream_sequence_number: 1,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"one"),
+        ..Default::default()
+    })?;
+
+    let old = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(old.read(&mut payload)?, payload.len());
+    let one = a
+        .stream(1)?
+        .read()?
+        .expect("resolved successor data must not wait for the stale old tail");
+    let mut payload = [0; 3];
+    assert_eq!(one.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"one");
+    Ok(())
+}
+
+#[test]
 fn test_i_forward_tsn_skip_is_scoped_to_queued_reset_generation() -> Result<()> {
     let mut a = association_with_queued_second_reset()?;
     a.handle_i_forward_tsn(&ChunkIForwardTsn {

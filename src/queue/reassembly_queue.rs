@@ -175,6 +175,24 @@ impl Chunks {
 
         true
     }
+
+    fn is_missing_tsn_at_or_before(&self, cumulative_tsn: u32) -> bool {
+        let Some(first) = self.chunks.first() else {
+            return false;
+        };
+        if !first.beginning_fragment && sna32lte(first.tsn.wrapping_sub(1), cumulative_tsn) {
+            return true;
+        }
+        if self.chunks.windows(2).any(|pair| {
+            let missing_tsn = pair[0].tsn.wrapping_add(1);
+            missing_tsn != pair[1].tsn && sna32lte(missing_tsn, cumulative_tsn)
+        }) {
+            return true;
+        }
+
+        let last = self.chunks.last().expect("a first chunk exists");
+        !last.ending_fragment && sna32lte(last.tsn.wrapping_add(1), cumulative_tsn)
+    }
 }
 
 #[derive(Default, Debug)]
@@ -464,15 +482,19 @@ impl ReassemblyQueue {
         last_ssn: u16,
         new_cumulative_tsn: u32,
     ) {
-        let first_newer_ssn = self
+        let first_unaffected_ssn = self
             .ordered
             .iter()
             .filter(|chunks| {
                 sna16lte(chunks.ssn, last_ssn)
-                    && chunks
-                        .chunks
-                        .iter()
-                        .any(|chunk| sna32gt(chunk.tsn, new_cumulative_tsn))
+                    && if chunks.is_complete() {
+                        chunks
+                            .chunks
+                            .iter()
+                            .any(|chunk| sna32gt(chunk.tsn, new_cumulative_tsn))
+                    } else {
+                        !chunks.is_missing_tsn_at_or_before(new_cumulative_tsn)
+                    }
             })
             .map(|chunks| chunks.ssn)
             .reduce(|first, candidate| {
@@ -484,7 +506,7 @@ impl ReassemblyQueue {
             });
 
         let is_forwarded = |ssn| {
-            sna16lte(ssn, last_ssn) && first_newer_ssn.is_none_or(|first| sna16lt(ssn, first))
+            sna16lte(ssn, last_ssn) && first_unaffected_ssn.is_none_or(|first| sna16lt(ssn, first))
         };
         let num_bytes = self
             .ordered
@@ -497,10 +519,41 @@ impl ReassemblyQueue {
         self.ordered
             .retain(|chunks| !is_forwarded(chunks.ssn) || chunks.is_complete());
 
-        let next_ssn = first_newer_ssn.unwrap_or_else(|| last_ssn.wrapping_add(1));
+        let next_ssn = first_unaffected_ssn.unwrap_or_else(|| last_ssn.wrapping_add(1));
         if sna16lt(self.next_ssn, next_ssn) {
             self.next_ssn = next_ssn;
         }
+    }
+
+    /// Whether an ambiguous deferred ordered skip has enough TSN context to
+    /// advance without overtaking a still-missing successor message.
+    pub(crate) fn can_apply_forward_tsn_for_ordered_bounded(
+        &self,
+        last_ssn: u16,
+        peer_last_tsn: u32,
+    ) -> bool {
+        if sna16gt(self.next_ssn, last_ssn)
+            || self
+                .ordered
+                .iter()
+                .any(|chunks| sna16lte(chunks.ssn, last_ssn))
+        {
+            return true;
+        }
+
+        self.ordered
+            .iter()
+            .filter(|chunks| sna16gt(chunks.ssn, last_ssn))
+            .flat_map(|chunks| chunks.chunks.iter())
+            .map(|chunk| chunk.tsn)
+            .reduce(|first, candidate| {
+                if sna32lt(candidate, first) {
+                    candidate
+                } else {
+                    first
+                }
+            })
+            .is_some_and(|first_tsn| sna32lte(first_tsn, peer_last_tsn))
     }
 
     /// Remove all fragments in the unordered sets that contains chunks

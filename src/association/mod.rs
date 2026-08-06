@@ -2036,30 +2036,61 @@ impl Association {
         }
     }
 
+    fn deferred_forward_tsn_is_ready(
+        &self,
+        stream_identifier: StreamId,
+        update: DeferredForwardTsn,
+    ) -> bool {
+        match update.kind {
+            DeferredForwardTsnKind::Ordered { last_ssn, .. } => {
+                self.streams.get(&stream_identifier).is_some_and(|stream| {
+                    stream
+                        .reassembly_queue
+                        .can_apply_forward_tsn_for_ordered_bounded(last_ssn, self.peer_last_tsn)
+                })
+            }
+            DeferredForwardTsnKind::Unordered { .. } => true,
+        }
+    }
+
     fn apply_deferred_forward_tsns(&mut self, stream_identifier: StreamId) {
         if !self.streams.contains_key(&stream_identifier) {
             return;
         }
 
         let boundary = self.current_reset_boundary(stream_identifier);
-        let ready: Vec<DeferredForwardTsn> = self
-            .deferred_forward_tsns
-            .get(&stream_identifier)
-            .into_iter()
-            .flatten()
-            .filter(|update| update.generation_boundary == boundary)
-            .copied()
-            .collect();
+        let Some(updates) = self.deferred_forward_tsns.get(&stream_identifier) else {
+            return;
+        };
+        let mut removals = Vec::with_capacity(updates.len());
+        let mut ready = vec![];
+        for update in updates {
+            let remove = update.generation_boundary == boundary
+                && self.deferred_forward_tsn_is_ready(stream_identifier, *update);
+            removals.push(remove);
+            if remove {
+                ready.push(*update);
+            }
+        }
 
         if ready.is_empty() {
             return;
         }
 
+        let mut index = 0;
         if let Some(updates) = self.deferred_forward_tsns.get_mut(&stream_identifier) {
-            updates.retain(|update| update.generation_boundary != boundary);
-            if updates.is_empty() {
-                self.deferred_forward_tsns.remove(&stream_identifier);
-            }
+            updates.retain(|_| {
+                let retain = !removals[index];
+                index += 1;
+                retain
+            });
+        }
+        if self
+            .deferred_forward_tsns
+            .get(&stream_identifier)
+            .is_some_and(VecDeque::is_empty)
+        {
+            self.deferred_forward_tsns.remove(&stream_identifier);
         }
 
         let became_readable = if let Some(stream) = self.streams.get_mut(&stream_identifier) {
@@ -2755,6 +2786,13 @@ impl Association {
                     self.deferred_reset_data.remove(&chunk.tsn);
                 }
             }
+        }
+
+        // A resolved TSN gap can disambiguate a deferred ordered skip whose
+        // later SSN arrived first on a reset successor.
+        let stream_ids: Vec<StreamId> = self.deferred_forward_tsns.keys().copied().collect();
+        for stream_identifier in stream_ids {
+            self.apply_deferred_forward_tsns(stream_identifier);
         }
 
         let has_packet_loss = !self.payload_queue.is_empty();

@@ -159,8 +159,13 @@ impl PendingResetCompletions {
 
 #[derive(Debug, Copy, Clone)]
 enum DeferredForwardTsnKind {
-    Ordered { last_ssn: u16 },
-    Unordered { new_cumulative_tsn: u32 },
+    Ordered {
+        last_ssn: u16,
+        new_cumulative_tsn: u32,
+    },
+    Unordered {
+        new_cumulative_tsn: u32,
+    },
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -1420,6 +1425,9 @@ impl Association {
             stream.reassembly_queue =
                 ReassemblyQueue::new(stream_identifier, self.max_receive_message_size);
         }
+        if !self.stream_reset_blocked(stream_identifier) {
+            self.unregister_stream(stream_identifier, false);
+        }
     }
 
     /// set_state atomically sets the state of the Association.
@@ -1891,17 +1899,61 @@ impl Association {
             || current_boundary == self.pending_reset_boundary(stream_identifier)
     }
 
-    fn apply_or_defer_ordered_forward_tsn(&mut self, stream_identifier: StreamId, last_ssn: u16) {
+    fn apply_or_defer_ordered_forward_tsn(
+        &mut self,
+        stream_identifier: StreamId,
+        last_ssn: u16,
+        new_cumulative_tsn: u32,
+    ) {
         if !self.forward_tsn_applies_to_current_generation(stream_identifier) {
             let generation_boundary = self.pending_reset_boundary(stream_identifier);
-            let kind = DeferredForwardTsnKind::Ordered { last_ssn };
-            self.deferred_forward_tsns
-                .entry(stream_identifier)
-                .or_default()
-                .push_back(DeferredForwardTsn {
-                    generation_boundary,
-                    kind,
+            let kind = {
+                let updates = self
+                    .deferred_forward_tsns
+                    .entry(stream_identifier)
+                    .or_default();
+                let previous = updates.iter_mut().find(|update| {
+                    if update.generation_boundary != generation_boundary {
+                        return false;
+                    }
+                    let DeferredForwardTsnKind::Ordered {
+                        last_ssn: previous_ssn,
+                        ..
+                    } = update.kind
+                    else {
+                        return false;
+                    };
+                    previous_ssn == last_ssn
+                        || (generation_boundary.is_some() && sna16lt(previous_ssn, last_ssn))
                 });
+
+                if let Some(previous) = previous {
+                    let DeferredForwardTsnKind::Ordered {
+                        last_ssn: previous_ssn,
+                        new_cumulative_tsn: previous_cumulative_tsn,
+                    } = &mut previous.kind
+                    else {
+                        unreachable!();
+                    };
+                    if sna16lt(*previous_ssn, last_ssn) {
+                        *previous_ssn = last_ssn;
+                    }
+                    if sna32lt(*previous_cumulative_tsn, new_cumulative_tsn) {
+                        *previous_cumulative_tsn = new_cumulative_tsn;
+                    }
+                    previous.kind
+                } else {
+                    let kind = DeferredForwardTsnKind::Ordered {
+                        last_ssn,
+                        new_cumulative_tsn,
+                    };
+                    updates.push_back(DeferredForwardTsn {
+                        generation_boundary,
+                        kind,
+                    });
+                    kind
+                }
+            };
             self.prune_deferred_reset_data_for_forward_tsn(
                 stream_identifier,
                 generation_boundary,
@@ -2014,8 +2066,13 @@ impl Association {
             let was_readable = stream.reassembly_queue.is_readable();
             for update in ready {
                 match update.kind {
-                    DeferredForwardTsnKind::Ordered { last_ssn } => {
-                        stream.reassembly_queue.forward_tsn_for_ordered(last_ssn);
+                    DeferredForwardTsnKind::Ordered {
+                        last_ssn,
+                        new_cumulative_tsn,
+                    } => {
+                        stream
+                            .reassembly_queue
+                            .forward_tsn_for_ordered_bounded(last_ssn, new_cumulative_tsn);
                     }
                     DeferredForwardTsnKind::Unordered { new_cumulative_tsn } => {
                         stream
@@ -2088,8 +2145,11 @@ impl Association {
             }
         }
         match kind {
-            DeferredForwardTsnKind::Ordered { last_ssn } => {
-                queue.forward_tsn_for_ordered(last_ssn);
+            DeferredForwardTsnKind::Ordered {
+                last_ssn,
+                new_cumulative_tsn,
+            } => {
+                queue.forward_tsn_for_ordered_bounded(last_ssn, new_cumulative_tsn);
             }
             DeferredForwardTsnKind::Unordered { new_cumulative_tsn } => {
                 queue.forward_tsn_for_unordered(new_cumulative_tsn);
@@ -2522,7 +2582,11 @@ impl Association {
         // corresponding streams so that the abandoned chunks can be removed
         // from the reassemblyQueue.
         for forwarded in &c.streams {
-            self.apply_or_defer_ordered_forward_tsn(forwarded.identifier, forwarded.sequence);
+            self.apply_or_defer_ordered_forward_tsn(
+                forwarded.identifier,
+                forwarded.sequence,
+                c.new_cumulative_tsn,
+            );
         }
 
         // TSN may be forwarded for unordered chunks. ForwardTSN chunk does not
@@ -2587,7 +2651,11 @@ impl Association {
                 );
             } else {
                 // MID maps to SSN for ordered streams; truncate to u16
-                self.apply_or_defer_ordered_forward_tsn(forwarded.identifier, forwarded.mid as u16);
+                self.apply_or_defer_ordered_forward_tsn(
+                    forwarded.identifier,
+                    forwarded.mid as u16,
+                    c.new_cumulative_tsn,
+                );
             }
         }
 
@@ -3206,7 +3274,7 @@ impl Association {
         }
 
         // Respond to every request that arrived, fresh, retransmitted
-        // or defered by arrival of in-flight data.
+        // or deferred by arrival of in-flight data.
         //
         // Intermediate re-evaluations that still fail due to in-flight data
         // stay silent rather than repeating "In progress" on every advance.

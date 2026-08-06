@@ -292,6 +292,10 @@ impl<'a> Stream<'a> {
     /// `StreamEvent::Finished` followed by `StreamEvent::ResetComplete` or
     /// `StreamEvent::ResetFailed`.
     pub fn stop(&mut self) -> Result<()> {
+        let retiring = self
+            .association
+            .retiring_streams
+            .contains_key(&self.stream_identifier);
         let reset = self
             .association
             .streams
@@ -301,6 +305,7 @@ impl<'a> Stream<'a> {
             });
 
         if reset
+            && !retiring
             && !self
                 .association
                 .stream_reset_in_progress(self.stream_identifier)
@@ -323,11 +328,7 @@ impl<'a> Stream<'a> {
         // stop() promises that future reads are not permitted. If a reset was
         // preserving unread boundary DATA, discard that old generation now so
         // its Finished event and unrelated association events cannot stall.
-        if self
-            .association
-            .retiring_streams
-            .contains_key(&self.stream_identifier)
-        {
+        if retiring {
             self.association
                 .discard_retiring_streams(self.stream_identifier);
         }

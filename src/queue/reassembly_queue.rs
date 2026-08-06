@@ -457,6 +457,52 @@ impl ReassemblyQueue {
         }
     }
 
+    /// Apply an ordered Forward-TSN retained across a stream reset without
+    /// crossing into messages whose TSNs are newer than its cumulative point.
+    pub(crate) fn forward_tsn_for_ordered_bounded(
+        &mut self,
+        last_ssn: u16,
+        new_cumulative_tsn: u32,
+    ) {
+        let first_newer_ssn = self
+            .ordered
+            .iter()
+            .filter(|chunks| {
+                sna16lte(chunks.ssn, last_ssn)
+                    && chunks
+                        .chunks
+                        .iter()
+                        .any(|chunk| sna32gt(chunk.tsn, new_cumulative_tsn))
+            })
+            .map(|chunks| chunks.ssn)
+            .reduce(|first, candidate| {
+                if sna16lt(candidate, first) {
+                    candidate
+                } else {
+                    first
+                }
+            });
+
+        let is_forwarded = |ssn| {
+            sna16lte(ssn, last_ssn) && first_newer_ssn.is_none_or(|first| sna16lt(ssn, first))
+        };
+        let num_bytes = self
+            .ordered
+            .iter()
+            .filter(|chunks| is_forwarded(chunks.ssn) && !chunks.is_complete())
+            .flat_map(|chunks| chunks.chunks.iter())
+            .map(|chunk| chunk.user_data.len())
+            .sum();
+        self.subtract_num_bytes(num_bytes);
+        self.ordered
+            .retain(|chunks| !is_forwarded(chunks.ssn) || chunks.is_complete());
+
+        let next_ssn = first_newer_ssn.unwrap_or_else(|| last_ssn.wrapping_add(1));
+        if sna16lt(self.next_ssn, next_ssn) {
+            self.next_ssn = next_ssn;
+        }
+    }
+
     /// Remove all fragments in the unordered sets that contains chunks
     /// equal to or older than `new_cumulative_tsn`.
     /// We know all sets in the r.unordered are complete ones.

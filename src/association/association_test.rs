@@ -2050,7 +2050,7 @@ fn test_deferred_bounded_ordered_forward_tsn_updates_are_coalesced() -> Result<(
     );
     assert!(matches!(
         ordered[0].kind,
-        DeferredForwardTsnKind::Ordered { last_ssn: 7 }
+        DeferredForwardTsnKind::Ordered { last_ssn: 7, .. }
     ));
     Ok(())
 }

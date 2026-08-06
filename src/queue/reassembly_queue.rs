@@ -530,13 +530,22 @@ impl ReassemblyQueue {
     pub(crate) fn can_apply_forward_tsn_for_ordered_bounded(
         &self,
         last_ssn: u16,
+        new_cumulative_tsn: u32,
         peer_last_tsn: u32,
     ) -> bool {
         if sna16gt(self.next_ssn, last_ssn)
-            || self
-                .ordered
-                .iter()
-                .any(|chunks| chunks.ssn == self.next_ssn)
+            || self.ordered.iter().any(|chunks| {
+                chunks.ssn == self.next_ssn
+                    || (sna16lte(chunks.ssn, last_ssn)
+                        && if chunks.is_complete() {
+                            chunks
+                                .chunks
+                                .iter()
+                                .all(|chunk| sna32lte(chunk.tsn, new_cumulative_tsn))
+                        } else {
+                            chunks.is_missing_tsn_at_or_before(new_cumulative_tsn)
+                        })
+            })
         {
             return true;
         }

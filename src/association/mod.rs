@@ -2042,13 +2042,18 @@ impl Association {
         update: DeferredForwardTsn,
     ) -> bool {
         match update.kind {
-            DeferredForwardTsnKind::Ordered { last_ssn, .. } => {
-                self.streams.get(&stream_identifier).is_some_and(|stream| {
-                    stream
-                        .reassembly_queue
-                        .can_apply_forward_tsn_for_ordered_bounded(last_ssn, self.peer_last_tsn)
-                })
-            }
+            DeferredForwardTsnKind::Ordered {
+                last_ssn,
+                new_cumulative_tsn,
+            } => self.streams.get(&stream_identifier).is_some_and(|stream| {
+                stream
+                    .reassembly_queue
+                    .can_apply_forward_tsn_for_ordered_bounded(
+                        last_ssn,
+                        new_cumulative_tsn,
+                        self.peer_last_tsn,
+                    )
+            }),
             DeferredForwardTsnKind::Unordered { .. } => true,
         }
     }

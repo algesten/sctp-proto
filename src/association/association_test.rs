@@ -1545,6 +1545,35 @@ fn test_forward_tsn_skip_is_scoped_to_queued_reset_generation() -> Result<()> {
 }
 
 #[test]
+fn test_retransmitted_forward_tsn_stays_with_reset_generation() -> Result<()> {
+    let mut a = association_with_queued_second_reset()?;
+
+    // The first FORWARD-TSN advances through generation B's abandoned SSN 0
+    // and lets its pending reset complete.
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 2,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 1,
+            sequence: 0,
+        }],
+    })?;
+    assert!(!a.reconfig_requests.contains_key(&8));
+
+    // If the resulting SACK is lost, the sender can legitimately repeat the
+    // same stream skip while advancing over an unrelated abandoned TSN. The
+    // repeated entry still belongs to generation B, not the future tail.
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 3,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 1,
+            sequence: 0,
+        }],
+    })?;
+
+    assert_generation_c_ssn_zero_is_readable(a)
+}
+
+#[test]
 fn test_i_forward_tsn_skip_is_scoped_to_queued_reset_generation() -> Result<()> {
     let mut a = association_with_queued_second_reset()?;
     a.handle_i_forward_tsn(&ChunkIForwardTsn {
@@ -1655,6 +1684,36 @@ fn test_forward_tsn_preserves_complete_deferred_message() -> Result<()> {
             sequence: 1,
         }],
     })?;
+    assert_received_message_survives_forward_tsn(a)
+}
+
+#[test]
+fn test_forward_tsn_preserves_out_of_order_complete_deferred_message() -> Result<()> {
+    let mut a = association_with_retiring_boundary_data()?;
+
+    // Generation B's complete SSN 0 arrives above a TSN gap, so it remains in
+    // both the association payload queue and the reset-generation holding map.
+    a.handle_data(&ChunkPayloadData {
+        tsn: 3,
+        stream_identifier: 1,
+        stream_sequence_number: 0,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"received"),
+        ..Default::default()
+    })?;
+
+    // The sender may not have received the gap SACK before abandoning TSNs 2
+    // and 3. Advancing the cumulative TSN must not erase a complete message
+    // that this receiver already holds for the successor generation.
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 3,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 1,
+            sequence: 0,
+        }],
+    })?;
+
     assert_received_message_survives_forward_tsn(a)
 }
 
@@ -1775,6 +1834,26 @@ fn test_stop_discards_unread_retiring_data_and_unblocks_finished() -> Result<()>
         a.poll(),
         Some(Event::Stream(StreamEvent::Finished { id: 1 }))
     ));
+    Ok(())
+}
+
+#[test]
+fn test_stop_during_retirement_does_not_queue_duplicate_reset() -> Result<()> {
+    let mut a = association_with_retiring_boundary_data()?;
+    assert_eq!(
+        a.reconfigs.len(),
+        1,
+        "peer reset should queue one reciprocal"
+    );
+    assert!(a.pending_reset_streams.is_empty());
+
+    a.stream(1)?.stop()?;
+
+    assert!(
+        a.pending_reset_streams.is_empty(),
+        "the reciprocal already resets this outgoing stream"
+    );
+    assert_eq!(a.reconfigs.len(), 1);
     Ok(())
 }
 

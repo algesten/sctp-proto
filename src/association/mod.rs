@@ -2036,25 +2036,34 @@ impl Association {
         }
     }
 
-    fn deferred_forward_tsn_is_ready(
+    fn deferred_forward_tsn_application(
         &self,
         stream_identifier: StreamId,
         update: DeferredForwardTsn,
-    ) -> bool {
+    ) -> Option<(DeferredForwardTsnKind, bool)> {
         match update.kind {
             DeferredForwardTsnKind::Ordered {
                 last_ssn,
                 new_cumulative_tsn,
-            } => self.streams.get(&stream_identifier).is_some_and(|stream| {
+            } => self.streams.get(&stream_identifier).and_then(|stream| {
                 stream
                     .reassembly_queue
-                    .can_apply_forward_tsn_for_ordered_bounded(
+                    .applicable_forward_tsn_for_ordered_bounded(
                         last_ssn,
                         new_cumulative_tsn,
                         self.peer_last_tsn,
                     )
+                    .map(|applicable_last_ssn| {
+                        (
+                            DeferredForwardTsnKind::Ordered {
+                                last_ssn: applicable_last_ssn,
+                                new_cumulative_tsn,
+                            },
+                            applicable_last_ssn == last_ssn,
+                        )
+                    })
             }),
-            DeferredForwardTsnKind::Unordered { .. } => true,
+            DeferredForwardTsnKind::Unordered { .. } => Some((update.kind, true)),
         }
     }
 
@@ -2070,11 +2079,15 @@ impl Association {
         let mut removals = Vec::with_capacity(updates.len());
         let mut ready = vec![];
         for update in updates {
-            let remove = update.generation_boundary == boundary
-                && self.deferred_forward_tsn_is_ready(stream_identifier, *update);
+            let application = if update.generation_boundary == boundary {
+                self.deferred_forward_tsn_application(stream_identifier, *update)
+            } else {
+                None
+            };
+            let remove = application.is_some_and(|(_, remove)| remove);
             removals.push(remove);
-            if remove {
-                ready.push(*update);
+            if let Some((kind, _)) = application {
+                ready.push(kind);
             }
         }
 
@@ -2100,8 +2113,8 @@ impl Association {
 
         let became_readable = if let Some(stream) = self.streams.get_mut(&stream_identifier) {
             let was_readable = stream.reassembly_queue.is_readable();
-            for update in ready {
-                match update.kind {
+            for kind in ready {
+                match kind {
                     DeferredForwardTsnKind::Ordered {
                         last_ssn,
                         new_cumulative_tsn,

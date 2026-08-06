@@ -2067,6 +2067,164 @@ fn test_resolved_successor_prefix_releases_message_before_stale_tail() -> Result
     Ok(())
 }
 
+fn assert_covered_partial_after_unaffected_anchor_is_discarded(last_ssn: u16) -> Result<()> {
+    let mut a = association_with_queued_second_reset()?;
+    for new_cumulative_tsn in [2, 3] {
+        a.handle_forward_tsn(&ChunkForwardTsn {
+            new_cumulative_tsn,
+            streams: vec![ChunkForwardTsnStream {
+                identifier: 1,
+                sequence: last_ssn,
+            }],
+        })?;
+    }
+    for chunk in [
+        ChunkPayloadData {
+            tsn: 4,
+            stream_identifier: 1,
+            stream_sequence_number: 1,
+            beginning_fragment: false,
+            ending_fragment: true,
+            user_data: Bytes::from_static(b"orphan"),
+            ..Default::default()
+        },
+        ChunkPayloadData {
+            tsn: 5,
+            stream_identifier: 1,
+            stream_sequence_number: 0,
+            beginning_fragment: true,
+            ending_fragment: true,
+            user_data: Bytes::from_static(b"zero"),
+            ..Default::default()
+        },
+    ] {
+        a.handle_data(&chunk)?;
+    }
+
+    let old = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(old.read(&mut payload)?, payload.len());
+    let zero = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 4];
+    assert_eq!(zero.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"zero");
+    assert_eq!(
+        a.get_my_receiver_window_credit(),
+        a.max_receive_buffer_size,
+        "the covered partial message must release its receive-window credit"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_full_forward_update_discards_covered_partial_after_anchor() -> Result<()> {
+    assert_covered_partial_after_unaffected_anchor_is_discarded(1)
+}
+
+#[test]
+fn test_partial_forward_update_discards_covered_partial_after_anchor() -> Result<()> {
+    assert_covered_partial_after_unaffected_anchor_is_discarded(2)
+}
+
+#[test]
+fn test_drained_generation_discards_retained_forward_suffix() -> Result<()> {
+    let mut a = association_with_retiring_boundary_data()?;
+    let reset: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 8,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: 5,
+        stream_identifiers: vec![1],
+    });
+    a.handle_reconfig_param(&reset, &mut vec![])?;
+    a.handle_data(&ChunkPayloadData {
+        tsn: 4,
+        stream_identifier: 1,
+        stream_sequence_number: 1,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"one"),
+        ..Default::default()
+    })?;
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 5,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 1,
+            sequence: 2,
+        }],
+    })?;
+
+    let old = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(old.read(&mut payload)?, payload.len());
+    let one = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(one.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"one");
+    assert!(
+        a.deferred_forward_tsns.get(&1).is_none_or(|updates| {
+            updates
+                .iter()
+                .all(|update| update.generation_boundary != Some(5))
+        }),
+        "a drained reset generation must discard its retained ambiguous suffix"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_first_reset_discards_retained_tail_forward_suffix() -> Result<()> {
+    let mut a = association_with_queued_second_reset()?;
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 2,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 1,
+            sequence: 0,
+        }],
+    })?;
+    a.handle_data(&ChunkPayloadData {
+        tsn: 4,
+        stream_identifier: 1,
+        stream_sequence_number: 1,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"one"),
+        ..Default::default()
+    })?;
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 5,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 1,
+            sequence: 2,
+        }],
+    })?;
+
+    let old = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(old.read(&mut payload)?, payload.len());
+    let one = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(one.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"one");
+    assert!(
+        a.deferred_forward_tsns[&1]
+            .iter()
+            .any(|update| update.generation_boundary.is_none())
+    );
+
+    let reset: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 9,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: 5,
+        stream_identifiers: vec![1],
+    });
+    a.handle_reconfig_param(&reset, &mut vec![])?;
+    assert!(
+        !a.deferred_forward_tsns.contains_key(&1),
+        "resetting a drained tail must discard its retained ambiguous suffix"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_i_forward_tsn_skip_is_scoped_to_queued_reset_generation() -> Result<()> {
     let mut a = association_with_queued_second_reset()?;

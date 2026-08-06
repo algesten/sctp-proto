@@ -1985,6 +1985,49 @@ fn test_cross_generation_forward_tsn_does_not_skip_uncovered_successor_ssn() -> 
 }
 
 #[test]
+fn test_successor_forward_tsn_releases_covered_message_before_lost_tail() -> Result<()> {
+    let mut a = association_with_queued_second_reset()?;
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 2,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 1,
+            sequence: 0,
+        }],
+    })?;
+    a.handle_data(&ChunkPayloadData {
+        tsn: 4,
+        stream_identifier: 1,
+        stream_sequence_number: 1,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"one"),
+        ..Default::default()
+    })?;
+
+    // Successor SSN 0/TSN 3 and SSN 2/TSN 5 were both abandoned. The
+    // complete covered SSN 1 can be released before SSN 2 is observed.
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 5,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 1,
+            sequence: 2,
+        }],
+    })?;
+
+    let old = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(old.read(&mut payload)?, payload.len());
+    let one = a
+        .stream(1)?
+        .read()?
+        .expect("covered successor data must not wait for the lost final SSN");
+    let mut payload = [0; 3];
+    assert_eq!(one.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"one");
+    Ok(())
+}
+
+#[test]
 fn test_i_forward_tsn_skip_is_scoped_to_queued_reset_generation() -> Result<()> {
     let mut a = association_with_queued_second_reset()?;
     a.handle_i_forward_tsn(&ChunkIForwardTsn {

@@ -1630,6 +1630,97 @@ fn test_successor_i_forward_tsn_can_reuse_reset_mid() -> Result<()> {
 }
 
 #[test]
+fn test_repeated_old_forward_tsn_does_not_skip_later_successor_ssn() -> Result<()> {
+    let mut a = association_with_queued_second_reset()?;
+    for new_cumulative_tsn in [2, 3] {
+        a.handle_forward_tsn(&ChunkForwardTsn {
+            new_cumulative_tsn,
+            streams: vec![ChunkForwardTsnStream {
+                identifier: 1,
+                sequence: 1,
+            }],
+        })?;
+    }
+
+    let old = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(old.read(&mut payload)?, payload.len());
+
+    for (tsn, ssn, bytes) in [(4, 0, b"zero".as_slice()), (5, 1, b"one".as_slice())] {
+        a.handle_data(&ChunkPayloadData {
+            tsn,
+            stream_identifier: 1,
+            stream_sequence_number: ssn,
+            beginning_fragment: true,
+            ending_fragment: true,
+            user_data: Bytes::copy_from_slice(bytes),
+            ..Default::default()
+        })?;
+        let message = a
+            .stream(1)?
+            .read()?
+            .expect("an old-generation repeat must not skip a live successor SSN");
+        let mut payload = [0; 4];
+        assert_eq!(message.read(&mut payload)?, bytes.len());
+        assert_eq!(&payload[..bytes.len()], bytes);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_repeated_old_forward_tsn_preserves_partial_successor_above_cumulative() -> Result<()> {
+    let mut a = association_with_queued_second_reset()?;
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 2,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 1,
+            sequence: 0,
+        }],
+    })?;
+    a.handle_data(&ChunkPayloadData {
+        tsn: 4,
+        stream_identifier: 1,
+        stream_sequence_number: 0,
+        beginning_fragment: true,
+        ending_fragment: false,
+        user_data: Bytes::from_static(b"live-"),
+        ..Default::default()
+    })?;
+
+    // TSN 3 is unrelated to this stream. Repeating generation B's skip must
+    // not discard generation C's fragment at TSN 4.
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 3,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 1,
+            sequence: 0,
+        }],
+    })?;
+
+    let old = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(old.read(&mut payload)?, payload.len());
+    a.handle_data(&ChunkPayloadData {
+        tsn: 5,
+        stream_identifier: 1,
+        stream_sequence_number: 0,
+        beginning_fragment: false,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"data"),
+        ..Default::default()
+    })?;
+
+    let message = a
+        .stream(1)?
+        .read()?
+        .expect("the successor fragments should still reassemble");
+    let mut payload = [0; 9];
+    assert_eq!(message.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"live-data");
+    Ok(())
+}
+
+#[test]
 fn test_i_forward_tsn_skip_is_scoped_to_queued_reset_generation() -> Result<()> {
     let mut a = association_with_queued_second_reset()?;
     a.handle_i_forward_tsn(&ChunkIForwardTsn {
@@ -1897,6 +1988,74 @@ fn test_deferred_unordered_forward_tsn_updates_are_coalesced() -> Result<()> {
 }
 
 #[test]
+fn test_deferred_tail_ordered_forward_tsn_duplicates_are_coalesced() -> Result<()> {
+    let mut a = association_with_retiring_boundary_data()?;
+    for new_cumulative_tsn in 2..=9 {
+        a.handle_forward_tsn(&ChunkForwardTsn {
+            new_cumulative_tsn,
+            streams: vec![ChunkForwardTsnStream {
+                identifier: 1,
+                sequence: 0,
+            }],
+        })?;
+    }
+
+    let ordered: Vec<_> = a.deferred_forward_tsns[&1]
+        .iter()
+        .filter(|update| {
+            update.generation_boundary.is_none()
+                && matches!(update.kind, DeferredForwardTsnKind::Ordered { .. })
+        })
+        .collect();
+    assert_eq!(
+        ordered.len(),
+        1,
+        "lost-SACK repeats for an ambiguous tail SSN should coalesce"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_deferred_bounded_ordered_forward_tsn_updates_are_coalesced() -> Result<()> {
+    let mut a = association_with_retiring_boundary_data()?;
+    let reset: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 8,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: 10,
+        stream_identifiers: vec![1],
+    });
+    a.handle_reconfig_param(&reset, &mut vec![])?;
+
+    for new_cumulative_tsn in 2..=9 {
+        a.handle_forward_tsn(&ChunkForwardTsn {
+            new_cumulative_tsn,
+            streams: vec![ChunkForwardTsnStream {
+                identifier: 1,
+                sequence: (new_cumulative_tsn - 2) as u16,
+            }],
+        })?;
+    }
+
+    let ordered: Vec<_> = a.deferred_forward_tsns[&1]
+        .iter()
+        .filter(|update| {
+            update.generation_boundary == Some(10)
+                && matches!(update.kind, DeferredForwardTsnKind::Ordered { .. })
+        })
+        .collect();
+    assert_eq!(
+        ordered.len(),
+        1,
+        "a newer ordered skip supersedes older skips for the same reset boundary"
+    );
+    assert!(matches!(
+        ordered[0].kind,
+        DeferredForwardTsnKind::Ordered { last_ssn: 7 }
+    ));
+    Ok(())
+}
+
+#[test]
 fn test_unread_retiring_stream_does_not_block_unrelated_events() -> Result<()> {
     let mut a = association_with_retiring_boundary_data()?;
     assert!(
@@ -2000,6 +2159,47 @@ fn test_stop_during_retirement_allows_reuse_after_reset_complete() -> Result<()>
 #[test]
 fn test_close_during_retirement_allows_reuse_after_reset_complete() -> Result<()> {
     assert_shutdown_during_retirement_allows_reuse(true)
+}
+
+fn assert_reset_complete_before_shutdown_allows_reuse(close: bool) -> Result<()> {
+    let mut a = association_with_retiring_boundary_data()?;
+    let rsn = *a.reconfigs.keys().next().unwrap();
+    a.active_reconfig = Some(rsn);
+    let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+        reconfig_response_sequence_number: rsn,
+        result: ReconfigResult::SuccessPerformed,
+    });
+    a.handle_reconfig_param(&response, &mut vec![])?;
+
+    if close {
+        a.stream(1)?.close()?;
+    } else {
+        a.stream(1)?.stop()?;
+    }
+
+    assert!(
+        a.pending_reset_streams.is_empty() && a.reconfigs.is_empty(),
+        "shutting down a completed retiring stream must not queue a duplicate reset"
+    );
+    assert!(
+        !a.streams.contains_key(&1),
+        "discarding the retired generation after ResetComplete must remove the stream"
+    );
+    assert!(
+        a.open_stream(1, PayloadProtocolIdentifier::Binary).is_ok(),
+        "the completed stream id should be immediately reusable"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_reset_complete_before_stop_allows_reuse() -> Result<()> {
+    assert_reset_complete_before_shutdown_allows_reuse(false)
+}
+
+#[test]
+fn test_reset_complete_before_close_allows_reuse() -> Result<()> {
+    assert_reset_complete_before_shutdown_allows_reuse(true)
 }
 
 #[test]

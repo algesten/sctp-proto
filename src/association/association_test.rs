@@ -1721,6 +1721,118 @@ fn test_repeated_old_forward_tsn_preserves_partial_successor_above_cumulative() 
 }
 
 #[test]
+fn test_deferred_forward_tsn_discards_partial_missing_pre_cumulative_tsn() -> Result<()> {
+    let mut a = association_with_retiring_boundary_data()?;
+    let reset: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 8,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: 4,
+        stream_identifiers: vec![1],
+    });
+    a.handle_reconfig_param(&reset, &mut vec![])?;
+
+    // B/SSN 0 is missing its beginning at TSN 2, while B/SSN 1 is complete.
+    for chunk in [
+        ChunkPayloadData {
+            tsn: 3,
+            stream_identifier: 1,
+            stream_sequence_number: 0,
+            beginning_fragment: false,
+            ending_fragment: true,
+            user_data: Bytes::from_static(b"orphan"),
+            ..Default::default()
+        },
+        ChunkPayloadData {
+            tsn: 4,
+            stream_identifier: 1,
+            stream_sequence_number: 1,
+            beginning_fragment: true,
+            ending_fragment: true,
+            user_data: Bytes::from_static(b"next"),
+            ..Default::default()
+        },
+    ] {
+        a.handle_data(&chunk)?;
+    }
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 2,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 1,
+            sequence: 0,
+        }],
+    })?;
+
+    assert_eq!(
+        a.get_my_receiver_window_credit(),
+        a.max_receive_buffer_size - 3 - 4,
+        "the partial message missing TSN 2 must release its six bytes immediately"
+    );
+    let old = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(old.read(&mut payload)?, payload.len());
+
+    let next = a
+        .stream(1)?
+        .read()?
+        .expect("discarding abandoned SSN 0 must unblock complete SSN 1");
+    let mut payload = [0; 4];
+    assert_eq!(next.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"next");
+    Ok(())
+}
+
+#[test]
+fn test_reordered_successor_waits_before_consuming_old_forward_tsn() -> Result<()> {
+    let mut a = association_with_queued_second_reset()?;
+    for new_cumulative_tsn in [2, 3] {
+        a.handle_forward_tsn(&ChunkForwardTsn {
+            new_cumulative_tsn,
+            streams: vec![ChunkForwardTsnStream {
+                identifier: 1,
+                sequence: 0,
+            }],
+        })?;
+    }
+    a.handle_data(&ChunkPayloadData {
+        tsn: 5,
+        stream_identifier: 1,
+        stream_sequence_number: 1,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"one"),
+        ..Default::default()
+    })?;
+
+    let old = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(old.read(&mut payload)?, payload.len());
+    assert!(
+        a.stream(1)?.read()?.is_none(),
+        "SSN 1 must wait while SSN 0's post-FWD TSN is still missing"
+    );
+
+    a.handle_data(&ChunkPayloadData {
+        tsn: 4,
+        stream_identifier: 1,
+        stream_sequence_number: 0,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"zero"),
+        ..Default::default()
+    })?;
+    for expected in [b"zero".as_slice(), b"one".as_slice()] {
+        let message = a
+            .stream(1)?
+            .read()?
+            .expect("successor messages should become readable in SSN order");
+        let mut payload = [0; 4];
+        assert_eq!(message.read(&mut payload)?, expected.len());
+        assert_eq!(&payload[..expected.len()], expected);
+    }
+    Ok(())
+}
+
+#[test]
 fn test_i_forward_tsn_skip_is_scoped_to_queued_reset_generation() -> Result<()> {
     let mut a = association_with_queued_second_reset()?;
     a.handle_i_forward_tsn(&ChunkIForwardTsn {

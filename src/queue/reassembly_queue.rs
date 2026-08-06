@@ -505,19 +505,24 @@ impl ReassemblyQueue {
                 }
             });
 
-        let is_forwarded = |ssn| {
-            sna16lte(ssn, last_ssn) && first_unaffected_ssn.is_none_or(|first| sna16lt(ssn, first))
+        let is_abandoned_partial = |chunks: &&Chunks| {
+            sna16lte(chunks.ssn, last_ssn)
+                && !chunks.is_complete()
+                && chunks.is_missing_tsn_at_or_before(new_cumulative_tsn)
         };
         let num_bytes = self
             .ordered
             .iter()
-            .filter(|chunks| is_forwarded(chunks.ssn) && !chunks.is_complete())
+            .filter(is_abandoned_partial)
             .flat_map(|chunks| chunks.chunks.iter())
             .map(|chunk| chunk.user_data.len())
             .sum();
         self.subtract_num_bytes(num_bytes);
-        self.ordered
-            .retain(|chunks| !is_forwarded(chunks.ssn) || chunks.is_complete());
+        self.ordered.retain(|chunks| {
+            !sna16lte(chunks.ssn, last_ssn)
+                || chunks.is_complete()
+                || !chunks.is_missing_tsn_at_or_before(new_cumulative_tsn)
+        });
 
         let next_ssn = first_unaffected_ssn.unwrap_or_else(|| last_ssn.wrapping_add(1));
         if sna16lt(self.next_ssn, next_ssn) {

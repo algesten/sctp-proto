@@ -1308,10 +1308,18 @@ impl Association {
         });
 
         if !has_readable_data {
+            self.deferred_forward_tsns.remove(&stream_identifier);
             self.unregister_stream(stream_identifier, true);
             return;
         }
 
+        if let Some(updates) = self.deferred_forward_tsns.get_mut(&stream_identifier) {
+            for update in updates {
+                if update.generation_boundary.is_none() {
+                    update.generation_boundary = Some(sender_last_tsn);
+                }
+            }
+        }
         let mut boundaries = VecDeque::new();
         boundaries.push_back(sender_last_tsn);
         self.retiring_streams.insert(stream_identifier, boundaries);
@@ -1344,6 +1352,7 @@ impl Association {
                     .expect("retiring stream must have a current generation");
                 (completed, boundaries.front().copied())
             };
+            self.discard_deferred_forward_tsns_through(stream_identifier, completed_boundary);
             self.ready_stream_finishes.insert(stream_identifier);
 
             let Some(next_boundary) = next_boundary else {

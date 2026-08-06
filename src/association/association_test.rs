@@ -1573,6 +1573,62 @@ fn test_retransmitted_forward_tsn_stays_with_reset_generation() -> Result<()> {
     assert_generation_c_ssn_zero_is_readable(a)
 }
 
+fn assert_successor_ssn_one_after_reused_forward_ssn(mut a: Association) -> Result<()> {
+    let old = a.stream(1)?.read()?.unwrap();
+    let mut payload = [0; 3];
+    assert_eq!(old.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"old");
+
+    a.handle_data(&ChunkPayloadData {
+        tsn: 4,
+        stream_identifier: 1,
+        stream_sequence_number: 1,
+        beginning_fragment: true,
+        ending_fragment: true,
+        user_data: Bytes::from_static(b"gen-c"),
+        ..Default::default()
+    })?;
+    let generation_c = a
+        .stream(1)?
+        .read()?
+        .expect("generation C SSN 1 should follow its abandoned SSN 0");
+    let mut payload = [0; 5];
+    assert_eq!(generation_c.read(&mut payload)?, payload.len());
+    assert_eq!(&payload, b"gen-c");
+    Ok(())
+}
+
+#[test]
+fn test_successor_forward_tsn_can_reuse_reset_ssn() -> Result<()> {
+    let mut a = association_with_queued_second_reset()?;
+    for new_cumulative_tsn in [2, 3] {
+        a.handle_forward_tsn(&ChunkForwardTsn {
+            new_cumulative_tsn,
+            streams: vec![ChunkForwardTsnStream {
+                identifier: 1,
+                sequence: 0,
+            }],
+        })?;
+    }
+    assert_successor_ssn_one_after_reused_forward_ssn(a)
+}
+
+#[test]
+fn test_successor_i_forward_tsn_can_reuse_reset_mid() -> Result<()> {
+    let mut a = association_with_queued_second_reset()?;
+    for new_cumulative_tsn in [2, 3] {
+        a.handle_i_forward_tsn(&ChunkIForwardTsn {
+            new_cumulative_tsn,
+            streams: vec![ChunkIForwardTsnStream {
+                identifier: 1,
+                unordered: false,
+                mid: 0,
+            }],
+        })?;
+    }
+    assert_successor_ssn_one_after_reused_forward_ssn(a)
+}
+
 #[test]
 fn test_i_forward_tsn_skip_is_scoped_to_queued_reset_generation() -> Result<()> {
     let mut a = association_with_queued_second_reset()?;
@@ -1789,6 +1845,58 @@ fn test_i_forward_tsn_discards_deferred_unordered_fragment() -> Result<()> {
 }
 
 #[test]
+fn test_forward_tsn_releases_abandoned_deferred_fragment_credit_immediately() -> Result<()> {
+    let mut a = association_with_deferred_unordered_fragment()?;
+    let old_generation_bytes = a
+        .streams
+        .get(&1)
+        .unwrap()
+        .get_num_bytes_in_reassembly_queue() as u32;
+
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: 3,
+        streams: vec![],
+    })?;
+
+    assert_eq!(
+        a.get_my_receiver_window_credit(),
+        a.max_receive_buffer_size - old_generation_bytes,
+        "abandoned successor fragments must not hold receive-window credit until the old generation drains"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_deferred_unordered_forward_tsn_updates_are_coalesced() -> Result<()> {
+    let mut a = association_with_retiring_boundary_data()?;
+    a.streams.get_mut(&1).unwrap().unordered = true;
+
+    for new_cumulative_tsn in 2..=9 {
+        a.handle_forward_tsn(&ChunkForwardTsn {
+            new_cumulative_tsn,
+            streams: vec![],
+        })?;
+    }
+
+    let updates = a.deferred_forward_tsns.get(&1).unwrap();
+    assert_eq!(
+        updates.len(),
+        1,
+        "newer unordered cumulative TSNs supersede older updates for the same generation"
+    );
+    assert!(matches!(
+        updates.front(),
+        Some(DeferredForwardTsn {
+            kind: DeferredForwardTsnKind::Unordered {
+                new_cumulative_tsn: 9
+            },
+            ..
+        })
+    ));
+    Ok(())
+}
+
+#[test]
 fn test_unread_retiring_stream_does_not_block_unrelated_events() -> Result<()> {
     let mut a = association_with_retiring_boundary_data()?;
     assert!(
@@ -1855,6 +1963,43 @@ fn test_stop_during_retirement_does_not_queue_duplicate_reset() -> Result<()> {
     );
     assert_eq!(a.reconfigs.len(), 1);
     Ok(())
+}
+
+fn assert_shutdown_during_retirement_allows_reuse(close: bool) -> Result<()> {
+    let mut a = association_with_retiring_boundary_data()?;
+    if close {
+        a.stream(1)?.close()?;
+    } else {
+        a.stream(1)?.stop()?;
+    }
+
+    let rsn = *a.reconfigs.keys().next().unwrap();
+    a.active_reconfig = Some(rsn);
+    let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+        reconfig_response_sequence_number: rsn,
+        result: ReconfigResult::SuccessPerformed,
+    });
+    a.handle_reconfig_param(&response, &mut vec![])?;
+
+    assert!(
+        !a.streams.contains_key(&1),
+        "a completed reciprocal reset must remove the locally shut down stream"
+    );
+    assert!(
+        a.open_stream(1, PayloadProtocolIdentifier::Binary).is_ok(),
+        "ResetComplete must make the retired stream id reusable"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_stop_during_retirement_allows_reuse_after_reset_complete() -> Result<()> {
+    assert_shutdown_during_retirement_allows_reuse(false)
+}
+
+#[test]
+fn test_close_during_retirement_allows_reuse_after_reset_complete() -> Result<()> {
+    assert_shutdown_during_retirement_allows_reuse(true)
 }
 
 #[test]
@@ -2003,6 +2148,40 @@ fn test_duplicate_stream_ids_retire_only_one_generation() -> Result<()> {
             .collect::<Vec<_>>(),
         vec![stream_id]
     );
+    Ok(())
+}
+
+#[test]
+fn test_reconfig_rejects_two_outgoing_resets_without_mutation() -> Result<()> {
+    let mut a = association_with_retiring_boundary_data()?;
+    let boundaries_before = a.retiring_streams.get(&1).unwrap().len();
+    let completions_before = a.pending_reset_completions.0.get(&1).copied();
+    let reconfigs_before = a.reconfigs.len();
+
+    let reconfig = ChunkReconfig {
+        param_a: Some(Box::new(ParamOutgoingResetRequest {
+            reconfig_request_sequence_number: 8,
+            reconfig_response_sequence_number: u32::MAX,
+            sender_last_tsn: a.peer_last_tsn,
+            stream_identifiers: vec![1],
+        })),
+        param_b: Some(Box::new(ParamOutgoingResetRequest {
+            reconfig_request_sequence_number: 9,
+            reconfig_response_sequence_number: u32::MAX,
+            sender_last_tsn: a.peer_last_tsn,
+            stream_identifiers: vec![1],
+        })),
+    };
+    let packet = a.create_packet(vec![Box::new(reconfig)]);
+    let result = a.handle_chunk(&packet, &packet.chunks[0], Instant::now());
+
+    assert!(result.is_err(), "two Outgoing Reset parameters are invalid");
+    assert_eq!(a.retiring_streams.get(&1).unwrap().len(), boundaries_before);
+    assert_eq!(
+        a.pending_reset_completions.0.get(&1).copied(),
+        completions_before
+    );
+    assert_eq!(a.reconfigs.len(), reconfigs_before);
     Ok(())
 }
 
@@ -2203,6 +2382,38 @@ fn test_empty_reset_stream_list_resets_all_streams() -> Result<()> {
         .unwrap_or_default();
     reciprocal_ids.sort_unstable();
     assert_eq!(reciprocal_ids, vec![1, 2]);
+    Ok(())
+}
+
+#[test]
+fn test_reset_all_reciprocal_fits_reconfig_chunk_length() -> Result<()> {
+    let mut a = Association {
+        my_next_tsn: 1,
+        ..Default::default()
+    };
+    for stream_id in 0..32_758u32 {
+        assert!(
+            a.create_stream(
+                stream_id as StreamId,
+                false,
+                PayloadProtocolIdentifier::Binary,
+            )
+            .is_some()
+        );
+    }
+
+    let request: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 7,
+        reconfig_response_sequence_number: u32::MAX,
+        sender_last_tsn: a.peer_last_tsn,
+        stream_identifiers: vec![],
+    });
+    let mut reply = vec![];
+    a.handle_reconfig_param(&request, &mut reply)?;
+
+    for packet in reply {
+        packet.marshal()?;
+    }
     Ok(())
 }
 

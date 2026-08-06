@@ -576,7 +576,11 @@ impl ReassemblyQueue {
             .filter(|chunks| {
                 (chunks.ssn == self.next_ssn || sna16gt(chunks.ssn, self.next_ssn))
                     && sna16lt(chunks.ssn, last_ssn)
-                    && is_covered(chunks)
+                    && (is_covered(chunks)
+                        || chunks
+                            .chunks
+                            .first()
+                            .is_some_and(|chunk| sna32lte(chunk.tsn, peer_last_tsn)))
             })
             .map(|chunks| chunks.ssn)
             .reduce(|last, candidate| {

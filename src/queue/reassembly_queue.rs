@@ -536,7 +536,7 @@ impl ReassemblyQueue {
             || self
                 .ordered
                 .iter()
-                .any(|chunks| sna16lte(chunks.ssn, last_ssn))
+                .any(|chunks| chunks.ssn == self.next_ssn)
         {
             return true;
         }

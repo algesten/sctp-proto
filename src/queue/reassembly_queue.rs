@@ -535,9 +535,9 @@ impl ReassemblyQueue {
     ) -> bool {
         if sna16gt(self.next_ssn, last_ssn)
             || self.ordered.iter().any(|chunks| {
-                chunks.ssn == self.next_ssn
-                    || (sna16lte(chunks.ssn, last_ssn)
-                        && if chunks.is_complete() {
+                chunks.ssn == last_ssn
+                    && (chunks.ssn == self.next_ssn
+                        || if chunks.is_complete() {
                             chunks
                                 .chunks
                                 .iter()
@@ -552,7 +552,7 @@ impl ReassemblyQueue {
 
         self.ordered
             .iter()
-            .filter(|chunks| sna16gt(chunks.ssn, last_ssn))
+            .filter(|chunks| chunks.ssn == last_ssn || sna16gt(chunks.ssn, last_ssn))
             .flat_map(|chunks| chunks.chunks.iter())
             .map(|chunk| chunk.tsn)
             .reduce(|first, candidate| {

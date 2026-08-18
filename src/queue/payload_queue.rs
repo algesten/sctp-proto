@@ -76,6 +76,27 @@ impl PayloadQueue {
         None
     }
 
+    /// Removes every queued chunk with a TSN at or before `cumulative_tsn`.
+    ///
+    /// Used when a FORWARD-TSN moves the cumulative TSN point past chunks the
+    /// peer abandoned. The cost is proportional to the number of queued chunks,
+    /// not to the size of the TSN jump: `cumulative_tsn` comes off the wire and
+    /// may be up to 2^31 ahead of the current point.
+    pub(crate) fn pop_up_to(&mut self, cumulative_tsn: u32) {
+        let chunk_map = &mut self.chunk_map;
+        let n_bytes = &mut self.n_bytes;
+        self.sorted.retain(|tsn| {
+            if sna32lte(*tsn, cumulative_tsn) {
+                if let Some(c) = chunk_map.remove(tsn) {
+                    *n_bytes = n_bytes.saturating_sub(c.user_data.len());
+                }
+                false
+            } else {
+                true
+            }
+        });
+    }
+
     /// get returns reference to chunkPayloadData with the given TSN value.
     pub(crate) fn get(&self, tsn: u32) -> Option<&ChunkPayloadData> {
         self.chunk_map.get(&tsn)

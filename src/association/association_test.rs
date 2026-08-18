@@ -3526,6 +3526,75 @@ fn test_handle_forward_tsn_dup_forward_tsn_chunk_should_generate_sack() -> Resul
     Ok(())
 }
 
+fn queued_chunk(tsn: u32) -> ChunkPayloadData {
+    ChunkPayloadData {
+        beginning_fragment: true,
+        ending_fragment: true,
+        tsn,
+        user_data: Bytes::from_static(b"ABC"),
+        ..Default::default()
+    }
+}
+
+/// A peer names `new_cumulative_tsn` freely, up to ~2^31 ahead in serial-number
+/// arithmetic. Advancing one TSN per iteration turned that into a multi-second
+/// hang per chunk; the cost must follow the queue, not the size of the jump.
+#[test]
+fn test_handle_forward_tsn_huge_gap_is_bounded() -> Result<()> {
+    let mut a = Association {
+        use_forward_tsn: true,
+        ..Default::default()
+    };
+    let gap: u32 = 1 << 30;
+
+    // One chunk the jump abandons, one beyond it that must survive.
+    assert!(a.payload_queue.push(queued_chunk(5), 0));
+    assert!(a.payload_queue.push(queued_chunk(gap + 5), 0));
+
+    let start = Instant::now();
+    a.handle_forward_tsn(&ChunkForwardTsn {
+        new_cumulative_tsn: gap,
+        streams: vec![],
+    })?;
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "advance must be bounded by queued data, took {elapsed:?}"
+    );
+    assert_eq!(a.peer_last_tsn, gap, "should reach the new cumulative TSN");
+    assert!(a.payload_queue.get(5).is_none(), "abandoned chunk dropped");
+    assert!(a.payload_queue.get(gap + 5).is_some(), "later chunk kept");
+    assert_eq!(a.payload_queue.get_num_bytes(), 3, "bytes follow the drop");
+
+    Ok(())
+}
+
+/// The I-FORWARD-TSN handler (RFC 8260) carries its own copy of the advance.
+#[test]
+fn test_handle_i_forward_tsn_huge_gap_is_bounded() -> Result<()> {
+    let mut a = Association {
+        use_forward_tsn: true,
+        ..Default::default()
+    };
+    let gap: u32 = 1 << 30;
+
+    let start = Instant::now();
+    a.handle_i_forward_tsn(&ChunkIForwardTsn {
+        new_cumulative_tsn: gap,
+        streams: vec![],
+    })?;
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "advance must be bounded by queued data, took {elapsed:?}"
+    );
+    assert_eq!(a.peer_last_tsn, gap, "should reach the new cumulative TSN");
+
+    Ok(())
+}
+
 #[test]
 fn test_assoc_create_new_stream() -> Result<()> {
     let mut a = Association::default();

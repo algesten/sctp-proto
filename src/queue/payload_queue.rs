@@ -68,7 +68,7 @@ impl PayloadQueue {
             self.sorted.remove(0);
             if let Some(c) = self.chunk_map.remove(&tsn) {
                 //self.length -= 1;
-                self.n_bytes -= c.user_data.len();
+                self.n_bytes = self.n_bytes.saturating_sub(c.user_data.len());
                 return Some(c);
             }
         }

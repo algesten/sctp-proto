@@ -1,5 +1,7 @@
 # Unreleased
 
+  * Bound FORWARD-TSN cumulative advance to avoid pinning the CPU up to ~2^31 TSN jumps per chunk
+
 # 0.10.3
 
   * Fix stream reset completion, failure reporting, and request serialization #54

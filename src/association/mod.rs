@@ -2626,15 +2626,10 @@ impl Association {
         //   its cumulative TSN point to the value carried in the FORWARD TSN
         //   chunk,
 
-        // Advance peer_last_tsn
-        while sna32lt(self.peer_last_tsn, c.new_cumulative_tsn) {
-            let next_tsn = self.peer_last_tsn.wrapping_add(1);
-            // Keep the reset-generation copy, if any. Applying the stream
-            // forwarding state after replay discards incomplete messages while
-            // preserving complete DATA already received above a TSN gap.
-            let _ = self.payload_queue.pop(next_tsn);
-            self.peer_last_tsn = next_tsn;
-        }
+        // Advance to the peer's new cumulative tsn point,
+        // dropping the chunks it abandoned along the way.
+        self.payload_queue.pop_up_to(c.new_cumulative_tsn);
+        self.peer_last_tsn = c.new_cumulative_tsn;
 
         // Report new peer_last_tsn value and abandoned largest SSN value to
         // corresponding streams so that the abandoned chunks can be removed
@@ -2690,15 +2685,10 @@ impl Association {
             return Ok(vec![]);
         }
 
-        // Advance peer_last_tsn
-        while sna32lt(self.peer_last_tsn, c.new_cumulative_tsn) {
-            let next_tsn = self.peer_last_tsn.wrapping_add(1);
-            // Keep the reset-generation copy, if any. Applying the stream
-            // forwarding state after replay discards incomplete messages while
-            // preserving complete DATA already received above a TSN gap.
-            let _ = self.payload_queue.pop(next_tsn);
-            self.peer_last_tsn = next_tsn;
-        }
+        // Advance to the peer's new cumulative tsn point,
+        // dropping the chunks it abandoned along the way.
+        self.payload_queue.pop_up_to(c.new_cumulative_tsn);
+        self.peer_last_tsn = c.new_cumulative_tsn;
 
         // Handle per-stream entries using the explicit unordered flag
         for forwarded in &c.streams {

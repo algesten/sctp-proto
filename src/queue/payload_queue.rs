@@ -68,12 +68,33 @@ impl PayloadQueue {
             self.sorted.remove(0);
             if let Some(c) = self.chunk_map.remove(&tsn) {
                 //self.length -= 1;
-                self.n_bytes -= c.user_data.len();
+                self.n_bytes = self.n_bytes.saturating_sub(c.user_data.len());
                 return Some(c);
             }
         }
 
         None
+    }
+
+    /// Removes every queued chunk with a TSN at or before `cumulative_tsn`.
+    ///
+    /// Used when a FORWARD-TSN moves the cumulative TSN point past chunks the
+    /// peer abandoned. The cost is proportional to the number of queued chunks,
+    /// not to the size of the TSN jump: `cumulative_tsn` comes off the wire and
+    /// may be up to 2^31 ahead of the current point.
+    pub(crate) fn pop_up_to(&mut self, cumulative_tsn: u32) {
+        let chunk_map = &mut self.chunk_map;
+        let n_bytes = &mut self.n_bytes;
+        self.sorted.retain(|tsn| {
+            if sna32lte(*tsn, cumulative_tsn) {
+                if let Some(c) = chunk_map.remove(tsn) {
+                    *n_bytes = n_bytes.saturating_sub(c.user_data.len());
+                }
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// get returns reference to chunkPayloadData with the given TSN value.
@@ -86,7 +107,7 @@ impl PayloadQueue {
 
     /// popDuplicates returns an array of TSN values that were found duplicate.
     pub(crate) fn pop_duplicates(&mut self) -> Vec<u32> {
-        self.dup_tsn.drain(..).collect()
+        core::mem::take(&mut self.dup_tsn)
     }
 
     pub(crate) fn get_gap_ack_blocks(&self, cumulative_tsn: u32) -> Vec<GapAckBlock> {

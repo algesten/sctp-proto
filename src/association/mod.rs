@@ -2627,7 +2627,7 @@ impl Association {
         //   chunk,
 
         // Advance to the peer's new cumulative tsn point,
-        // dropping the chunks it abandoned along the way. 
+        // dropping the chunks it abandoned along the way.
         self.payload_queue.pop_up_to(c.new_cumulative_tsn);
         self.peer_last_tsn = c.new_cumulative_tsn;
 

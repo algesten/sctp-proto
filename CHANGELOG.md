@@ -1,5 +1,7 @@
 # Unreleased
 
+# 0.10.4
+
   * Bound FORWARD-TSN cumulative advance to avoid CPU exhaustion on large TSN jumps #56
 
 # 0.10.3

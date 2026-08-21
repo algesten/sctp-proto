@@ -1,6 +1,6 @@
 # Unreleased
 
-  * Bound FORWARD-TSN cumulative advance to avoid pinning the CPU up to ~2^31 TSN jumps per chunk
+  * Bound FORWARD-TSN cumulative advance to avoid CPU exhaustion on large TSN jumps #56
 
 # 0.10.3
 

@@ -1,6 +1,8 @@
 use crate::chunk::chunk_i_forward_tsn::ChunkIForwardTsnStream;
+use crate::chunk::chunk_payload_data::ABANDONED;
 use crate::chunk::{Chunk, chunk_init::ChunkInit};
 use crate::config::generate_snap_token;
+use core::sync::atomic::AtomicU8;
 
 use super::*;
 
@@ -3282,10 +3284,7 @@ fn test_create_forward_tsn_forward_one_abandoned() -> Result<()> {
         stream_sequence_number: 2,
         user_data: Bytes::from_static(b"ABC"),
         nsent: 1,
-        message_state: Arc::new(crate::chunk::chunk_payload_data::MessageState {
-            abandoned: core::sync::atomic::AtomicBool::new(true),
-            ..Default::default()
-        }),
+        message_state: Some(Arc::new(AtomicU8::new(ABANDONED))),
         ..Default::default()
     });
 
@@ -3315,10 +3314,7 @@ fn test_create_forward_tsn_forward_two_abandoned_with_the_same_si() -> Result<()
         stream_sequence_number: 2,
         user_data: Bytes::from_static(b"ABC"),
         nsent: 1,
-        message_state: Arc::new(crate::chunk::chunk_payload_data::MessageState {
-            abandoned: core::sync::atomic::AtomicBool::new(true),
-            ..Default::default()
-        }),
+        message_state: Some(Arc::new(AtomicU8::new(ABANDONED))),
         ..Default::default()
     });
     a.inflight_queue.push_no_check(ChunkPayloadData {
@@ -3329,10 +3325,7 @@ fn test_create_forward_tsn_forward_two_abandoned_with_the_same_si() -> Result<()
         stream_sequence_number: 3,
         user_data: Bytes::from_static(b"DEF"),
         nsent: 1,
-        message_state: Arc::new(crate::chunk::chunk_payload_data::MessageState {
-            abandoned: core::sync::atomic::AtomicBool::new(true),
-            ..Default::default()
-        }),
+        message_state: Some(Arc::new(AtomicU8::new(ABANDONED))),
         ..Default::default()
     });
     a.inflight_queue.push_no_check(ChunkPayloadData {
@@ -3343,10 +3336,7 @@ fn test_create_forward_tsn_forward_two_abandoned_with_the_same_si() -> Result<()
         stream_sequence_number: 1,
         user_data: Bytes::from_static(b"123"),
         nsent: 1,
-        message_state: Arc::new(crate::chunk::chunk_payload_data::MessageState {
-            abandoned: core::sync::atomic::AtomicBool::new(true),
-            ..Default::default()
-        }),
+        message_state: Some(Arc::new(AtomicU8::new(ABANDONED))),
         ..Default::default()
     });
 

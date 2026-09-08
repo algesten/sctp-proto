@@ -1,6 +1,15 @@
 use super::{chunk_header::*, chunk_type::*, *};
 
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+
+/// One sender lifecycle shared by every fragment of a user message.
+#[derive(Debug, Default)]
+pub(crate) struct MessageState {
+    pub(crate) abandoned: AtomicBool,
+    pub(crate) all_inflight: AtomicBool,
+}
 
 pub(crate) const PAYLOAD_DATA_ENDING_FRAGMENT_BITMASK: u8 = 1;
 pub(crate) const PAYLOAD_DATA_BEGINING_FRAGMENT_BITMASK: u8 = 2;
@@ -107,10 +116,7 @@ pub struct ChunkPayloadData {
     /// number of transmission made for this chunk
     pub(crate) nsent: u32,
 
-    /// valid only with the first fragment
-    pub(crate) abandoned: bool,
-    /// valid only with the first fragment
-    pub(crate) all_inflight: bool,
+    pub(crate) message_state: Arc<MessageState>,
 
     /// Retransmission flag set when T1-RTX timeout occurred and this
     /// chunk is still in the inflight queue
@@ -133,8 +139,7 @@ impl Default for ChunkPayloadData {
             miss_indicator: 0,
             since: None,
             nsent: 0,
-            abandoned: false,
-            all_inflight: false,
+            message_state: Arc::default(),
             retransmit: false,
         }
     }
@@ -211,8 +216,7 @@ impl Chunk for ChunkPayloadData {
             miss_indicator: 0,
             since: None,
             nsent: 0,
-            abandoned: false,
-            all_inflight: false,
+            message_state: Arc::default(),
             retransmit: false,
         })
     }
@@ -243,17 +247,25 @@ impl Chunk for ChunkPayloadData {
 }
 
 impl ChunkPayloadData {
+    pub(crate) fn message_abandoned(&self) -> bool {
+        self.message_state.abandoned.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn abandoned(&self) -> bool {
-        self.abandoned && self.all_inflight
+        self.message_abandoned() && self.message_state.all_inflight.load(Ordering::Relaxed)
     }
 
     pub(crate) fn set_abandoned(&mut self, abandoned: bool) {
-        self.abandoned = abandoned;
+        self.message_state
+            .abandoned
+            .store(abandoned, Ordering::Relaxed);
     }
 
     pub(crate) fn set_all_inflight(&mut self) {
         if self.ending_fragment {
-            self.all_inflight = true;
+            self.message_state
+                .all_inflight
+                .store(true, Ordering::Relaxed);
         }
     }
 }

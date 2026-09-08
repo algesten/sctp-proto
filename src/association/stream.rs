@@ -557,7 +557,7 @@ impl StreamState {
                 immediate_sack: false,
                 payload_type: ppi,
                 stream_sequence_number: self.sequence_number,
-                message_state: alloc::sync::Arc::clone(&message_state),
+                message_state: Some(alloc::sync::Arc::clone(&message_state)),
                 ..Default::default()
             };
 

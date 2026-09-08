@@ -4065,7 +4065,7 @@ impl Association {
                 // retransmitting, so maxRTX=0 abandons only when recovery
                 // would first retransmit, never while the original is in flight.
                 if c.nsent > reliability_value {
-                    c.set_abandoned(true);
+                    c.abandon();
                     trace!(
                         "[{}] marked as abandoned: tsn={} ppi={} (remix: {})",
                         side, c.tsn, c.payload_type, c.nsent
@@ -4075,7 +4075,7 @@ impl Association {
                 if let Some(since) = &c.since {
                     let elapsed = now.duration_since(*since);
                     if elapsed.as_millis() as u32 >= reliability_value {
-                        c.set_abandoned(true);
+                        c.abandon();
                         trace!(
                             "[{}] marked as abandoned: tsn={} ppi={} (timed: {:?})",
                             side, c.tsn, c.payload_type, elapsed

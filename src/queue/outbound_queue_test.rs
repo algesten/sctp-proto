@@ -69,20 +69,27 @@ fn abandonment_owns_pending_tail_and_does_not_alias_unordered_messages() {
     assert_eq!(q.mark_as_acked(3), 8);
     assert_eq!(q.mark_as_acked(3), 0);
     assert_eq!(q.inflight_bytes(), 8);
-    assert_eq!(q.abandon(2), Some((7, 16)));
+    assert_eq!(q.abandon(2), Some((7, 16, 2)));
     assert!(q.is_abandoned(2));
     assert!(q.is_abandoned(3));
     assert!(!q.is_abandoned(1));
     assert_eq!(q.pending_len(), 1);
     assert_eq!(q.pending_bytes(), 8);
-    assert_eq!(q.abandon(3), Some((7, 0)), "release each byte only once");
+    assert_eq!(q.abandon(3), Some((7, 0, 0)), "release each byte only once");
 
-    // No TSNs are consumed by the discarded tail.
-    let next = q.send_next(4, now).unwrap();
+    // The unsent tail has TSNs but no payload or retransmissions. The next
+    // message must follow those reserved TSNs.
+    for tsn in 4..=5 {
+        assert!(q.is_abandoned(tsn));
+        assert!(q.get(tsn).unwrap().user_data.is_empty());
+        assert_eq!(q.get(tsn).unwrap().nsent, 0);
+        assert!(!q.get(tsn).unwrap().retransmit);
+    }
+    let next = q.send_next(6, now).unwrap();
     assert!(next.beginning_fragment && next.ending_fragment);
-    assert!(!q.is_abandoned(4));
+    assert!(!q.is_abandoned(6));
     assert!(!q.pending_contains_stream(7));
-    for tsn in 2..=4 {
+    for tsn in 2..=6 {
         q.pop(tsn).unwrap();
     }
     assert!(q.started.is_empty());
@@ -101,7 +108,7 @@ fn retransmission_excludes_pending_acked_and_abandoned_fragments() {
     }
     q.mark_all_to_retransmit();
     assert_eq!(q.mark_as_acked(2), 8);
-    assert_eq!(q.abandon(1), Some((1, 0)));
+    assert_eq!(q.abandon(1), Some((1, 0, 0)));
     q.mark_all_to_retransmit();
     for tsn in 1..=4 {
         assert_eq!(q.get(tsn).unwrap().retransmit, tsn >= 3);
@@ -129,7 +136,7 @@ fn tsn_lookup_and_retirement_across_wraparound() {
     assert!(q.get(first.wrapping_sub(1)).is_none());
     assert!(q.get(first.wrapping_add(12)).is_none());
     assert!(q.pop(first.wrapping_add(1)).is_none());
-    assert_eq!(q.abandon(u32::MAX), Some((1, 0)));
+    assert_eq!(q.abandon(u32::MAX), Some((1, 0, 0)));
     for i in 0..12 {
         let tsn = first.wrapping_add(i);
         for remaining in i..12 {
@@ -170,6 +177,31 @@ fn message_lookup_after_deque_storage_wraps() {
     for tsn in 120..128 {
         q.pop(tsn).unwrap();
     }
+    assert!(q.started.is_empty());
+}
+
+#[test]
+fn reserving_abandoned_tail_tsns_crosses_wraparound() {
+    let now = Instant::now();
+    let mut q = OutboundQueue::default();
+    q.push(message(1, false, 4));
+    q.push(message(2, false, 1));
+    q.send_next(u32::MAX - 1, now).unwrap();
+    assert_eq!(q.abandon(u32::MAX - 1), Some((1, 24, 3)));
+    assert_eq!(q.inflight_len(), 4);
+    assert_eq!(q.inflight_bytes(), 8);
+    q.mark_all_to_retransmit();
+    for tsn in [u32::MAX - 1, u32::MAX, 0, 1] {
+        assert!(q.is_abandoned(tsn));
+        assert!(!q.get(tsn).unwrap().retransmit);
+    }
+    q.send_next(2, now).unwrap();
+    assert_eq!(q.get(2).unwrap().stream_identifier, 2);
+    assert!(!q.is_abandoned(2));
+    for tsn in [u32::MAX - 1, u32::MAX, 0, 1, 2] {
+        q.pop(tsn).unwrap();
+    }
+    assert_eq!(q.inflight_bytes(), 0);
     assert!(q.started.is_empty());
 }
 

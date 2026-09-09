@@ -4441,7 +4441,7 @@ fn test_fast_retransmission_abandons_message_and_pending_tail() {
     assert!(a.outbound_queue.is_abandoned(2));
     assert_eq!(a.outbound_queue.pending_len(), 0);
     assert_eq!(a.stream(1).unwrap().buffered_amount().unwrap(), 8);
-    assert_eq!(a.my_next_tsn, 3);
+    assert_eq!(a.my_next_tsn, 4);
     let packets = a.gather_outbound_forward_tsn_packets(vec![]);
     assert_eq!(packets.len(), 1);
     let packet = Packet::unmarshal(&packets[0]).unwrap();
@@ -4449,7 +4449,7 @@ fn test_fast_retransmission_abandons_message_and_pending_tail() {
         .as_any()
         .downcast_ref::<ChunkForwardTsn>()
         .unwrap();
-    assert_eq!(forward.new_cumulative_tsn, 2);
+    assert_eq!(forward.new_cumulative_tsn, 3);
     assert_eq!(forward.streams[0].identifier, 1);
     assert_eq!(forward.streams[0].sequence, 0);
 }

@@ -4008,7 +4008,8 @@ impl Association {
             return false;
         }
         trace!("[{}] abandoning message containing tsn={}", self.side, tsn);
-        if let Some((id, bytes)) = self.outbound_queue.abandon(tsn) {
+        if let Some((id, bytes, reserved_tsns)) = self.outbound_queue.abandon(tsn) {
+            self.my_next_tsn = self.my_next_tsn.wrapping_add(reserved_tsns);
             if let Some(stream) = self.streams.get_mut(&id) {
                 if stream.on_buffer_released(bytes as i64) {
                     self.events

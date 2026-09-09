@@ -12,8 +12,9 @@ mod tests;
 /// Owns a user message until its last fragment is acknowledged or discarded.
 #[derive(Debug)]
 pub(crate) struct OutboundMessage {
-    // The sent prefix stays here until cumulatively acknowledged. Gap ACKs
-    // release its payload, but retain the chunk for TSN and FORWARD-TSN lookup.
+    // The TSN-assigned prefix stays here until cumulatively acknowledged. Gap
+    // ACKs release its payload, but retain the chunk for FORWARD-TSN lookup.
+    // On abandonment, the unsent tail joins this prefix with empty payloads.
     chunks: VecDeque<ChunkPayloadData>,
     inflight: usize,
     abandoned: bool,
@@ -160,26 +161,36 @@ impl OutboundQueue {
             .is_some_and(|(index, _)| self.started[index].abandoned)
     }
 
-    /// Abandon the entire message and discard its unsent tail. Return the
-    /// stream and bytes whose buffer credit must be released locally. Sent
-    /// chunks retain their TSNs until the peer acknowledges FORWARD-TSN.
-    pub(crate) fn abandon(&mut self, tsn: u32) -> Option<(u16, usize)> {
+    /// Abandon the entire message and release its unsent payload. Return the
+    /// stream, released bytes, and number of TSNs reserved for the unsent tail.
+    /// The caller must advance its next TSN by that count before sending DATA.
+    /// All chunks retain their TSNs until the peer acknowledges FORWARD-TSN.
+    pub(crate) fn abandon(&mut self, tsn: u32) -> Option<(u16, usize, u32)> {
         let (index, _) = self.position(tsn)?;
         let message = &mut self.started[index];
         message.abandoned = true;
         let stream = message.chunks[0].stream_identifier;
         let pending = message.chunks.len() - message.inflight;
-        let bytes = message
-            .chunks
-            .drain(message.inflight..)
-            .map(|c| c.user_data.len())
-            .sum();
+        // Only the last started message can have an unsent tail. Give those
+        // fragments TSNs without transmitting them: if every sent fragment
+        // arrived but its SACK was lost, forwarding only the sent prefix would
+        // be a duplicate and would leave the receiver's message incomplete.
+        let mut next_tsn = message.chunks[message.inflight - 1].tsn.wrapping_add(1);
+        let mut bytes = 0;
+        for chunk in message.chunks.iter_mut().skip(message.inflight) {
+            chunk.tsn = next_tsn;
+            next_tsn = next_tsn.wrapping_add(1);
+            bytes += chunk.user_data.len();
+            chunk.user_data.clear();
+        }
+        message.inflight += pending;
+        self.inflight_len += pending;
         self.pending_len -= pending;
         self.pending_bytes -= bytes;
         for chunk in &mut message.chunks {
             chunk.retransmit = false;
         }
-        Some((stream, bytes))
+        Some((stream, bytes, pending as u32))
     }
 
     pub(crate) fn mark_all_to_retransmit(&mut self) {

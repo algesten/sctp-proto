@@ -138,14 +138,14 @@ fn test_payload_queue_get_last_tsn_received() -> Result<()> {
 }
 
 #[test]
-fn test_payload_queue_mark_all_to_retrasmit() -> Result<()> {
+fn test_payload_queue_mark_all_to_retransmit() -> Result<()> {
     let mut pq = PayloadQueue::new();
 
     for i in 0..3 {
         pq.push(make_payload(i + 1, 10), 0);
     }
     pq.mark_as_acked(2);
-    pq.mark_all_to_retrasmit();
+    pq.mark_all_to_retransmit();
 
     let c = pq.get(1);
     assert!(c.is_some(), "should be true");
@@ -168,7 +168,7 @@ fn test_payload_queue_reset_retransmit_flag_on_ack() -> Result<()> {
         pq.push(make_payload(i + 1, 10), 0);
     }
 
-    pq.mark_all_to_retrasmit();
+    pq.mark_all_to_retransmit();
     pq.mark_as_acked(2); // should cancel retransmission for TSN 2
     pq.mark_as_acked(4); // should cancel retransmission for TSN 4
 

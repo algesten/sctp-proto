@@ -450,3 +450,50 @@ fn fragment_retry_limits_and_lost_forward_recovery() {
         }
     }
 }
+
+#[test]
+fn lost_prefix_sacks_do_not_strand_the_next_ordered_message() {
+    let (mut a, mut b) = pairs(ReliabilityType::Rexmit);
+    a.assoc
+        .stream(0)
+        .unwrap()
+        .set_reliability_params(false, ReliabilityType::Rexmit, 0)
+        .unwrap();
+    let now = Instant::now();
+    a.assoc.stream(0).unwrap().write(&vec![7; 24000]).unwrap();
+    a.assoc
+        .stream(0)
+        .unwrap()
+        .write(b"following message")
+        .unwrap();
+    // Deliver every fragment allowed by the initial congestion window, but
+    // lose the SACKs. The receiver holds an incomplete, contiguous prefix.
+    for packet in a.drain(now) {
+        b.receive(now, a.addr, packet);
+    }
+    assert!(b.messages().is_empty());
+    assert!(!b.drain(now).is_empty());
+
+    let mut received = Vec::new();
+    let mut forwarded = false;
+    for ms in 1..10000 {
+        let now = now + Duration::from_millis(ms);
+        a.assoc.handle_timeout(now);
+        b.assoc.handle_timeout(now);
+        for packet in a.drain(now) {
+            forwarded |= chunks(&packet).iter().any(|(ty, _)| *ty == 192);
+            b.receive(now, a.addr, packet);
+        }
+        for packet in b.drain(now) {
+            // Lose prefix SACKs, including delayed ones. Once recovery starts,
+            // deliver all traffic in both directions without further loss.
+            if forwarded {
+                a.receive(now, b.addr, packet);
+            }
+        }
+        received.extend(b.messages());
+    }
+    assert!(forwarded, "the sender must abandon the message on timeout");
+    assert_eq!(a.assoc.stream(0).unwrap().buffered_amount().unwrap(), 0);
+    assert_eq!(received, vec![b"following message".to_vec()]);
+}

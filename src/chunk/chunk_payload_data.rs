@@ -107,11 +107,6 @@ pub struct ChunkPayloadData {
     /// number of transmission made for this chunk
     pub(crate) nsent: u32,
 
-    /// valid only with the first fragment
-    pub(crate) abandoned: bool,
-    /// valid only with the first fragment
-    pub(crate) all_inflight: bool,
-
     /// Retransmission flag set when T1-RTX timeout occurred and this
     /// chunk is still in the inflight queue
     pub(crate) retransmit: bool,
@@ -133,8 +128,6 @@ impl Default for ChunkPayloadData {
             miss_indicator: 0,
             since: None,
             nsent: 0,
-            abandoned: false,
-            all_inflight: false,
             retransmit: false,
         }
     }
@@ -211,8 +204,6 @@ impl Chunk for ChunkPayloadData {
             miss_indicator: 0,
             since: None,
             nsent: 0,
-            abandoned: false,
-            all_inflight: false,
             retransmit: false,
         })
     }
@@ -239,21 +230,5 @@ impl Chunk for ChunkPayloadData {
 
     fn as_any(&self) -> &(dyn Any + Send + Sync) {
         self
-    }
-}
-
-impl ChunkPayloadData {
-    pub(crate) fn abandoned(&self) -> bool {
-        self.abandoned && self.all_inflight
-    }
-
-    pub(crate) fn set_abandoned(&mut self, abandoned: bool) {
-        self.abandoned = abandoned;
-    }
-
-    pub(crate) fn set_all_inflight(&mut self) {
-        if self.ending_fragment {
-            self.all_inflight = true;
-        }
     }
 }

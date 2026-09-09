@@ -2,12 +2,12 @@ use crate::association::Association;
 use crate::association::state::AssociationState;
 use crate::chunk::chunk_payload_data::{ChunkPayloadData, PayloadProtocolIdentifier};
 use crate::error::{Error, Result};
+use crate::queue::outbound_queue::OutboundMessage;
 use crate::queue::reassembly_queue::{Chunks, ReassemblyQueue};
 use crate::{ErrorCauseCode, Side};
 
 use crate::util::{ByteSlice, BytesArray, BytesSource};
 use alloc::vec;
-use alloc::vec::Vec;
 use bytes::Bytes;
 use core::fmt;
 use log::{debug, error, trace};
@@ -239,8 +239,8 @@ impl<'a> Stream<'a> {
         let (p, _) = source.pop_chunk(self.association.max_send_message_size() as usize);
 
         if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
-            let (is_buffered_amount_high, chunks) = s.packetize(&p, ppi);
-            self.association.send_payload_data(chunks)?;
+            let (is_buffered_amount_high, message) = s.packetize(&p, ppi);
+            self.association.send_payload_data(message)?;
 
             if is_buffered_amount_high {
                 trace!("StreamEvent::BufferedAmountHigh");
@@ -528,7 +528,7 @@ impl StreamState {
         &mut self,
         raw: &Bytes,
         ppi: PayloadProtocolIdentifier,
-    ) -> (bool, Vec<ChunkPayloadData>) {
+    ) -> (bool, OutboundMessage) {
         let mut i = 0;
         let mut remaining = raw.len();
 
@@ -539,8 +539,6 @@ impl StreamState {
 
         let mut chunks = vec![];
 
-        let head_abandoned = false;
-        let head_all_inflight = false;
         while remaining != 0 {
             // self.association.max_payload_size
             let fragment_size = core::cmp::min(self.max_payload_size as usize, remaining);
@@ -558,8 +556,6 @@ impl StreamState {
                 immediate_sack: false,
                 payload_type: ppi,
                 stream_sequence_number: self.sequence_number,
-                abandoned: head_abandoned, // all fragmented chunks use the same abandoned
-                all_inflight: head_all_inflight, // all fragmented chunks use the same all_inflight
                 ..Default::default()
             };
 
@@ -585,7 +581,7 @@ impl StreamState {
         let is_buffered_amount_high =
             old_amount < self.buffered_amount_high && new_amount >= self.buffered_amount_high;
 
-        (is_buffered_amount_high, chunks)
+        (is_buffered_amount_high, OutboundMessage::new(chunks))
     }
 
     /// This method is called by association's read_loop (go-)routine to notify this stream

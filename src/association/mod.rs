@@ -31,7 +31,7 @@ use crate::param::param_outgoing_reset_request::ParamOutgoingResetRequest;
 use crate::param::param_reconfig_response::{ParamReconfigResponse, ReconfigResult};
 use crate::param::param_state_cookie::ParamStateCookie;
 use crate::param::param_supported_extensions::ParamSupportedExtensions;
-use crate::queue::outbound_queue::{OutboundMessage, OutboundQueue};
+use crate::queue::outbound_queue::OutboundQueue;
 use crate::queue::payload_queue::PayloadQueue;
 use crate::queue::reassembly_queue::ReassemblyQueue;
 use crate::shared::{AssociationEventInner, AssociationId, EndpointEvent, EndpointEventInner};
@@ -3165,9 +3165,8 @@ impl Association {
 
             let mut tsn = cum_tsn_ack_point + 1;
             while sna32lt(tsn, max_tsn) {
-                let abandoned = self.outbound_queue.is_abandoned(tsn);
                 if let Some(c) = self.outbound_queue.get_mut(tsn) {
-                    if !c.acked && !abandoned && c.miss_indicator < 3 {
+                    if !c.acked && !c.abandoned && c.miss_indicator < 3 {
                         c.miss_indicator += 1;
                         if c.miss_indicator == 3 && !self.in_fast_recovery {
                             // 2)  If not in Fast Recovery, adjust the ssthresh and cwnd of the
@@ -3647,11 +3646,7 @@ impl Association {
             loop {
                 let tsn = self.cumulative_tsn_ack_point + i + 1;
                 if let Some(c) = self.outbound_queue.get(tsn) {
-                    if c.acked
-                        || self.outbound_queue.is_abandoned(tsn)
-                        || c.nsent > 1
-                        || c.miss_indicator < 3
-                    {
+                    if c.acked || c.abandoned || c.nsent > 1 || c.miss_indicator < 3 {
                         i += 1;
                         continue;
                     }
@@ -3963,13 +3958,6 @@ impl Association {
         packets
     }
 
-    /// generate_next_tsn returns the my_next_tsn and increases it. The caller should hold the lock.
-    fn generate_next_tsn(&mut self) -> u32 {
-        let tsn = self.my_next_tsn;
-        self.my_next_tsn = self.my_next_tsn.wrapping_add(1);
-        tsn
-    }
-
     /// generate_next_rsn returns the my_next_rsn and increases it. The caller should hold the lock.
     fn generate_next_rsn(&mut self) -> u32 {
         let rsn = self.my_next_rsn;
@@ -3980,15 +3968,15 @@ impl Association {
     /// Called only when a chunk is eligible for retransmission. Abandoning its
     /// message also drops the unsent tail, so no fragment can outlive the policy.
     fn abandon_if_needed(&mut self, tsn: u32, now: Instant) -> bool {
-        if self.outbound_queue.is_abandoned(tsn) {
+        let Some(c) = self.outbound_queue.get(tsn) else {
+            return false;
+        };
+        if c.abandoned {
             return true;
         }
         if !self.use_forward_tsn {
             return false;
         }
-        let Some(c) = self.outbound_queue.get(tsn) else {
-            return false;
-        };
         // Data-channel establishment messages always use reliable delivery.
         if c.payload_type == PayloadProtocolIdentifier::Dcep {
             return false;
@@ -4008,8 +3996,7 @@ impl Association {
             return false;
         }
         trace!("[{}] abandoning message containing tsn={}", self.side, tsn);
-        if let Some((id, bytes, reserved_tsns)) = self.outbound_queue.abandon(tsn) {
-            self.my_next_tsn = self.my_next_tsn.wrapping_add(reserved_tsns);
+        if let Some((id, bytes)) = self.outbound_queue.abandon(tsn, &mut self.my_next_tsn) {
             if let Some(stream) = self.streams.get_mut(&id) {
                 if stream.on_buffer_released(bytes as i64) {
                     self.events
@@ -4073,11 +4060,9 @@ impl Association {
         fwd_tsn
     }
 
-    /// Assign a TSN to the next pending fragment and keep its message queued.
+    /// Assign a TSN to the next pending fragment and retain it for retransmission.
     fn send_next_data_chunk(&mut self, now: Instant) -> Option<ChunkPayloadData> {
-        self.outbound_queue.peek_pending()?;
-        let tsn = self.generate_next_tsn();
-        let chunk = self.outbound_queue.send_next(tsn, now)?;
+        let chunk = self.outbound_queue.send_next(&mut self.my_next_tsn, now)?;
         trace!(
             "[{}] sending ppi={} tsn={} ssn={} len={}",
             self.side,
@@ -4102,7 +4087,7 @@ impl Association {
     }
 
     /// send_payload_data sends the data chunks.
-    pub(crate) fn send_payload_data(&mut self, message: OutboundMessage) -> Result<()> {
+    pub(crate) fn send_payload_data(&mut self, message: Vec<ChunkPayloadData>) -> Result<()> {
         let state = self.state();
         if state != AssociationState::Established {
             return Err(Error::ErrPayloadDataStateNotExist);

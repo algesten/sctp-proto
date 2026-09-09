@@ -2,12 +2,12 @@ use crate::association::Association;
 use crate::association::state::AssociationState;
 use crate::chunk::chunk_payload_data::{ChunkPayloadData, PayloadProtocolIdentifier};
 use crate::error::{Error, Result};
-use crate::queue::outbound_queue::OutboundMessage;
 use crate::queue::reassembly_queue::{Chunks, ReassemblyQueue};
 use crate::{ErrorCauseCode, Side};
 
 use crate::util::{ByteSlice, BytesArray, BytesSource};
 use alloc::vec;
+use alloc::vec::Vec;
 use bytes::Bytes;
 use core::fmt;
 use log::{debug, error, trace};
@@ -528,7 +528,7 @@ impl StreamState {
         &mut self,
         raw: &Bytes,
         ppi: PayloadProtocolIdentifier,
-    ) -> (bool, OutboundMessage) {
+    ) -> (bool, Vec<ChunkPayloadData>) {
         let mut i = 0;
         let mut remaining = raw.len();
 
@@ -581,7 +581,7 @@ impl StreamState {
         let is_buffered_amount_high =
             old_amount < self.buffered_amount_high && new_amount >= self.buffered_amount_high;
 
-        (is_buffered_amount_high, OutboundMessage::new(chunks))
+        (is_buffered_amount_high, chunks)
     }
 
     /// This method is called by association's read_loop (go-)routine to notify this stream

@@ -3309,7 +3309,7 @@ fn test_create_forward_tsn_forward_one_abandoned() -> Result<()> {
         },
     );
 
-    a.outbound_queue.abandon(10).unwrap();
+    a.outbound_queue.abandon(10, &mut a.my_next_tsn).unwrap();
 
     let fwdtsn = a.create_forward_tsn();
 
@@ -3369,9 +3369,9 @@ fn test_create_forward_tsn_forward_two_abandoned_with_the_same_si() -> Result<()
         },
     );
 
-    a.outbound_queue.abandon(10).unwrap();
-    a.outbound_queue.abandon(11).unwrap();
-    a.outbound_queue.abandon(12).unwrap();
+    a.outbound_queue.abandon(10, &mut a.my_next_tsn).unwrap();
+    a.outbound_queue.abandon(11, &mut a.my_next_tsn).unwrap();
+    a.outbound_queue.abandon(12, &mut a.my_next_tsn).unwrap();
 
     let fwdtsn = a.create_forward_tsn();
 
@@ -4391,13 +4391,18 @@ fn test_initial_cwnd_small_mtu() {
 }
 
 fn queue_pending(a: &mut Association, chunk: ChunkPayloadData) {
-    a.outbound_queue.push(OutboundMessage::new(vec![chunk]));
+    a.outbound_queue.push(vec![chunk]);
 }
 
-fn queue_inflight(a: &mut Association, chunk: ChunkPayloadData) {
+fn queue_inflight(a: &mut Association, mut chunk: ChunkPayloadData) {
+    // These fixtures insert one complete message through the real scheduler.
+    chunk.beginning_fragment = true;
+    chunk.ending_fragment = true;
     let tsn = chunk.tsn;
     queue_pending(a, chunk);
-    a.outbound_queue.send_next(tsn, Instant::now()).unwrap();
+    a.outbound_queue
+        .send_next(&mut { tsn }, Instant::now())
+        .unwrap();
 }
 
 fn fragmented_retransmission_fixture(limit: u32) -> Association {

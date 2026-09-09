@@ -100,7 +100,12 @@ pub struct ChunkPayloadData {
 
     /// Whether this data chunk was acknowledged (received by peer)
     pub(crate) acked: bool,
-    pub(crate) miss_indicator: u32,
+    /// Missing reports saturate at the fast-retransmit threshold of three.
+    pub(crate) miss_indicator: u8,
+
+    /// Sender-only identity shared by value across a message's fragments.
+    pub(crate) message_id: u64,
+    pub(crate) abandoned: bool,
 
     /// Partial-reliability parameters used only by sender
     pub(crate) since: Option<Instant>,
@@ -126,6 +131,8 @@ impl Default for ChunkPayloadData {
             user_data: Bytes::new(),
             acked: false,
             miss_indicator: 0,
+            message_id: 0,
+            abandoned: false,
             since: None,
             nsent: 0,
             retransmit: false,
@@ -202,6 +209,8 @@ impl Chunk for ChunkPayloadData {
 
             acked: false,
             miss_indicator: 0,
+            message_id: 0,
+            abandoned: false,
             since: None,
             nsent: 0,
             retransmit: false,

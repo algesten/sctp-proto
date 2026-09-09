@@ -102,6 +102,28 @@ impl PayloadQueue {
         self.chunk_map.get(&tsn)
     }
 
+    pub(crate) fn get_mut(&mut self, tsn: u32) -> Option<&mut ChunkPayloadData> {
+        self.chunk_map.get_mut(&tsn)
+    }
+
+    /// Abandon siblings by identity, including nonconsecutive TSNs.
+    pub(crate) fn abandon_message(&mut self, message_id: u64) {
+        for chunk in self.chunk_map.values_mut() {
+            if chunk.message_id == message_id {
+                chunk.abandoned = true;
+                chunk.retransmit = false;
+            }
+        }
+    }
+
+    pub(crate) fn mark_all_to_retransmit(&mut self) {
+        for chunk in self.chunk_map.values_mut() {
+            if !chunk.acked && !chunk.abandoned {
+                chunk.retransmit = true;
+            }
+        }
+    }
+
     /// popDuplicates returns an array of TSN values that were found duplicate.
     pub(crate) fn pop_duplicates(&mut self) -> Vec<u32> {
         core::mem::take(&mut self.dup_tsn)

@@ -1,5 +1,7 @@
 # Unreleased
 
+  * Fix INIT/INIT-ACK parsing when the last optional parameter carries no value #59
+
 # 0.10.4
 
   * Bound FORWARD-TSN cumulative advance to avoid CPU exhaustion on large TSN jumps #56

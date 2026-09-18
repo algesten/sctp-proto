@@ -1,6 +1,6 @@
 # Unreleased
 
-  * Fix INIT/INIT-ACK parsing when the last optional parameter carries no value
+  * Fix INIT/INIT-ACK parsing when the last optional parameter carries no value #59
 
 # 0.10.4
 

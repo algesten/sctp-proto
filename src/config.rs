@@ -59,6 +59,16 @@ pub struct TransportConfig {
     /// Maximum retransmission timeout in milliseconds.
     /// Default: 60000
     rto_max_ms: u64,
+
+    /// SCTP source port when this endpoint initiates the association.
+    ///
+    /// Default: [`DEFAULT_SCTP_PORT`]
+    local_port: u16,
+
+    /// SCTP destination port when this endpoint initiates the association.
+    ///
+    /// Default: [`DEFAULT_SCTP_PORT`]
+    remote_port: u16,
 }
 
 impl Default for TransportConfig {
@@ -74,6 +84,8 @@ impl Default for TransportConfig {
             rto_initial_ms: RTO_INITIAL,
             rto_min_ms: RTO_MIN,
             rto_max_ms: RTO_MAX,
+            local_port: DEFAULT_SCTP_PORT,
+            remote_port: DEFAULT_SCTP_PORT,
         }
     }
 }
@@ -160,6 +172,18 @@ impl TransportConfig {
         self
     }
 
+    /// Set the SCTP source port used when initiating an association.
+    pub fn with_local_port(mut self, value: u16) -> Self {
+        self.local_port = value;
+        self
+    }
+
+    /// Set the SCTP destination port used when initiating an association.
+    pub fn with_remote_port(mut self, value: u16) -> Self {
+        self.remote_port = value;
+        self
+    }
+
     pub(crate) fn max_init_retransmits(&self) -> Option<usize> {
         self.max_init_retransmits
     }
@@ -178,6 +202,14 @@ impl TransportConfig {
 
     pub(crate) fn rto_max_ms(&self) -> u64 {
         self.rto_max_ms
+    }
+
+    pub(crate) fn local_port(&self) -> u16 {
+        self.local_port
+    }
+
+    pub(crate) fn remote_port(&self) -> u16 {
+        self.remote_port
     }
 }
 

@@ -1,5 +1,6 @@
 use crate::chunk::chunk_i_forward_tsn::ChunkIForwardTsnStream;
 use crate::chunk::{Chunk, chunk_init::ChunkInit};
+use crate::config::DEFAULT_SCTP_PORT;
 use crate::config::generate_snap_token;
 
 use super::*;
@@ -4353,4 +4354,77 @@ fn test_initial_cwnd_small_mtu() {
     // RFC 4960 Sec 7.2.1: min(4*MTU, max(2*MTU, 4380)).
     assert_eq!(assoc.cwnd, (4 * mtu).min((2 * mtu).max(4380)));
     assert_eq!(assoc.cwnd, 4 * mtu);
+}
+
+fn first_transmit_common_header(a: &mut Association) -> CommonHeader {
+    let transmit = a
+        .poll_transmit(Instant::now())
+        .expect("client association should emit an INIT");
+
+    let raw = match transmit.payload {
+        Payload::RawEncode(ref raws) => raws.first().expect("at least one packet").clone(),
+        _ => panic!("outbound transmit should encode"),
+    };
+
+    Packet::unmarshal(&raw)
+        .expect("INIT should unmarshal")
+        .common_header
+}
+
+#[test]
+fn test_client_uses_configured_sctp_ports() {
+    let mut a = create_association(
+        TransportConfig::default()
+            .with_local_port(41234)
+            .with_remote_port(9899),
+    );
+
+    assert_eq!(41234, a.source_port);
+    assert_eq!(9899, a.destination_port);
+
+    let header = first_transmit_common_header(&mut a);
+    assert_eq!(41234, header.source_port, "INIT source port on the wire");
+    assert_eq!(
+        9899, header.destination_port,
+        "INIT destination port on the wire"
+    );
+}
+
+#[test]
+fn test_client_defaults_to_well_known_sctp_port() {
+    let mut a = create_association(TransportConfig::default());
+    assert_eq!(DEFAULT_SCTP_PORT, a.source_port);
+    assert_eq!(DEFAULT_SCTP_PORT, a.destination_port);
+
+    let header = first_transmit_common_header(&mut a);
+    assert_eq!(DEFAULT_SCTP_PORT, header.source_port);
+    assert_eq!(DEFAULT_SCTP_PORT, header.destination_port);
+}
+
+#[test]
+fn test_out_of_band_init_uses_configured_sctp_ports() {
+    let local_init = ChunkInit {
+        initiate_tag: 1,
+        ..Default::default()
+    };
+    let remote_init = ChunkInit {
+        initiate_tag: 2,
+        ..Default::default()
+    };
+    let a = Association::new_with_out_of_band_init(
+        Arc::new(
+            TransportConfig::default()
+                .with_local_port(6001)
+                .with_remote_port(6002),
+        ),
+        1400,
+        SocketAddr::from_str("0.0.0.0:0").unwrap(),
+        None,
+        local_init,
+        remote_init,
+    )
+    .expect("out-of-band association");
+
+    assert_eq!(6001, a.source_port);
+    assert_eq!(6002, a.destination_port);
 }

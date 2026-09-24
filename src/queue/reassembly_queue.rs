@@ -225,6 +225,15 @@ impl ReassemblyQueue {
         }
     }
 
+    /// Every retained DATA fragment, complete or still awaiting reassembly.
+    pub(crate) fn chunks(&self) -> impl Iterator<Item = &ChunkPayloadData> {
+        self.ordered
+            .iter()
+            .chain(&self.unordered)
+            .flat_map(|message| &message.chunks)
+            .chain(&self.unordered_chunks)
+    }
+
     pub(crate) fn push(&mut self, chunk: ChunkPayloadData) -> Result<bool> {
         if chunk.stream_identifier != self.si {
             return Ok(false);

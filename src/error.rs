@@ -217,6 +217,8 @@ pub enum Error {
     ErrOutboundPacketTooLarge,
     #[error("inbound packet larger than maximum message size")]
     ErrInboundPacketTooLarge,
+    #[error("inbound DATA resource limit exceeded")]
+    ErrReceiveLimitExceeded,
     #[error("Stream closed")]
     ErrStreamClosed,
     #[error("Stream not existed")]

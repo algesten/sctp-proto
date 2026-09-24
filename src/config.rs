@@ -22,11 +22,72 @@ pub(crate) const RTO_MAX: u64 = 60000;
 // Default max retransmit value (RFC 4960 Section 15)
 const DEFAULT_MAX_INIT_RETRANS: usize = 8;
 
+/// Optional hard limits on retained inbound DATA state.
+///
+/// These limits apply before adding a new fragment, including data retained for
+/// missing TSNs and stream resets. They do not bound all association heap use,
+/// allocator overhead, or control-chunk state. Exceeding a limit closes the
+/// association; the limits are a resource policy, not SCTP flow control.
+#[derive(Debug, Clone, Copy)]
+pub struct ReceiveLimits {
+    max_message_size: u32,
+    max_buffered_bytes: u32,
+    max_buffered_chunks: usize,
+    max_streams: usize,
+}
+
+impl ReceiveLimits {
+    /// Construct a receive resource policy.
+    ///
+    /// Stream count is the number of live stream states, independent of stream
+    /// identifier values. It includes locally opened streams.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any limit is zero or a message cannot fit in the byte budget.
+    pub fn new(
+        max_message_size: u32,
+        max_buffered_bytes: u32,
+        max_buffered_chunks: usize,
+        max_streams: usize,
+    ) -> Self {
+        assert!(max_message_size > 0 && max_message_size <= max_buffered_bytes);
+        assert!(max_buffered_chunks > 0 && max_streams > 0);
+        Self {
+            max_message_size,
+            max_buffered_bytes,
+            max_buffered_chunks,
+            max_streams,
+        }
+    }
+
+    /// Maximum size of an individual received message, enforced in reassembly.
+    pub fn max_message_size(self) -> u32 {
+        self.max_message_size
+    }
+
+    /// Maximum retained DATA payload bytes across receive queues.
+    pub fn max_buffered_bytes(self) -> u32 {
+        self.max_buffered_bytes
+    }
+
+    /// Maximum retained DATA fragments across receive queues.
+    pub fn max_buffered_chunks(self) -> usize {
+        self.max_buffered_chunks
+    }
+
+    /// Maximum live stream states; this does not limit identifier values.
+    pub fn max_streams(self) -> usize {
+        self.max_streams
+    }
+}
+
 /// Config collects the arguments to create_association construction into
 /// a single structure
 #[derive(Debug)]
 pub struct TransportConfig {
     max_receive_buffer_size: u32,
+    receive_limits: Option<ReceiveLimits>,
     max_num_outbound_streams: u16,
     max_num_inbound_streams: u16,
 
@@ -65,6 +126,7 @@ impl Default for TransportConfig {
     fn default() -> Self {
         TransportConfig {
             max_receive_buffer_size: INITIAL_RECV_BUF_SIZE,
+            receive_limits: None,
             max_send_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             max_receive_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             max_num_outbound_streams: u16::MAX,
@@ -79,6 +141,21 @@ impl Default for TransportConfig {
 }
 
 impl TransportConfig {
+    /// Set an optional hard policy for retained inbound DATA state.
+    ///
+    /// Also sets the advertised receive window and per-message limit. The hard
+    /// policy is disabled by default, preserving ordinary SCTP window behavior.
+    pub fn with_receive_limits(mut self, limits: ReceiveLimits) -> Self {
+        self.max_receive_buffer_size = limits.max_buffered_bytes;
+        self.max_receive_message_size = limits.max_message_size;
+        self.receive_limits = Some(limits);
+        self
+    }
+
+    pub(crate) fn receive_limits(&self) -> Option<ReceiveLimits> {
+        self.receive_limits
+    }
+
     pub fn with_max_receive_buffer_size(mut self, value: u32) -> Self {
         self.max_receive_buffer_size = value;
         self
@@ -111,7 +188,10 @@ impl TransportConfig {
     }
 
     pub(crate) fn max_receive_buffer_size(&self) -> u32 {
-        self.max_receive_buffer_size
+        self.receive_limits
+            .map_or(self.max_receive_buffer_size, |limits| {
+                self.max_receive_buffer_size.min(limits.max_buffered_bytes)
+            })
     }
 
     pub(crate) fn max_send_message_size(&self) -> u32 {
@@ -119,7 +199,10 @@ impl TransportConfig {
     }
 
     pub(crate) fn max_receive_message_size(&self) -> u32 {
-        self.max_receive_message_size
+        self.receive_limits
+            .map_or(self.max_receive_message_size, |limits| {
+                self.max_receive_message_size.min(limits.max_message_size)
+            })
     }
 
     pub(crate) fn max_num_outbound_streams(&self) -> u16 {

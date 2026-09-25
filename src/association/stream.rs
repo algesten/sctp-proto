@@ -239,8 +239,8 @@ impl<'a> Stream<'a> {
         let (p, _) = source.pop_chunk(self.association.max_send_message_size() as usize);
 
         if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
-            let (is_buffered_amount_high, chunks) = s.packetize(&p, ppi);
-            self.association.send_payload_data(chunks)?;
+            let (is_buffered_amount_high, message) = s.packetize(&p, ppi);
+            self.association.send_payload_data(message)?;
 
             if is_buffered_amount_high {
                 trace!("StreamEvent::BufferedAmountHigh");
@@ -539,8 +539,6 @@ impl StreamState {
 
         let mut chunks = vec![];
 
-        let head_abandoned = false;
-        let head_all_inflight = false;
         while remaining != 0 {
             // self.association.max_payload_size
             let fragment_size = core::cmp::min(self.max_payload_size as usize, remaining);
@@ -558,8 +556,6 @@ impl StreamState {
                 immediate_sack: false,
                 payload_type: ppi,
                 stream_sequence_number: self.sequence_number,
-                abandoned: head_abandoned, // all fragmented chunks use the same abandoned
-                all_inflight: head_all_inflight, // all fragmented chunks use the same all_inflight
                 ..Default::default()
             };
 

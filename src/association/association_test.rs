@@ -912,18 +912,24 @@ fn test_local_reset_does_not_overtake_pending_data() -> Result<()> {
         my_next_tsn: 1,
         ..Default::default()
     };
-    a.inflight_queue.push_no_check(ChunkPayloadData {
-        tsn: 1,
-        user_data: Bytes::from_static(b"inflight"),
-        ..Default::default()
-    });
-    a.pending_queue.push(ChunkPayloadData {
-        stream_identifier: 1,
-        beginning_fragment: true,
-        ending_fragment: true,
-        user_data: Bytes::from_static(b"pending"),
-        ..Default::default()
-    });
+    queue_inflight(
+        &mut a,
+        ChunkPayloadData {
+            tsn: 1,
+            user_data: Bytes::from_static(b"inflight"),
+            ..Default::default()
+        },
+    );
+    queue_pending(
+        &mut a,
+        ChunkPayloadData {
+            stream_identifier: 1,
+            beginning_fragment: true,
+            ending_fragment: true,
+            user_data: Bytes::from_static(b"pending"),
+            ..Default::default()
+        },
+    );
     a.send_reset_request(1)?;
 
     let _ = a.poll_transmit(Instant::now());
@@ -945,19 +951,25 @@ fn test_local_reset_is_not_blocked_by_unrelated_pending_data() -> Result<()> {
         mtu: 1400,
         ..Default::default()
     };
-    a.inflight_queue.push_no_check(ChunkPayloadData {
-        tsn: 1,
-        stream_identifier: unrelated_stream_id,
-        user_data: Bytes::from_static(b"inflight"),
-        ..Default::default()
-    });
-    a.pending_queue.push(ChunkPayloadData {
-        stream_identifier: unrelated_stream_id,
-        beginning_fragment: true,
-        ending_fragment: true,
-        user_data: Bytes::from_static(b"flow controlled"),
-        ..Default::default()
-    });
+    queue_inflight(
+        &mut a,
+        ChunkPayloadData {
+            tsn: 1,
+            stream_identifier: unrelated_stream_id,
+            user_data: Bytes::from_static(b"inflight"),
+            ..Default::default()
+        },
+    );
+    queue_pending(
+        &mut a,
+        ChunkPayloadData {
+            stream_identifier: unrelated_stream_id,
+            beginning_fragment: true,
+            ending_fragment: true,
+            user_data: Bytes::from_static(b"flow controlled"),
+            ..Default::default()
+        },
+    );
     a.send_reset_request(reset_stream_id)?;
 
     let _ = a.gather_outbound(Instant::now());
@@ -967,7 +979,7 @@ fn test_local_reset_is_not_blocked_by_unrelated_pending_data() -> Result<()> {
         "flow-controlled DATA on another stream must not starve this reset"
     );
     assert!(
-        !a.pending_queue.is_empty(),
+        a.outbound_queue.pending_len() != 0,
         "the test requires the unrelated DATA to remain flow controlled"
     );
     Ok(())
@@ -1073,14 +1085,17 @@ fn test_reciprocal_reset_covers_preexisting_pending_data() -> Result<()> {
         a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
             .is_some()
     );
-    a.pending_queue.push(ChunkPayloadData {
-        stream_identifier: stream_id,
-        stream_sequence_number: 4,
-        beginning_fragment: true,
-        ending_fragment: true,
-        user_data: Bytes::from_static(b"pending"),
-        ..Default::default()
-    });
+    queue_pending(
+        &mut a,
+        ChunkPayloadData {
+            stream_identifier: stream_id,
+            stream_sequence_number: 4,
+            beginning_fragment: true,
+            ending_fragment: true,
+            user_data: Bytes::from_static(b"pending"),
+            ..Default::default()
+        },
+    );
 
     // Receiving the peer's outgoing reset creates a reciprocal outgoing reset.
     // DATA accepted before that request must be assigned a TSN covered by the
@@ -1097,7 +1112,7 @@ fn test_reciprocal_reset_covers_preexisting_pending_data() -> Result<()> {
 
     let _ = a.gather_outbound(Instant::now());
 
-    let data_tsn = a.inflight_queue.get(1).unwrap().tsn;
+    let data_tsn = a.outbound_queue.get(1).unwrap().tsn;
     let reciprocal = a
         .reconfigs
         .get(&a.active_reconfig.unwrap())
@@ -3142,19 +3157,25 @@ fn test_blocked_reconfig_does_not_allow_later_rsn_to_overtake() {
         mtu: 1400,
         ..Default::default()
     };
-    a.pending_queue.push(ChunkPayloadData {
-        stream_identifier: 1,
-        beginning_fragment: true,
-        ending_fragment: true,
-        user_data: Bytes::from_static(b"pending"),
-        ..Default::default()
-    });
-    a.inflight_queue.push_no_check(ChunkPayloadData {
-        tsn: 0,
-        stream_identifier: 2,
-        user_data: Bytes::from_static(b"inflight"),
-        ..Default::default()
-    });
+    queue_inflight(
+        &mut a,
+        ChunkPayloadData {
+            tsn: 0,
+            stream_identifier: 2,
+            user_data: Bytes::from_static(b"inflight"),
+            ..Default::default()
+        },
+    );
+    queue_pending(
+        &mut a,
+        ChunkPayloadData {
+            stream_identifier: 1,
+            beginning_fragment: true,
+            ending_fragment: true,
+            user_data: Bytes::from_static(b"pending"),
+            ..Default::default()
+        },
+    );
     insert_queued_reset(&mut a, 7, 1);
     insert_queued_reset(&mut a, 8, 2);
 
@@ -3274,17 +3295,21 @@ fn test_create_forward_tsn_forward_one_abandoned() -> Result<()> {
         ..Default::default()
     };
 
-    a.inflight_queue.push_no_check(ChunkPayloadData {
-        beginning_fragment: true,
-        ending_fragment: true,
-        tsn: 10,
-        stream_identifier: 1,
-        stream_sequence_number: 2,
-        user_data: Bytes::from_static(b"ABC"),
-        nsent: 1,
-        abandoned: true,
-        ..Default::default()
-    });
+    queue_inflight(
+        &mut a,
+        ChunkPayloadData {
+            beginning_fragment: true,
+            ending_fragment: true,
+            tsn: 10,
+            stream_identifier: 1,
+            stream_sequence_number: 2,
+            user_data: Bytes::from_static(b"ABC"),
+            nsent: 1,
+            ..Default::default()
+        },
+    );
+
+    a.outbound_queue.abandon(10, &mut a.my_next_tsn).unwrap();
 
     let fwdtsn = a.create_forward_tsn();
 
@@ -3304,39 +3329,49 @@ fn test_create_forward_tsn_forward_two_abandoned_with_the_same_si() -> Result<()
         ..Default::default()
     };
 
-    a.inflight_queue.push_no_check(ChunkPayloadData {
-        beginning_fragment: true,
-        ending_fragment: true,
-        tsn: 10,
-        stream_identifier: 1,
-        stream_sequence_number: 2,
-        user_data: Bytes::from_static(b"ABC"),
-        nsent: 1,
-        abandoned: true,
-        ..Default::default()
-    });
-    a.inflight_queue.push_no_check(ChunkPayloadData {
-        beginning_fragment: true,
-        ending_fragment: true,
-        tsn: 11,
-        stream_identifier: 1,
-        stream_sequence_number: 3,
-        user_data: Bytes::from_static(b"DEF"),
-        nsent: 1,
-        abandoned: true,
-        ..Default::default()
-    });
-    a.inflight_queue.push_no_check(ChunkPayloadData {
-        beginning_fragment: true,
-        ending_fragment: true,
-        tsn: 12,
-        stream_identifier: 2,
-        stream_sequence_number: 1,
-        user_data: Bytes::from_static(b"123"),
-        nsent: 1,
-        abandoned: true,
-        ..Default::default()
-    });
+    queue_inflight(
+        &mut a,
+        ChunkPayloadData {
+            beginning_fragment: true,
+            ending_fragment: true,
+            tsn: 10,
+            stream_identifier: 1,
+            stream_sequence_number: 2,
+            user_data: Bytes::from_static(b"ABC"),
+            nsent: 1,
+            ..Default::default()
+        },
+    );
+    queue_inflight(
+        &mut a,
+        ChunkPayloadData {
+            beginning_fragment: true,
+            ending_fragment: true,
+            tsn: 11,
+            stream_identifier: 1,
+            stream_sequence_number: 3,
+            user_data: Bytes::from_static(b"DEF"),
+            nsent: 1,
+            ..Default::default()
+        },
+    );
+    queue_inflight(
+        &mut a,
+        ChunkPayloadData {
+            beginning_fragment: true,
+            ending_fragment: true,
+            tsn: 12,
+            stream_identifier: 2,
+            stream_sequence_number: 1,
+            user_data: Bytes::from_static(b"123"),
+            nsent: 1,
+            ..Default::default()
+        },
+    );
+
+    a.outbound_queue.abandon(10, &mut a.my_next_tsn).unwrap();
+    a.outbound_queue.abandon(11, &mut a.my_next_tsn).unwrap();
+    a.outbound_queue.abandon(12, &mut a.my_next_tsn).unwrap();
 
     let fwdtsn = a.create_forward_tsn();
 
@@ -4353,4 +4388,125 @@ fn test_initial_cwnd_small_mtu() {
     // RFC 4960 Sec 7.2.1: min(4*MTU, max(2*MTU, 4380)).
     assert_eq!(assoc.cwnd, (4 * mtu).min((2 * mtu).max(4380)));
     assert_eq!(assoc.cwnd, 4 * mtu);
+}
+
+fn queue_pending(a: &mut Association, chunk: ChunkPayloadData) {
+    a.outbound_queue.push(vec![chunk]);
+}
+
+fn queue_inflight(a: &mut Association, mut chunk: ChunkPayloadData) {
+    // These fixtures insert one complete message through the real scheduler.
+    chunk.beginning_fragment = true;
+    chunk.ending_fragment = true;
+    let tsn = chunk.tsn;
+    queue_pending(a, chunk);
+    a.outbound_queue
+        .send_next(&mut { tsn }, Instant::now())
+        .unwrap();
+}
+
+fn fragmented_retransmission_fixture(limit: u32) -> Association {
+    let mut a = Association {
+        state: AssociationState::Established,
+        use_forward_tsn: true,
+        my_next_tsn: 1,
+        max_send_message_size: 100,
+        max_receive_message_size: 100,
+        max_payload_size: 4,
+        cwnd: 100,
+        rwnd: 100,
+        mtu: 1400,
+        ..Default::default()
+    };
+    a.create_stream(1, false, PayloadProtocolIdentifier::Binary)
+        .unwrap();
+    let mut stream = a.stream(1).unwrap();
+    stream
+        .set_reliability_params(false, ReliabilityType::Rexmit, limit)
+        .unwrap();
+    stream.write(b"abcdefghij").unwrap();
+    a
+}
+
+#[test]
+fn test_fast_retransmission_abandons_message_and_pending_tail() {
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(0);
+    a.send_next_data_chunk(now).unwrap();
+    a.send_next_data_chunk(now).unwrap();
+    for tsn in 1..=2 {
+        a.outbound_queue.get_mut(tsn).unwrap().miss_indicator = 3;
+    }
+    a.will_retransmit_fast = true;
+    assert!(
+        a.gather_outbound_fast_retransmission_packets(vec![], now)
+            .is_empty()
+    );
+    assert!(a.outbound_queue.is_abandoned(1));
+    assert!(a.outbound_queue.is_abandoned(2));
+    assert_eq!(a.outbound_queue.pending_len(), 0);
+    assert_eq!(a.stream(1).unwrap().buffered_amount().unwrap(), 8);
+    assert_eq!(a.my_next_tsn, 4);
+    let packets = a.gather_outbound_forward_tsn_packets(vec![]);
+    assert_eq!(packets.len(), 1);
+    let packet = Packet::unmarshal(&packets[0]).unwrap();
+    let forward = packet.chunks[0]
+        .as_any()
+        .downcast_ref::<ChunkForwardTsn>()
+        .unwrap();
+    assert_eq!(forward.new_cumulative_tsn, 3);
+    assert_eq!(forward.streams[0].identifier, 1);
+    assert_eq!(forward.streams[0].sequence, 0);
+}
+
+#[test]
+fn test_later_fragment_exhaustion_cancels_earlier_scheduled_retry() {
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(1);
+    a.send_next_data_chunk(now).unwrap();
+    a.send_next_data_chunk(now).unwrap();
+    // Chunks keep independent retry counts. Once one exhausts its allowance,
+    // even siblings already selected in this batch must be abandoned.
+    a.outbound_queue.get_mut(2).unwrap().nsent = 2;
+    a.outbound_queue.mark_all_to_retransmit();
+    assert!(a.get_data_packets_to_retransmit(now).is_empty());
+    assert!(a.outbound_queue.is_abandoned(1));
+    assert!(a.outbound_queue.is_abandoned(2));
+    assert_eq!(a.outbound_queue.pending_len(), 0);
+    assert_eq!(a.stream(1).unwrap().buffered_amount().unwrap(), 8);
+}
+
+#[test]
+fn test_fast_retry_counts_toward_timer_retransmission_limit() {
+    for limit in [1, 2] {
+        let now = Instant::now();
+        let mut a = fragmented_retransmission_fixture(limit);
+        for _ in 0..3 {
+            a.send_next_data_chunk(now).unwrap();
+        }
+        for tsn in 1..=3 {
+            a.outbound_queue.get_mut(tsn).unwrap().miss_indicator = 3;
+        }
+        a.will_retransmit_fast = true;
+        assert_eq!(
+            a.gather_outbound_fast_retransmission_packets(vec![], now)
+                .len(),
+            1
+        );
+        for tsn in 1..=3 {
+            assert_eq!(a.outbound_queue.get(tsn).unwrap().nsent, 2);
+            assert!(!a.outbound_queue.is_abandoned(tsn));
+        }
+        a.outbound_queue.mark_all_to_retransmit();
+        let packets = a.get_data_packets_to_retransmit(now);
+        assert_eq!(packets.len(), (limit - 1) as usize);
+        if limit == 2 {
+            a.outbound_queue.mark_all_to_retransmit();
+            assert!(a.get_data_packets_to_retransmit(now).is_empty());
+        }
+        for tsn in 1..=3 {
+            assert_eq!(a.outbound_queue.get(tsn).unwrap().nsent, limit + 1);
+            assert!(a.outbound_queue.is_abandoned(tsn));
+        }
+    }
 }

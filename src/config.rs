@@ -173,12 +173,14 @@ impl TransportConfig {
     }
 
     /// Set the SCTP source port used when initiating an association.
+    /// A zero port is rejected by [`crate::Endpoint::connect`].
     pub fn with_local_port(mut self, value: u16) -> Self {
         self.local_port = value;
         self
     }
 
     /// Set the SCTP destination port used when initiating an association.
+    /// A zero port is rejected by [`crate::Endpoint::connect`].
     pub fn with_remote_port(mut self, value: u16) -> Self {
         self.remote_port = value;
         self

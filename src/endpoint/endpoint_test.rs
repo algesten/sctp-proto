@@ -2985,6 +2985,50 @@ fn test_assoc_reconfig_failure_keeps_stream_quarantined() -> Result<()> {
 }
 
 #[test]
+fn test_configured_sctp_ports_complete_handshake() -> Result<()> {
+    let mut pair = Pair::default();
+    let config = ClientConfig {
+        transport: Arc::new(
+            TransportConfig::default()
+                .with_local_port(41234)
+                .with_remote_port(9899),
+        ),
+        ..Default::default()
+    };
+
+    let (client_ch, server_ch) = pair.connect_with(config);
+    establish_session_pair(&mut pair, client_ch, server_ch, 1)
+}
+
+#[test]
+fn test_connect_rejects_zero_sctp_port() {
+    let remote: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+
+    for (local_port, remote_port) in [(0, 5000), (5000, 0)] {
+        for use_snap in [false, true] {
+            let transport = TransportConfig::default()
+                .with_local_port(local_port)
+                .with_remote_port(remote_port);
+            let mut config = ClientConfig {
+                transport: Arc::new(transport),
+                ..Default::default()
+            };
+            if use_snap {
+                let local_init = generate_snap_token(&config.transport).unwrap();
+                let remote_init = generate_snap_token(&config.transport).unwrap();
+                config = config.with_snap(local_init, remote_init);
+            }
+
+            let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+            assert_matches!(
+                endpoint.connect(config, remote),
+                Err(ConnectError::InvalidSctpPort)
+            );
+        }
+    }
+}
+
+#[test]
 fn test_snap_connect_established_and_transmit_uses_peer_verification_tag() {
     let now = Instant::now();
 

@@ -21,7 +21,6 @@ use crate::chunk::chunk_shutdown_complete::ChunkShutdownComplete;
 use crate::chunk::chunk_type::CT_FORWARD_TSN;
 use crate::config::COMMON_HEADER_SIZE;
 use crate::config::DATA_CHUNK_HEADER_SIZE;
-use crate::config::DEFAULT_SCTP_PORT;
 use crate::config::{ServerConfig, TransportConfig};
 use crate::error::{Error, Result};
 use crate::packet::{CommonHeader, Packet};
@@ -463,6 +462,9 @@ impl Association {
             remote_addr,
             local_ip,
 
+            source_port: config.local_port(),
+            destination_port: config.remote_port(),
+
             my_verification_tag: verification_tag,
             my_next_tsn: initial_tsn,
             my_next_rsn: initial_tsn,
@@ -501,9 +503,6 @@ impl Association {
             local_aid,
             tsn,
         );
-
-        this.source_port = DEFAULT_SCTP_PORT;
-        this.destination_port = DEFAULT_SCTP_PORT;
 
         if side.is_client() {
             let mut init = ChunkInit {
@@ -594,8 +593,6 @@ impl Association {
 
         this.peer_verification_tag = remote_init.initiate_tag;
 
-        this.source_port = DEFAULT_SCTP_PORT;
-        this.destination_port = DEFAULT_SCTP_PORT;
         this.handshake_completed = true;
 
         this.apply_remote_init_params(

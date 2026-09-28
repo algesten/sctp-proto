@@ -65,6 +65,8 @@ mod timer;
 
 #[cfg(test)]
 mod association_test;
+#[cfg(test)]
+mod receive_limits_test;
 
 /// Reasons why an association might be lost
 #[non_exhaustive]
@@ -199,6 +201,7 @@ pub struct Association {
     handshake_completed: bool,
     max_send_message_size: u32,
     max_receive_message_size: u32,
+    receive_limits: Option<crate::ReceiveLimits>,
     inflight_queue_length: usize,
     will_send_shutdown: bool,
     bytes_received: usize,
@@ -322,6 +325,7 @@ impl Default for Association {
             handshake_completed: false,
             max_send_message_size: 0,
             max_receive_message_size: 0,
+            receive_limits: None,
             inflight_queue_length: 0,
             will_send_shutdown: false,
             bytes_received: 0,
@@ -442,6 +446,7 @@ impl Association {
             max_receive_buffer_size: config.max_receive_buffer_size(),
             max_send_message_size: config.max_send_message_size(),
             max_receive_message_size: config.max_receive_message_size(),
+            receive_limits: config.receive_limits(),
             my_max_num_outbound_streams: config.max_num_outbound_streams(),
             my_max_num_inbound_streams: config.max_num_inbound_streams(),
             max_payload_size,
@@ -2360,6 +2365,20 @@ impl Association {
         self.stats.inc_datas();
 
         let can_push = self.payload_queue.can_push(d, self.peer_last_tsn);
+        if can_push {
+            self.check_receive_limits(d)?;
+        }
+        // A small fragment may otherwise retain a whole large packet through
+        // Bytes::slice. Compact only when enforcing the hard resource policy;
+        // subsequent queue clones share this one bounded payload allocation.
+        let mut compact;
+        let d = if can_push && self.receive_limits.is_some() {
+            compact = d.clone();
+            compact.user_data = Bytes::copy_from_slice(&d.user_data);
+            &compact
+        } else {
+            d
+        };
         let mut stream_handle_data = false;
         let mut defer_stream_data = false;
         if can_push && self.data_is_above_pending_reset(d) {
@@ -3368,6 +3387,12 @@ impl Association {
         accept: bool,
         default_payload_type: PayloadProtocolIdentifier,
     ) -> Option<Stream<'_>> {
+        if self
+            .receive_limits
+            .is_some_and(|limits| self.streams.len() >= limits.max_streams())
+        {
+            return None;
+        }
         let s = StreamState::new(
             self.side,
             stream_identifier,
@@ -3407,7 +3432,51 @@ impl Association {
         }
     }
 
+    /// Count each retained TSN once, including DATA already delivered to the
+    /// application but still held behind a gap in the association payload queue.
+    fn retained_receive_data(&self) -> (usize, usize) {
+        let mut bytes = self.payload_queue.get_num_bytes();
+        let mut chunks = self.payload_queue.len();
+        for stream in self.streams.values() {
+            for chunk in stream.reassembly_queue.chunks() {
+                if self.payload_queue.get(chunk.tsn).is_none() {
+                    bytes = bytes.saturating_add(chunk.user_data.len());
+                    chunks = chunks.saturating_add(1);
+                }
+            }
+        }
+        for chunk in self.deferred_reset_data.values() {
+            if self.payload_queue.get(chunk.tsn).is_none() {
+                bytes = bytes.saturating_add(chunk.user_data.len());
+                chunks = chunks.saturating_add(1);
+            }
+        }
+        (bytes, chunks)
+    }
+
+    fn check_receive_limits(&self, data: &ChunkPayloadData) -> Result<()> {
+        let Some(limits) = self.receive_limits else {
+            return Ok(());
+        };
+        let (bytes, chunks) = self.retained_receive_data();
+        if data.user_data.len() > (limits.max_buffered_bytes() as usize).saturating_sub(bytes)
+            || chunks >= limits.max_buffered_chunks()
+            || (!self.streams.contains_key(&data.stream_identifier)
+                && self.streams.len() >= limits.max_streams())
+        {
+            return Err(Error::ErrReceiveLimitExceeded);
+        }
+        Ok(())
+    }
+
     pub(crate) fn get_my_receiver_window_credit(&self) -> u32 {
+        if let Some(limits) = self.receive_limits {
+            let (bytes, chunks) = self.retained_receive_data();
+            if chunks >= limits.max_buffered_chunks() {
+                return 0;
+            }
+            return self.max_receive_buffer_size.saturating_sub(bytes as u32);
+        }
         let mut bytes_queued = 0;
         for s in self.streams.values() {
             bytes_queued += s.get_num_bytes_in_reassembly_queue() as u32;

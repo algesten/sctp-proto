@@ -317,7 +317,21 @@ impl Packet {
     }
 
     pub(crate) fn marshal(&self) -> Result<Bytes> {
-        let mut buf = BytesMut::with_capacity(PACKET_HEADER_SIZE);
+        // Chunk lengths are known before writing. Reserve the complete padded
+        // packet once instead of growing from the common header for every send.
+        let capacity = self
+            .chunks
+            .iter()
+            .try_fold(PACKET_HEADER_SIZE, |total, chunk| {
+                let length = CHUNK_HEADER_SIZE
+                    .checked_add(chunk.value_length())
+                    .ok_or(Error::ErrOutboundPacketTooLarge)?;
+                total
+                    .checked_add(length)
+                    .and_then(|n| n.checked_add(get_padding_size(length)))
+                    .ok_or(Error::ErrOutboundPacketTooLarge)
+            })?;
+        let mut buf = BytesMut::with_capacity(capacity);
         self.marshal_to(&mut buf)?;
         Ok(buf.freeze())
     }

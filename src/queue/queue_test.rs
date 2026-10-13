@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 
+use alloc::vec::Vec;
 use bytes::{Bytes, BytesMut};
 
 ///////////////////////////////////////////////////////////////////
@@ -104,6 +105,75 @@ fn test_payload_queue_get_gap_ack_block() -> Result<()> {
     assert_eq!(gab1[1].end, gab2[1].end);
 
     Ok(())
+}
+
+#[test]
+fn test_payload_queue_gap_ack_blocks_wraparound() {
+    for cumulative_tsn in [0, u32::MAX - 2, u32::MAX] {
+        let mut pq = PayloadQueue::new();
+        for offset in [6, 4, 2, 3] {
+            assert!(pq.push(
+                make_payload(cumulative_tsn.wrapping_add(offset), 1),
+                cumulative_tsn
+            ));
+        }
+
+        let gaps: Vec<_> = pq
+            .get_gap_ack_blocks(cumulative_tsn)
+            .iter()
+            .map(|gap| (gap.start, gap.end))
+            .collect();
+        assert_eq!(gaps, [(2, 4), (6, 6)], "cumulative TSN {cumulative_tsn}");
+    }
+}
+
+#[test]
+fn test_payload_queue_gap_ack_blocks_at_u16_limit() {
+    for cumulative_tsn in [0, u32::MAX - 1] {
+        let mut pq = PayloadQueue::new();
+        for offset in [2, 65_534, 65_535, 65_536, 65_537] {
+            assert!(pq.push(
+                make_payload(cumulative_tsn.wrapping_add(offset), 1),
+                cumulative_tsn
+            ));
+        }
+
+        let gaps: Vec<_> = pq
+            .get_gap_ack_blocks(cumulative_tsn)
+            .iter()
+            .map(|gap| (gap.start, gap.end))
+            .collect();
+        assert_eq!(
+            gaps,
+            [(2, 2), (65_534, 65_535)],
+            "cumulative TSN {cumulative_tsn}"
+        );
+        assert_eq!(pq.len(), 5);
+        assert_eq!(pq.get_num_bytes(), 5);
+    }
+}
+
+#[test]
+fn test_payload_queue_gap_ack_blocks_retain_unrepresentable_offsets() {
+    for cumulative_tsn in [0, u32::MAX - 1] {
+        for offset in [65_536, 65_537, (1 << 31) - 1] {
+            let mut pq = PayloadQueue::new();
+            let tsn = cumulative_tsn.wrapping_add(offset);
+            assert!(pq.push(make_payload(tsn, 1), cumulative_tsn));
+            assert!(pq.get_gap_ack_blocks(cumulative_tsn).is_empty());
+            assert_eq!(pq.len(), 1);
+            assert_eq!(pq.get_num_bytes(), 1);
+            assert!(pq.get(tsn).is_some());
+
+            let advanced_tsn = cumulative_tsn.wrapping_add(offset - 2);
+            let gaps: Vec<_> = pq
+                .get_gap_ack_blocks(advanced_tsn)
+                .iter()
+                .map(|gap| (gap.start, gap.end))
+                .collect();
+            assert_eq!(gaps, [(2, 2)]);
+        }
+    }
 }
 
 #[test]

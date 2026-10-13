@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Fix TSN wraparound panics and incorrect SACK gap offsets at sequence-number boundaries
   * Allow configurable SCTP source and destination ports when connecting #64
   * Accept INIT chunks containing Supported Address Types #63
 

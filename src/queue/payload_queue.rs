@@ -110,34 +110,26 @@ impl PayloadQueue {
         core::mem::take(&mut self.dup_tsn)
     }
 
+    /// Gap offsets are nonzero u16 distances, not wrapping sequence numbers.
+    /// Farther TSNs remain queued for reporting once the cumulative TSN advances.
     pub(crate) fn get_gap_ack_blocks(&self, cumulative_tsn: u32) -> Vec<GapAckBlock> {
-        if self.chunk_map.is_empty() {
-            return vec![];
-        }
-
-        let mut b = GapAckBlock::default();
-        let mut gap_ack_blocks = vec![];
-        for (i, tsn) in self.sorted.iter().enumerate() {
-            let diff = if *tsn >= cumulative_tsn {
-                (*tsn - cumulative_tsn) as u16
-            } else {
-                0
+        let mut gap_ack_blocks: Vec<GapAckBlock> = vec![];
+        for tsn in &self.sorted {
+            let Ok(offset) = u16::try_from(tsn.wrapping_sub(cumulative_tsn)) else {
+                continue;
             };
+            if offset == 0 {
+                continue;
+            }
 
-            if i == 0 {
-                b.start = diff;
-                b.end = b.start;
-            } else if b.end + 1 == diff {
-                b.end += 1;
-            } else {
-                gap_ack_blocks.push(b);
-
-                b.start = diff;
-                b.end = diff;
+            match gap_ack_blocks.last_mut() {
+                Some(block) if block.end.checked_add(1) == Some(offset) => block.end = offset,
+                _ => gap_ack_blocks.push(GapAckBlock {
+                    start: offset,
+                    end: offset,
+                }),
             }
         }
-
-        gap_ack_blocks.push(b);
 
         gap_ack_blocks
     }

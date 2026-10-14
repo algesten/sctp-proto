@@ -539,8 +539,7 @@ impl StreamState {
 
         let mut chunks = vec![];
 
-        let head_abandoned = false;
-        let head_all_inflight = false;
+        let message_state = alloc::sync::Arc::default();
         while remaining != 0 {
             // self.association.max_payload_size
             let fragment_size = core::cmp::min(self.max_payload_size as usize, remaining);
@@ -558,8 +557,7 @@ impl StreamState {
                 immediate_sack: false,
                 payload_type: ppi,
                 stream_sequence_number: self.sequence_number,
-                abandoned: head_abandoned, // all fragmented chunks use the same abandoned
-                all_inflight: head_all_inflight, // all fragmented chunks use the same all_inflight
+                message_state: Some(alloc::sync::Arc::clone(&message_state)),
                 ..Default::default()
             };
 

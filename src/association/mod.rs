@@ -3682,6 +3682,18 @@ impl Association {
                     //      of cwnd and SHOULD NOT delay retransmission for this single
                     //		packet.
 
+                    Association::check_partial_reliability_status(
+                        c,
+                        now,
+                        self.use_forward_tsn,
+                        self.side,
+                        &self.streams,
+                    );
+                    if c.message_abandoned() {
+                        i += 1;
+                        continue;
+                    }
+
                     let data_chunk_size = DATA_CHUNK_HEADER_SIZE + c.user_data.len() as u32;
                     if self.mtu < fast_retrans_size + data_chunk_size {
                         break;
@@ -3695,13 +3707,6 @@ impl Association {
                 }
 
                 if let Some(c) = self.inflight_queue.get_mut(tsn) {
-                    Association::check_partial_reliability_status(
-                        c,
-                        now,
-                        self.use_forward_tsn,
-                        self.side,
-                        &self.streams,
-                    );
                     to_fast_retrans.push(Box::new(c.clone()));
                     trace!(
                         "[{}] fast-retransmit: tsn={} sent={} htna={}",
@@ -3742,6 +3747,34 @@ impl Association {
     }
 
     fn gather_outbound_forward_tsn_packets(&mut self, mut raw_packets: Vec<Bytes>) -> Vec<Bytes> {
+        self.discard_abandoned_pending_fragments();
+        // Retransmission decisions above may have just abandoned DATA. Advance
+        // now, including after a timeout with no subsequent incoming SACK.
+        if self.use_forward_tsn {
+            let previous = self.advanced_peer_tsn_ack_point;
+            if sna32lt(
+                self.advanced_peer_tsn_ack_point,
+                self.cumulative_tsn_ack_point,
+            ) {
+                self.advanced_peer_tsn_ack_point = self.cumulative_tsn_ack_point;
+            }
+            let mut next = self.advanced_peer_tsn_ack_point.wrapping_add(1);
+            while let Some(chunk) = self.inflight_queue.get(next) {
+                if !chunk.abandoned() {
+                    break;
+                }
+                self.advanced_peer_tsn_ack_point = next;
+                next = next.wrapping_add(1);
+            }
+            if sna32gt(self.advanced_peer_tsn_ack_point, previous)
+                && sna32gt(
+                    self.advanced_peer_tsn_ack_point,
+                    self.cumulative_tsn_ack_point,
+                )
+            {
+                self.will_send_forward_tsn = true;
+            }
+        }
         /*log::debug!(
             "[{}] gatherOutboundForwardTSNPackets {}",
             self.name,
@@ -3840,6 +3873,19 @@ impl Association {
                     continue;
                 }
 
+                Association::check_partial_reliability_status(
+                    c,
+                    now,
+                    self.use_forward_tsn,
+                    self.side,
+                    &self.streams,
+                );
+                if c.message_abandoned() {
+                    c.retransmit = false;
+                    i += 1;
+                    continue;
+                }
+
                 if i == 0 && self.rwnd < c.user_data.len() as u32 {
                     // Send it as a zero window probe
                     done = true;
@@ -3858,14 +3904,6 @@ impl Association {
             }
 
             if let Some(c) = self.inflight_queue.get_mut(tsn) {
-                Association::check_partial_reliability_status(
-                    c,
-                    now,
-                    self.use_forward_tsn,
-                    self.side,
-                    &self.streams,
-                );
-
                 trace!(
                     "[{}] retransmitting tsn={} ssn={} sent={}",
                     self.side, c.tsn, c.stream_sequence_number, c.nsent
@@ -3879,9 +3917,35 @@ impl Association {
         self.bundle_data_chunks_into_packets(chunks)
     }
 
+    /// Drop the unsent tail of an abandoned message before testing cwnd/rwnd.
+    /// PendingQueue keeps fragments contiguous, so a partially sent message's
+    /// remaining fragments are at its selected head. No TSNs were assigned to
+    /// these bytes: release their buffer credit locally and forward only the
+    /// prefix that entered the flight queue.
+    fn discard_abandoned_pending_fragments(&mut self) {
+        while let Some(c) = self.pending_queue.peek() {
+            if !c.message_abandoned() {
+                break;
+            }
+            let Some(mut c) = self.pending_queue.pop(c.beginning_fragment, c.unordered) else {
+                break;
+            };
+            c.set_all_inflight();
+            if let Some(stream) = self.streams.get_mut(&c.stream_identifier) {
+                if stream.on_buffer_released(c.user_data.len() as i64) {
+                    self.events
+                        .push_back(Event::Stream(StreamEvent::BufferedAmountLow {
+                            id: c.stream_identifier,
+                        }));
+                }
+            }
+        }
+    }
+
     /// pop_pending_data_chunks_to_send pops chunks from the pending queues as many as
     /// the cwnd and rwnd allows to send.
     fn pop_pending_data_chunks_to_send(&mut self, now: Instant) -> Vec<ChunkPayloadData> {
+        self.discard_abandoned_pending_fragments();
         let mut chunks = vec![];
         if !self.pending_queue.is_empty() {
             // RFC 4960 sec 6.1.  Transmission of DATA Chunks
@@ -4006,8 +4070,11 @@ impl Association {
             let reliability_value = s.reliability_value;
 
             if reliability_type == ReliabilityType::Rexmit {
-                if c.nsent >= reliability_value {
-                    c.set_abandoned(true);
+                // nsent includes the original transmission. Check before
+                // retransmitting, so maxRTX=0 abandons only when recovery
+                // would first retransmit, never while the original is in flight.
+                if c.nsent > reliability_value {
+                    c.abandon();
                     trace!(
                         "[{}] marked as abandoned: tsn={} ppi={} (remix: {})",
                         side, c.tsn, c.payload_type, c.nsent
@@ -4017,7 +4084,7 @@ impl Association {
                 if let Some(since) = &c.since {
                     let elapsed = now.duration_since(*since);
                     if elapsed.as_millis() as u32 >= reliability_value {
-                        c.set_abandoned(true);
+                        c.abandon();
                         trace!(
                             "[{}] marked as abandoned: tsn={} ppi={} (timed: {:?})",
                             side, c.tsn, c.payload_type, elapsed
@@ -4103,14 +4170,6 @@ impl Association {
 
             c.since = Some(now); // use to calculate RTT and also for maxPacketLifeTime
             c.nsent = 1; // being sent for the first time
-
-            Association::check_partial_reliability_status(
-                &mut c,
-                now,
-                self.use_forward_tsn,
-                self.side,
-                &self.streams,
-            );
 
             trace!(
                 "[{}] sending ppi={} tsn={} ssn={} sent={} len={} ({},{})",

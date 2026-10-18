@@ -4084,8 +4084,20 @@ impl Association {
     /// In particular, a blocked early chunk must not hide later expired DATA.
     fn expire_inflight_messages(&mut self, now: Instant) {
         if self.use_forward_tsn {
+            let mut abandoned = false;
             for tsn in self.outbound_queue.expired_inflight(now) {
-                self.abandon_if_needed(tsn, now);
+                abandoned |= self.abandon_if_needed(tsn, now);
+            }
+            while let Some((id, message_id, bytes)) = self
+                .outbound_queue
+                .expire_pending_tail(now, &mut self.my_next_tsn)
+            {
+                self.release_abandoned_buffer(id, message_id, bytes);
+                abandoned = true;
+            }
+            if abandoned {
+                self.timers
+                    .restart_if_stale(Timer::T3RTX, now, self.rto_mgr.get_rto());
             }
         }
     }
@@ -4125,15 +4137,18 @@ impl Association {
         let message_id = c.message_id;
         trace!("[{}] abandoning message containing tsn={}", self.side, tsn);
         if let Some((id, bytes)) = self.outbound_queue.abandon(tsn, &mut self.my_next_tsn) {
-            if let Some(stream) = self.streams.get_mut(&id) {
-                if message_id >= stream.first_message_id && stream.on_buffer_released(bytes as i64)
-                {
-                    self.events
-                        .push_back(Event::Stream(StreamEvent::BufferedAmountLow { id }));
-                }
-            }
+            self.release_abandoned_buffer(id, message_id, bytes);
         }
         true
+    }
+
+    fn release_abandoned_buffer(&mut self, id: u16, message_id: u64, bytes: usize) {
+        if let Some(stream) = self.streams.get_mut(&id) {
+            if message_id >= stream.first_message_id && stream.on_buffer_released(bytes as i64) {
+                self.events
+                    .push_back(Event::Stream(StreamEvent::BufferedAmountLow { id }));
+            }
+        }
     }
 
     fn create_selective_ack_chunk(&mut self) -> ChunkSelectiveAck {

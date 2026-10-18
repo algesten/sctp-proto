@@ -252,3 +252,31 @@ fn timed_expiry_abandons_tail_after_entire_prefix_was_gap_acked() {
     assert_eq!(a.stream(1).unwrap().buffered_amount().unwrap(), 0);
     assert!(!a.gather_outbound_forward_tsn_packets(vec![]).is_empty());
 }
+
+#[test]
+fn timed_expiry_retains_forward_recovery_after_prefix_cumulative_ack() {
+    let now = Instant::now();
+    let mut a = timed_fixture(now, false);
+    a.send_next_data_chunk(now).unwrap();
+    a.process_selective_ack(
+        &ChunkSelectiveAck {
+            cumulative_tsn_ack: 1,
+            ..Default::default()
+        },
+        now,
+    )
+    .unwrap();
+    a.cumulative_tsn_ack_point = 1;
+    a.streams.get_mut(&1).unwrap().on_buffer_released(4);
+    assert_eq!(a.outbound_queue.inflight_len(), 0);
+    assert!(a.timers.get(Timer::T3RTX).is_none());
+    assert!(
+        a.pop_pending_data_chunks_to_send(now + Duration::from_millis(10))
+            .is_empty()
+    );
+    assert_eq!(a.outbound_queue.pending_len(), 0);
+    assert_eq!(a.stream(1).unwrap().buffered_amount().unwrap(), 0);
+    assert!(a.outbound_queue.is_abandoned(2));
+    assert!(!a.gather_outbound_forward_tsn_packets(vec![]).is_empty());
+    assert!(a.timers.get(Timer::T3RTX).is_some());
+}

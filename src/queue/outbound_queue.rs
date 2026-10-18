@@ -108,6 +108,33 @@ impl OutboundQueue {
         if chunk.abandoned {
             return Some((stream, 0));
         }
+        self.abandon_message(message_id, stream, next_tsn)
+    }
+
+    /// A cumulatively acknowledged prefix may no longer have an inflight anchor.
+    pub(crate) fn expire_pending_tail(
+        &mut self,
+        now: Instant,
+        next_tsn: &mut u32,
+    ) -> Option<(u16, u64, usize)> {
+        let chunk = self.pending.peek()?;
+        if chunk.beginning_fragment
+            || chunk.payload_type == crate::PayloadProtocolIdentifier::Dcep
+            || !chunk.deadline.is_some_and(|deadline| now >= deadline)
+        {
+            return None;
+        }
+        let message_id = chunk.message_id;
+        self.abandon_message(message_id, chunk.stream_identifier, next_tsn)
+            .map(|(id, bytes)| (id, message_id, bytes))
+    }
+
+    fn abandon_message(
+        &mut self,
+        message_id: u64,
+        stream: u16,
+        next_tsn: &mut u32,
+    ) -> Option<(u16, usize)> {
         let inflight_bytes = self.inflight.abandon_message(message_id);
         let mut terminal = None;
         let bytes = self.pending.remove_message(message_id, |mut chunk| {

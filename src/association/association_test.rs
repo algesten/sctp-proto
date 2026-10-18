@@ -3228,19 +3228,23 @@ fn association_with_inflight_data(cumulative_tsn_ack_point: u32, now: Instant) -
     };
 
     for stream_sequence_number in 0..3 {
-        a.inflight_queue.push_no_check(ChunkPayloadData {
-            tsn: cumulative_tsn_ack_point.wrapping_add(u32::from(stream_sequence_number) + 1),
-            stream_identifier: 1,
-            stream_sequence_number,
-            beginning_fragment: true,
-            ending_fragment: true,
-            payload_type: PayloadProtocolIdentifier::Binary,
-            user_data: Bytes::from_static(b"payload"),
-            nsent: 1,
-            since: Some(now),
-            all_inflight: true,
-            ..Default::default()
-        });
+        queue_inflight(
+            &mut a,
+            ChunkPayloadData {
+                tsn: cumulative_tsn_ack_point.wrapping_add(u32::from(stream_sequence_number) + 1),
+                stream_identifier: 1,
+                stream_sequence_number,
+                beginning_fragment: true,
+                ending_fragment: true,
+                payload_type: PayloadProtocolIdentifier::Binary,
+                user_data: Bytes::from_static(b"payload"),
+                nsent: 1,
+                since: Some(now),
+                ..Default::default()
+            },
+        );
+        let tsn = cumulative_tsn_ack_point.wrapping_add(u32::from(stream_sequence_number) + 1);
+        a.outbound_queue.get_mut(tsn).unwrap().since = Some(now);
     }
 
     a
@@ -3261,7 +3265,7 @@ fn test_data_retransmission_wraps_tsn() -> Result<()> {
     for cumulative_tsn in [10, u32::MAX - 1, u32::MAX] {
         let mut a = association_with_inflight_data(cumulative_tsn, now);
         let acked_tsn = cumulative_tsn.wrapping_add(2);
-        a.inflight_queue.mark_as_acked(acked_tsn);
+        a.outbound_queue.mark_as_acked(acked_tsn);
         a.on_retransmission_timeout(Timer::T3RTX, 1);
 
         let packets = a.get_data_packets_to_retransmit(now);
@@ -3273,11 +3277,11 @@ fn test_data_retransmission_wraps_tsn() -> Result<()> {
         ];
         assert_retransmitted_packet(&packet, &retransmitted_tsns);
         for tsn in retransmitted_tsns {
-            let chunk = a.inflight_queue.get(tsn).unwrap();
+            let chunk = a.outbound_queue.get(tsn).unwrap();
             assert!(!chunk.retransmit);
             assert_eq!(chunk.nsent, 2);
         }
-        assert_eq!(a.inflight_queue.get(acked_tsn).unwrap().nsent, 1);
+        assert_eq!(a.outbound_queue.get(acked_tsn).unwrap().nsent, 1);
         assert!(a.get_data_packets_to_retransmit(now).is_empty());
     }
     Ok(())
@@ -3308,7 +3312,7 @@ fn test_zero_window_probe_wraps_tsn() -> Result<()> {
         assert_retransmitted_packet(&packets[0], &[cumulative_tsn.wrapping_add(1)]);
         for offset in [2, 3] {
             let chunk = a
-                .inflight_queue
+                .outbound_queue
                 .get(cumulative_tsn.wrapping_add(offset))
                 .unwrap();
             assert!(chunk.retransmit);
@@ -3325,13 +3329,13 @@ fn test_fast_retransmission_wraps_tsn() -> Result<()> {
     for cumulative_tsn in [10, u32::MAX - 1, u32::MAX] {
         let mut a = association_with_inflight_data(cumulative_tsn, now);
         let acked_tsn = cumulative_tsn.wrapping_add(2);
-        a.inflight_queue.mark_as_acked(acked_tsn);
+        a.outbound_queue.mark_as_acked(acked_tsn);
         let retransmitted_tsns = [
             cumulative_tsn.wrapping_add(1),
             cumulative_tsn.wrapping_add(3),
         ];
         for tsn in retransmitted_tsns {
-            a.inflight_queue.get_mut(tsn).unwrap().miss_indicator = 3;
+            a.outbound_queue.get_mut(tsn).unwrap().miss_indicator = 3;
         }
         a.will_retransmit_fast = true;
 
@@ -3339,9 +3343,9 @@ fn test_fast_retransmission_wraps_tsn() -> Result<()> {
         assert_eq!(packets.len(), 1);
         assert_retransmitted_packet(&Packet::unmarshal(&packets[0])?, &retransmitted_tsns);
         for tsn in retransmitted_tsns {
-            assert_eq!(a.inflight_queue.get(tsn).unwrap().nsent, 2);
+            assert_eq!(a.outbound_queue.get(tsn).unwrap().nsent, 2);
         }
-        assert_eq!(a.inflight_queue.get(acked_tsn).unwrap().nsent, 1);
+        assert_eq!(a.outbound_queue.get(acked_tsn).unwrap().nsent, 1);
         assert!(!a.will_retransmit_fast);
         assert_eq!(a.stats.get_num_fast_retrans(), 2);
     }
@@ -3365,9 +3369,9 @@ fn test_cumulative_sack_wraps_tsn() -> Result<()> {
 
         assert_eq!(bytes_acked, HashMap::from([(1, 14)]));
         assert_eq!(htna, ack_tsn);
-        assert_eq!(a.inflight_queue.len(), 1);
+        assert_eq!(a.outbound_queue.inflight_len(), 1);
         assert!(
-            a.inflight_queue
+            a.outbound_queue
                 .get(cumulative_tsn.wrapping_add(3))
                 .is_some()
         );
@@ -3387,7 +3391,7 @@ fn test_gap_sack_wraps_tsn() -> Result<()> {
         };
         for offset in [2, 3] {
             let data = sender
-                .inflight_queue
+                .outbound_queue
                 .get(cumulative_tsn.wrapping_add(offset))
                 .unwrap()
                 .clone();
@@ -3398,10 +3402,10 @@ fn test_gap_sack_wraps_tsn() -> Result<()> {
 
         assert_eq!(bytes_acked, HashMap::from([(1, 14)]));
         assert_eq!(htna, cumulative_tsn.wrapping_add(3));
-        assert_eq!(sender.inflight_queue.get_num_bytes(), 7);
+        assert_eq!(sender.outbound_queue.inflight_bytes(), 7);
         for offset in [1, 2, 3] {
             let data = sender
-                .inflight_queue
+                .outbound_queue
                 .get(cumulative_tsn.wrapping_add(offset))
                 .unwrap();
             assert_eq!(data.acked, offset != 1);
@@ -3419,9 +3423,9 @@ fn test_fast_recovery_wraps_tsn() -> Result<()> {
             a.in_fast_recovery = in_fast_recovery;
             let htna = cumulative_tsn.wrapping_add(3);
             a.fast_recover_exit_point = htna;
-            a.inflight_queue.mark_as_acked(htna);
+            a.outbound_queue.mark_as_acked(htna);
             for offset in [1, 2] {
-                a.inflight_queue
+                a.outbound_queue
                     .get_mut(cumulative_tsn.wrapping_add(offset))
                     .unwrap()
                     .miss_indicator = 2;
@@ -3434,12 +3438,12 @@ fn test_fast_recovery_wraps_tsn() -> Result<()> {
             assert_eq!(a.fast_recover_exit_point, htna);
             for offset in [1, 2] {
                 let chunk = a
-                    .inflight_queue
+                    .outbound_queue
                     .get(cumulative_tsn.wrapping_add(offset))
                     .unwrap();
                 assert_eq!(chunk.miss_indicator, 3);
             }
-            assert_eq!(a.inflight_queue.get(htna).unwrap().miss_indicator, 0);
+            assert_eq!(a.outbound_queue.get(htna).unwrap().miss_indicator, 0);
         }
     }
     Ok(())
@@ -3453,10 +3457,10 @@ fn test_forward_tsn_wraparound() -> Result<()> {
             let mut a = association_with_inflight_data(cumulative_tsn, now);
             a.use_forward_tsn = true;
             for offset in [1, 2] {
-                a.inflight_queue
+                a.outbound_queue
                     .get_mut(cumulative_tsn.wrapping_add(offset))
                     .unwrap()
-                    .set_abandoned(true);
+                    .abandoned = true;
             }
 
             if from_timeout {
@@ -5357,7 +5361,7 @@ fn test_fast_retransmission_abandons_message_and_pending_tail() {
     assert!(a.outbound_queue.is_abandoned(1));
     assert!(a.outbound_queue.is_abandoned(2));
     assert_eq!(a.outbound_queue.pending_len(), 0);
-    assert_eq!(a.stream(1).unwrap().buffered_amount().unwrap(), 8);
+    assert_eq!(a.stream(1).unwrap().buffered_amount().unwrap(), 0);
     assert_eq!(a.my_next_tsn, 4);
     let packets = a.gather_outbound_forward_tsn_packets(vec![]);
     assert_eq!(packets.len(), 1);
@@ -5385,7 +5389,7 @@ fn test_later_fragment_exhaustion_cancels_earlier_scheduled_retry() {
     assert!(a.outbound_queue.is_abandoned(1));
     assert!(a.outbound_queue.is_abandoned(2));
     assert_eq!(a.outbound_queue.pending_len(), 0);
-    assert_eq!(a.stream(1).unwrap().buffered_amount().unwrap(), 8);
+    assert_eq!(a.stream(1).unwrap().buffered_amount().unwrap(), 0);
 }
 
 #[test]

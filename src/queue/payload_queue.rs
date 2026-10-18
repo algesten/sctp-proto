@@ -108,13 +108,18 @@ impl PayloadQueue {
     }
 
     /// Abandon siblings by identity, including nonconsecutive TSNs.
-    pub(crate) fn abandon_message(&mut self, message_id: u64) {
+    pub(crate) fn abandon_message(&mut self, message_id: u64) -> usize {
+        let mut released = 0;
         for chunk in self.chunk_map.values_mut() {
             if chunk.message_id == message_id {
+                released += chunk.user_data.len();
+                chunk.user_data.clear();
                 chunk.abandoned = true;
                 chunk.retransmit = false;
             }
         }
+        self.n_bytes -= released;
+        released
     }
 
     pub(crate) fn mark_all_to_retransmit(&mut self) {

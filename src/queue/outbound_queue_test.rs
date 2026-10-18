@@ -71,7 +71,7 @@ fn abandonment_discards_pending_tail_and_does_not_alias_unordered_messages() {
     assert_eq!(q.mark_as_acked(3), 0);
     assert_eq!(q.inflight_bytes(), 8);
     let mut next_tsn = 4;
-    assert_eq!(q.abandon(2, &mut next_tsn), Some((7, 16)));
+    assert_eq!(q.abandon(2, &mut next_tsn), Some((7, 24)));
     assert_eq!(next_tsn, 5);
     assert!(q.is_abandoned(2));
     assert!(q.is_abandoned(3));
@@ -112,14 +112,14 @@ fn retransmission_excludes_pending_acked_and_abandoned_fragments() {
     }
     q.mark_all_to_retransmit();
     assert_eq!(q.mark_as_acked(2), 8);
-    assert_eq!(q.abandon(1, &mut 5), Some((1, 0)));
+    assert_eq!(q.abandon(1, &mut 5), Some((1, 8)));
     q.mark_all_to_retransmit();
     for tsn in 1..=4 {
         assert_eq!(q.get(tsn).unwrap().retransmit, tsn >= 3);
     }
     assert!(!q.peek_pending().unwrap().retransmit);
     assert!(q.get(5).is_none(), "pending chunks have no TSN yet");
-    assert_eq!(q.inflight_bytes(), 24);
+    assert_eq!(q.inflight_bytes(), 16);
     assert_eq!(q.pending_bytes(), 8);
     q.get_mut(3).unwrap().nsent += 1;
     assert_eq!(q.get(3).unwrap().nsent, 2);
@@ -140,7 +140,7 @@ fn tsn_lookup_and_retirement_across_wraparound() {
     assert!(q.get(first.wrapping_sub(1)).is_none());
     assert!(q.get(first.wrapping_add(12)).is_none());
     assert!(q.pop(first.wrapping_add(1)).is_none());
-    assert_eq!(q.abandon(u32::MAX, &mut 7), Some((1, 0)));
+    assert_eq!(q.abandon(u32::MAX, &mut 7), Some((1, 24)));
     for i in 0..12 {
         let tsn = first.wrapping_add(i);
         for remaining in i..12 {
@@ -154,7 +154,10 @@ fn tsn_lookup_and_retirement_across_wraparound() {
         assert_eq!(q.pop(tsn).unwrap().tsn, tsn);
         assert!(q.get(tsn).is_none());
         assert_eq!(q.inflight_len(), (11 - i) as usize);
-        assert_eq!(q.inflight_bytes(), (11 - i) as usize * 8);
+        assert_eq!(
+            q.inflight_bytes(),
+            ((i + 1)..12).filter(|n| !(3..6).contains(n)).count() * 8
+        );
     }
     assert_eq!(q.inflight_len(), 0);
 }
@@ -192,10 +195,10 @@ fn reserving_abandoned_tail_tsns_crosses_wraparound() {
     q.push(message(2, false, 1));
     q.send_next(&mut { u32::MAX - 1 }, now).unwrap();
     let mut next_tsn = u32::MAX;
-    assert_eq!(q.abandon(u32::MAX - 1, &mut next_tsn), Some((1, 24)));
+    assert_eq!(q.abandon(u32::MAX - 1, &mut next_tsn), Some((1, 32)));
     assert_eq!(next_tsn, 0);
     assert_eq!(q.inflight_len(), 2);
-    assert_eq!(q.inflight_bytes(), 8);
+    assert_eq!(q.inflight_bytes(), 0);
     q.mark_all_to_retransmit();
     for tsn in [u32::MAX - 1, u32::MAX] {
         assert!(q.is_abandoned(tsn));
@@ -250,7 +253,7 @@ fn abandonment_matches_interleaved_fragments_by_message_tag() {
     let mut next_tsn = first.wrapping_add(6);
     assert_eq!(
         q.abandon(first.wrapping_add(2), &mut next_tsn),
-        Some((7, 0))
+        Some((7, 24))
     );
     assert_eq!(next_tsn, first.wrapping_add(6));
     for i in 0..6 {
@@ -286,7 +289,7 @@ fn removing_other_message_tail_preserves_pending_selection() {
     q.next_message_id = 2;
     q.send_next(&mut 3, now).unwrap();
     let mut next_tsn = 4;
-    assert_eq!(q.abandon(2, &mut next_tsn), Some((2, 16)));
+    assert_eq!(q.abandon(2, &mut next_tsn), Some((2, 24)));
     assert_eq!(next_tsn, 5);
     assert_eq!(q.pending_len(), 1);
     let remaining = q.send_next(&mut next_tsn, now).unwrap();

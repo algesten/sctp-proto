@@ -20,6 +20,10 @@ pub(crate) struct OutboundQueue {
 }
 
 impl OutboundQueue {
+    pub(crate) fn next_message_id(&self) -> u64 {
+        self.next_message_id
+    }
+
     pub(crate) fn push(&mut self, chunks: Vec<ChunkPayloadData>) {
         if chunks.is_empty() {
             return;
@@ -84,7 +88,7 @@ impl OutboundQueue {
         if chunk.abandoned {
             return Some((stream, 0));
         }
-        self.inflight.abandon_message(message_id);
+        let inflight_bytes = self.inflight.abandon_message(message_id);
         let mut terminal = None;
         let bytes = self.pending.remove_message(message_id, |mut chunk| {
             chunk.user_data.clear();
@@ -102,7 +106,7 @@ impl OutboundQueue {
             chunk.retransmit = false;
             self.inflight.push_no_check(chunk);
         }
-        Some((stream, bytes))
+        Some((stream, bytes + inflight_bytes))
     }
 
     pub(crate) fn mark_all_to_retransmit(&mut self) {

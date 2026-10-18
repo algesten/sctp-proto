@@ -164,7 +164,9 @@ pub enum ReliabilityType {
     /// ReliabilityTypeReliable is used for reliable transmission
     #[default]
     Reliable = 0,
-    /// ReliabilityTypeRexmit is used for partial reliability by retransmission count
+    /// Limit retries per DATA chunk, excluding its original transmission.
+    /// Originals and the last permitted retry remain buffered until acknowledged
+    /// or a subsequent recovery event requires abandonment.
     Rexmit = 1,
     /// ReliabilityTypeTimed is used for partial reliability by retransmission duration
     Timed = 2,
@@ -596,6 +598,7 @@ impl From<u8> for RecvSendState {
 #[derive(Default, Debug)]
 pub struct StreamState {
     pub(crate) stats: DataChannelStats,
+    pub(crate) first_message_id: u64,
     pub(crate) side: Side,
     pub(crate) max_payload_size: u32,
     pub(crate) stream_identifier: StreamId,
@@ -623,6 +626,7 @@ impl StreamState {
                 stream_identifier,
                 ..Default::default()
             },
+            first_message_id: 0,
             side,
             stream_identifier,
             max_payload_size,

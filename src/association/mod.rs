@@ -3006,7 +3006,7 @@ impl Association {
         //log::debug!("[{}] i={} d={}", self.name, i, d.cumulative_tsn_ack);
         while sna32lte(i, d.cumulative_tsn_ack) {
             if let Some(c) = self.outbound_queue.pop(i) {
-                if !c.acked {
+                if !c.acked && !c.abandoned {
                     // RFC 4096 sec 6.3.2.  Retransmission Timer Rules
                     //   R3)  Whenever a SACK is received that acknowledges the DATA chunk
                     //        with the earliest outstanding TSN for that address, restart the
@@ -3083,7 +3083,7 @@ impl Association {
                 };
 
                 if let Some(c) = self.outbound_queue.get(tsn) {
-                    if !is_acked {
+                    if !is_acked && !c.abandoned {
                         // Sum the number of bytes acknowledged per stream
                         if let Some(amount) = bytes_acked_per_stream.get_mut(&c.stream_identifier) {
                             *amount += n_bytes_acked;
@@ -3423,6 +3423,7 @@ impl Association {
         );
 
         s.stats.generation = generation;
+        s.first_message_id = self.outbound_queue.next_message_id();
 
         if accept {
             self.stream_queue.push_back(stream_identifier);
@@ -4064,10 +4065,12 @@ impl Association {
         if !expired {
             return false;
         }
+        let message_id = c.message_id;
         trace!("[{}] abandoning message containing tsn={}", self.side, tsn);
         if let Some((id, bytes)) = self.outbound_queue.abandon(tsn, &mut self.my_next_tsn) {
             if let Some(stream) = self.streams.get_mut(&id) {
-                if stream.on_buffer_released(bytes as i64) {
+                if message_id >= stream.first_message_id && stream.on_buffer_released(bytes as i64)
+                {
                     self.events
                         .push_back(Event::Stream(StreamEvent::BufferedAmountLow { id }));
                 }

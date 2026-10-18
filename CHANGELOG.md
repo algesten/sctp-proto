@@ -1,5 +1,6 @@
 # Unreleased
 
+  * Expire pending timed messages before TSN assignment without ordered delivery gaps #77
   * Eliminate front-shifting in payload and reassembly queues #73
   * Report receive-buffer exhaustion explicitly when incomplete messages cannot be drained #74
   * Add per-stream logical data-channel statistics and final snapshots across resets and association loss #75

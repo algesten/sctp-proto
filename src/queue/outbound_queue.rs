@@ -41,6 +41,26 @@ impl OutboundQueue {
         self.pending.peek()
     }
 
+    /// Discard an expired, entirely unsent head message without allocating a TSN.
+    pub(crate) fn expire_pending(&mut self, now: Instant) -> Option<(u16, bool, usize)> {
+        let chunk = self.pending.peek()?;
+        if !chunk.beginning_fragment
+            || chunk.user_data.is_empty()
+            || chunk.payload_type == crate::PayloadProtocolIdentifier::Dcep
+            || !chunk.deadline.is_some_and(|deadline| now >= deadline)
+        {
+            return None;
+        }
+        let stream = chunk.stream_identifier;
+        let unordered = chunk.unordered;
+        let message_id = chunk.message_id;
+        let bytes = self.pending.remove_message(message_id, |_| {});
+        if !unordered {
+            self.pending.compact_ordered_ssns(stream);
+        }
+        Some((stream, unordered, bytes))
+    }
+
     /// Assign the next TSN and retain the chunk in the hash-indexed flight queue.
     pub(crate) fn send_next(
         &mut self,

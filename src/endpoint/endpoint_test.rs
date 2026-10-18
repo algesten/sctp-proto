@@ -1251,168 +1251,87 @@ fn test_assoc_unreliable_rexmit_unordered_fragment() -> Result<()> {
 }
 
 #[test]
-fn test_assoc_unreliable_rexmit_timed_ordered() -> Result<()> {
-    //let _guard = subscribe();
-
-    let si: u16 = 3;
-    let mut sbuf = vec![0u8; 1000];
-    for (i, b) in sbuf.iter_mut().enumerate() {
-        *b = (i & 0xff) as u8;
+fn test_pending_timed_expiry_window_stall() -> Result<()> {
+    for unordered in [false, true] {
+        for initial_ssn in [1, u16::MAX] {
+            let (mut pair, client, server) = create_association_pair(AckMode::NoDelay, 0)?;
+            establish_session_pair(&mut pair, client, server, 3)?;
+            pair.client_conn_mut(client)
+                .streams
+                .get_mut(&3)
+                .unwrap()
+                .sequence_number = initial_ssn;
+            pair.server_conn_mut(server)
+                .streams
+                .get_mut(&3)
+                .unwrap()
+                .reassembly_queue
+                .next_ssn = initial_ssn;
+            let now = pair.time;
+            // Leave reliable DATA in flight so the stalled window cannot send a probe.
+            pair.client_conn_mut(client)
+                .open_stream(4, PayloadProtocolIdentifier::Binary)?
+                .write(b"blocker")?;
+            pair.client.drive(now, pair.server.addr);
+            let old_cwnd = pair.client_conn_mut(client).cwnd;
+            pair.client_conn_mut(client).cwnd = 7;
+            pair.client_stream(client, 3)?.set_reliability_params(
+                unordered,
+                ReliabilityType::Timed,
+                10,
+            )?;
+            assert_eq!(
+                pair.client_stream(client, 3)?.write(b"needs time"),
+                Err(Error::ErrTimedMessageRequiresTimestamp)
+            );
+            while pair.client_conn_mut(client).poll().is_some() {}
+            let old = vec![42; 3000];
+            pair.client_stream(client, 3)?.write_at(now, &old)?;
+            pair.client
+                .drive(now + Duration::from_millis(9), pair.server.addr);
+            assert_eq!(pair.client_stream(client, 3)?.buffered_amount()?, old.len());
+            // Changing the stream policy cannot extend an accepted message's lifetime.
+            pair.client_stream(client, 3)?.set_reliability_params(
+                unordered,
+                ReliabilityType::Reliable,
+                0,
+            )?;
+            // Exact deadline expiry precedes the first TSN assignment even with a closed window.
+            pair.client
+                .drive(now + Duration::from_millis(10), pair.server.addr);
+            assert_eq!(pair.client_stream(client, 3)?.buffered_amount()?, 0);
+            pair.client
+                .drive(now + Duration::from_millis(11), pair.server.addr);
+            let mut low_events = 0;
+            while let Some(event) = pair.client_conn_mut(client).poll() {
+                if matches!(
+                    event,
+                    Event::Stream(StreamEvent::BufferedAmountLow { id: 3 })
+                ) {
+                    low_events += 1;
+                }
+            }
+            assert_eq!(low_events, 1, "expiry releases buffer credit exactly once");
+            pair.time = now + Duration::from_millis(20);
+            pair.client_conn_mut(client).cwnd = old_cwnd;
+            pair.client_stream(client, 3)?.set_reliability_params(
+                unordered,
+                ReliabilityType::Reliable,
+                0,
+            )?;
+            pair.client_stream(client, 3)?.write(b"fresh")?;
+            pair.drive();
+            let chunks = pair
+                .server_stream(server, 3)?
+                .read()?
+                .expect("fresh message");
+            let mut data = vec![0; chunks.len()];
+            chunks.read(&mut data)?;
+            assert_eq!(data, b"fresh");
+            assert!(pair.server_stream(server, 3)?.read()?.is_none());
+            assert_eq!(pair.client_stream(client, 3)?.buffered_amount()?, 0);
+        }
     }
-
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
-
-    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
-
-    // A lost original expires before recovery; the following live message arrives.
-    pair.client_stream(client_ch, si)?
-        .set_reliability_params(false, ReliabilityType::Timed, 1)?;
-    pair.server_stream(server_ch, si)?
-        .set_reliability_params(false, ReliabilityType::Timed, 1)?; // doesn't matter
-
-    //br.drop_next_nwrites(0, 1).await; // drop the first packet (second one should be sacked)
-
-    sbuf[0..4].copy_from_slice(&0u32.to_be_bytes());
-    let now = pair.time;
-    let n = pair.client_stream(client_ch, si)?.write_sctp_at(
-        now,
-        &Bytes::from(sbuf.clone()),
-        PayloadProtocolIdentifier::Binary,
-    )?;
-    assert_eq!(sbuf.len(), n, "unexpected length of received data");
-    pair.client.drive(pair.time, pair.server.addr);
-    pair.client.outbound.clear();
-    pair.time += Duration::from_millis(1);
-
-    sbuf[0..4].copy_from_slice(&1u32.to_be_bytes());
-    let now = pair.time;
-    let n = pair.client_stream(client_ch, si)?.write_sctp_at(
-        now,
-        &Bytes::from(sbuf.clone()),
-        PayloadProtocolIdentifier::Binary,
-    )?;
-    assert_eq!(sbuf.len(), n, "unexpected length of received data");
-
-    //log::debug!("flush_buffers");
-    pair.drive();
-
-    let mut buf = vec![0u8; 2000];
-
-    //log::debug!("read_sctp");
-    let chunks = pair.server_stream(server_ch, si)?.read_sctp()?.unwrap();
-    let (n, ppi) = (chunks.len(), chunks.ppi);
-    chunks.read(&mut buf)?;
-    assert_eq!(n, sbuf.len(), "unexpected length of received data");
-    assert_eq!(ppi, PayloadProtocolIdentifier::Binary, "unexpected ppi");
-    assert_eq!(
-        u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
-        1,
-        "unexpected received data"
-    );
-
-    //log::debug!("process");
-    pair.drive();
-
-    {
-        let q = &pair
-            .client_conn_mut(client_ch)
-            .streams
-            .get(&si)
-            .unwrap()
-            .reassembly_queue;
-        assert!(!q.is_readable(), "should no longer be readable");
-    }
-
-    close_association_pair(&mut pair, client_ch, server_ch, si);
-
-    Ok(())
-}
-
-#[test]
-fn test_assoc_unreliable_rexmit_timed_unordered() -> Result<()> {
-    //let _guard = subscribe();
-
-    let si: u16 = 3;
-    let mut sbuf = vec![0u8; 1000];
-    for (i, b) in sbuf.iter_mut().enumerate() {
-        *b = (i & 0xff) as u8;
-    }
-
-    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
-
-    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
-
-    // A lost original expires before recovery; the following live message arrives.
-    pair.client_stream(client_ch, si)?
-        .set_reliability_params(true, ReliabilityType::Timed, 1)?;
-    pair.server_stream(server_ch, si)?
-        .set_reliability_params(true, ReliabilityType::Timed, 1)?; // doesn't matter
-
-    //br.drop_next_nwrites(0, 1).await; // drop the first packet (second one should be sacked)
-
-    sbuf[0..4].copy_from_slice(&0u32.to_be_bytes());
-    let now = pair.time;
-    let n = pair.client_stream(client_ch, si)?.write_sctp_at(
-        now,
-        &Bytes::from(sbuf.clone()),
-        PayloadProtocolIdentifier::Binary,
-    )?;
-    assert_eq!(sbuf.len(), n, "unexpected length of received data");
-    pair.client.drive(pair.time, pair.server.addr);
-    pair.client.outbound.clear();
-    pair.time += Duration::from_millis(1);
-
-    sbuf[0..4].copy_from_slice(&1u32.to_be_bytes());
-    let now = pair.time;
-    let n = pair.client_stream(client_ch, si)?.write_sctp_at(
-        now,
-        &Bytes::from(sbuf.clone()),
-        PayloadProtocolIdentifier::Binary,
-    )?;
-    assert_eq!(sbuf.len(), n, "unexpected length of received data");
-
-    //log::debug!("flush_buffers");
-    pair.drive();
-
-    let mut buf = vec![0u8; 2000];
-
-    //log::debug!("read_sctp");
-    let chunks = pair.server_stream(server_ch, si)?.read_sctp()?.unwrap();
-    let (n, ppi) = (chunks.len(), chunks.ppi);
-    chunks.read(&mut buf)?;
-    assert_eq!(n, sbuf.len(), "unexpected length of received data");
-    assert_eq!(ppi, PayloadProtocolIdentifier::Binary, "unexpected ppi");
-    assert_eq!(
-        u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]),
-        1,
-        "unexpected received data"
-    );
-
-    //log::debug!("process");
-    pair.drive();
-
-    {
-        let q = &pair
-            .client_conn_mut(client_ch)
-            .streams
-            .get(&si)
-            .unwrap()
-            .reassembly_queue;
-        assert!(!q.is_readable(), "should no longer be readable");
-        assert_eq!(
-            0,
-            q.unordered.len(),
-            "should be nothing in the unordered queue"
-        );
-        assert_eq!(
-            0,
-            q.unordered_chunks.len(),
-            "should be nothing in the unorderedChunks list"
-        );
-    }
-
-    close_association_pair(&mut pair, client_ch, server_ch, si);
-
     Ok(())
 }
 

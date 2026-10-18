@@ -4895,6 +4895,7 @@ fn test_receive_capacity_detected_after_reading_last_complete_message() -> Resul
     a.set_state(AssociationState::Established);
     a.peer_last_tsn = 0;
     let mut complete = receive_capacity_fragment(1, true, true);
+    complete.payload_type = PayloadProtocolIdentifier::Binary;
     complete.user_data = Bytes::from_static(b"old");
     a.handle_data(&complete)?;
     for tsn in 2..=33 {
@@ -4906,7 +4907,19 @@ fn test_receive_capacity_detected_after_reading_last_complete_message() -> Resul
     assert!(!a.is_closed());
     assert!(a.stream(1)?.read()?.is_some());
     assert!(a.is_closed());
-    assert!(core::iter::from_fn(|| a.poll()).any(|event| matches!(
+    let events: Vec<_> = core::iter::from_fn(|| a.poll()).collect();
+    let final_stats = events
+        .iter()
+        .find_map(|event| match event {
+            Event::DataChannelStatsFinal(stats) if stats.stream_identifier == 1 => Some(stats),
+            _ => None,
+        })
+        .expect("receive-capacity closure preserves final stats");
+    assert_eq!(
+        (final_stats.messages_received, final_stats.bytes_received),
+        (1, 3)
+    );
+    assert!(events.iter().any(|event| matches!(
         event,
         Event::AssociationLost {
             reason: AssociationError::ReceiveBufferExhausted

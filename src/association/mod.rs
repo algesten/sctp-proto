@@ -36,6 +36,7 @@ use crate::queue::reassembly_queue::ReassemblyQueue;
 use crate::shared::{AssociationEventInner, AssociationId, EndpointEvent, EndpointEventInner};
 use crate::util::{sna16lt, sna32gt, sna32gte, sna32lt, sna32lte};
 use crate::{AssociationEvent, Payload, Side, Transmit};
+use stream::DataChannelStats;
 use stream::{ReliabilityType, Stream, StreamEvent, StreamId, StreamResetError, StreamState};
 use timer::{ACK_INTERVAL, RtoManager, Timer, TimerTable};
 
@@ -121,6 +122,12 @@ pub enum Event {
     },
     /// Stream events
     Stream(StreamEvent),
+    /// Final counters for a removed stream generation, including association loss.
+    ///
+    /// Emitted exactly once per removed generation. Drain events after reads and
+    /// close/reset operations as well as transport input, and before dropping
+    /// the association. The embedding layer owns retention of closed reports.
+    DataChannelStatsFinal(DataChannelStats),
     /// One or more application datagrams have been received
     DatagramReceived,
 }
@@ -204,6 +211,7 @@ pub struct Association {
     max_receive_message_size: u32,
     inflight_queue_length: usize,
     will_send_shutdown: bool,
+    next_stream_generation: u64,
     bytes_received: usize,
     bytes_sent: usize,
 
@@ -327,6 +335,7 @@ impl Default for Association {
             max_receive_message_size: 0,
             inflight_queue_length: 0,
             will_send_shutdown: false,
+            next_stream_generation: 0,
             bytes_received: 0,
             bytes_sent: 0,
 
@@ -1299,6 +1308,7 @@ impl Association {
     fn unregister_stream(&mut self, stream_identifier: StreamId, emit_stream_finished: bool) {
         if let Some(mut s) = self.streams.remove(&stream_identifier) {
             debug!("[{}] unregister_stream {}", self.side, stream_identifier);
+            self.events.push_back(Event::DataChannelStatsFinal(s.stats));
             s.state = RecvSendState::Closed;
             if emit_stream_finished {
                 self.queue_stream_finished(stream_identifier, true);
@@ -1372,6 +1382,8 @@ impl Association {
             .map(|stream| stream.state)
             .unwrap_or(RecvSendState::ReadWritable);
         if let Some(mut stream) = self.streams.remove(&stream_identifier) {
+            self.events
+                .push_back(Event::DataChannelStatsFinal(stream.stats));
             stream.state = RecvSendState::Closed;
         }
 
@@ -1415,6 +1427,8 @@ impl Association {
             // Finished event can become ready immediately, and any forwarding
             // state scoped to it must not leak into the following generation.
             if let Some(mut stream) = self.streams.remove(&stream_identifier) {
+                self.events
+                    .push_back(Event::DataChannelStatsFinal(stream.stats));
                 stream.state = RecvSendState::Closed;
             }
             self.discard_deferred_forward_tsns_through(stream_identifier, next_boundary);
@@ -3416,13 +3430,17 @@ impl Association {
         accept: bool,
         default_payload_type: PayloadProtocolIdentifier,
     ) -> Option<Stream<'_>> {
-        let s = StreamState::new(
+        let generation = self.next_stream_generation;
+        self.next_stream_generation = generation.checked_add(1)?;
+        let mut s = StreamState::new(
             self.side,
             stream_identifier,
             self.max_payload_size,
             self.max_receive_message_size,
             default_payload_type,
         );
+
+        s.stats.generation = generation;
 
         if accept {
             self.stream_queue.push_back(stream_identifier);

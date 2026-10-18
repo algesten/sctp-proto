@@ -15,6 +15,66 @@ use log::{debug, error, trace};
 /// Identifier for a stream within a particular association
 pub type StreamId = u16;
 
+/// Cumulative WebRTC application payload totals at the SCTP API boundary.
+///
+/// Writes count once after queue acceptance; reads count once when a complete
+/// message is returned. Retries, acknowledgements and abandonment do not change
+/// these totals. Text uses UTF-8 bytes. Empty-message PPIDs count one message
+/// and zero bytes; DCEP and unknown PPIDs are excluded. An empty write that
+/// queues no SCTP message is excluded (use the empty PPID with its dummy byte).
+/// All counters saturate at `u64::MAX`.
+///
+/// This is not a complete RTCDataChannelStats report: the embedding layer owns
+/// label, protocol, WebRTC state, timestamp and report ID. Sends buffered above
+/// SCTP and reads discarded above SCTP require accounting at that layer's API
+/// boundary. Use checked conversion for WebIDL's 32-bit message counters.
+/// Pair `generation` with an association identity for a unique report identity;
+/// the numeric stream ID alone can be reused. Retain final snapshots from
+/// [`crate::Event::DataChannelStatsFinal`] for closed-channel reporting.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub struct DataChannelStats {
+    /// SCTP stream identifier.
+    pub stream_identifier: StreamId,
+    /// Unique stream generation within this association.
+    pub generation: u64,
+    /// Successfully accepted application messages.
+    pub messages_sent: u64,
+    /// Application payload bytes accepted for sending.
+    pub bytes_sent: u64,
+    /// Complete application messages returned to the caller.
+    pub messages_received: u64,
+    /// Application payload bytes returned to the caller.
+    pub bytes_received: u64,
+}
+
+impl DataChannelStats {
+    fn payload_bytes(ppi: PayloadProtocolIdentifier, len: usize) -> Option<u64> {
+        match ppi {
+            PayloadProtocolIdentifier::String | PayloadProtocolIdentifier::Binary => {
+                Some(u64::try_from(len).unwrap_or(u64::MAX))
+            }
+            PayloadProtocolIdentifier::StringEmpty | PayloadProtocolIdentifier::BinaryEmpty => {
+                Some(0)
+            }
+            _ => None,
+        }
+    }
+
+    fn sent(&mut self, ppi: PayloadProtocolIdentifier, len: usize) {
+        if let Some(bytes) = Self::payload_bytes(ppi, len) {
+            self.messages_sent = self.messages_sent.saturating_add(1);
+            self.bytes_sent = self.bytes_sent.saturating_add(bytes);
+        }
+    }
+
+    fn received(&mut self, ppi: PayloadProtocolIdentifier, len: usize) {
+        if let Some(bytes) = Self::payload_bytes(ppi, len) {
+            self.messages_received = self.messages_received.saturating_add(1);
+            self.bytes_received = self.bytes_received.saturating_add(bytes);
+        }
+    }
+}
+
 /// Why a stream reset did not complete successfully.
 #[non_exhaustive]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -138,6 +198,15 @@ pub struct Stream<'a> {
 }
 
 impl<'a> Stream<'a> {
+    /// Return a read-only snapshot for the current stream generation.
+    pub fn stats(&self) -> Result<DataChannelStats> {
+        self.association
+            .streams
+            .get(&self.stream_identifier)
+            .map(|s| s.stats)
+            .ok_or(Error::ErrStreamClosed)
+    }
+
     /// read reads a packet of len(p) bytes, dropping the Payload Protocol Identifier.
     /// Returns EOF when the stream is reset or an error if the stream is closed
     /// otherwise.
@@ -150,7 +219,7 @@ impl<'a> Stream<'a> {
     /// Returns EOF when the stream is reset or an error if the stream is closed
     /// otherwise.
     pub fn read_sctp(&mut self) -> Result<Option<Chunks>> {
-        let (message, drained) =
+        let (message, drained, generation) =
             if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
                 if s.state != RecvSendState::ReadWritable && s.state != RecvSendState::Readable {
                     return Err(Error::ErrStreamClosed);
@@ -158,7 +227,7 @@ impl<'a> Stream<'a> {
 
                 let message = s.reassembly_queue.read();
                 let drained = message.is_some() && s.reassembly_queue.get_num_bytes() == 0;
-                (message, drained)
+                (message, drained, s.stats.generation)
             } else {
                 return Err(Error::ErrStreamClosed);
             };
@@ -174,6 +243,30 @@ impl<'a> Stream<'a> {
             self.association.abort_receive_capacity();
         }
 
+        if let Some(message) = &message {
+            let stats = self
+                .association
+                .streams
+                .get_mut(&self.stream_identifier)
+                .filter(|s| s.stats.generation == generation)
+                .map(|s| &mut s.stats)
+                .or_else(|| {
+                    self.association
+                        .events
+                        .iter_mut()
+                        .find_map(|event| match event {
+                            crate::Event::DataChannelStatsFinal(stats)
+                                if stats.generation == generation =>
+                            {
+                                Some(stats)
+                            }
+                            _ => None,
+                        })
+                });
+            if let Some(stats) = stats {
+                stats.received(message.ppi, message.len());
+            }
+        }
         Ok(message)
     }
 
@@ -246,7 +339,16 @@ impl<'a> Stream<'a> {
 
         if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
             let (is_buffered_amount_high, chunks) = s.packetize(&p, ppi);
+            let queued = !chunks.is_empty();
             self.association.send_payload_data(chunks)?;
+            if queued {
+                self.association
+                    .streams
+                    .get_mut(&self.stream_identifier)
+                    .expect("accepted stream remains registered")
+                    .stats
+                    .sent(ppi, p.len());
+            }
 
             if is_buffered_amount_high {
                 trace!("StreamEvent::BufferedAmountHigh");
@@ -493,6 +595,7 @@ impl From<u8> for RecvSendState {
 /// StreamState represents the state of an SCTP stream
 #[derive(Default, Debug)]
 pub struct StreamState {
+    pub(crate) stats: DataChannelStats,
     pub(crate) side: Side,
     pub(crate) max_payload_size: u32,
     pub(crate) stream_identifier: StreamId,
@@ -516,6 +619,10 @@ impl StreamState {
         default_payload_type: PayloadProtocolIdentifier,
     ) -> Self {
         StreamState {
+            stats: DataChannelStats {
+                stream_identifier,
+                ..Default::default()
+            },
             side,
             stream_identifier,
             max_payload_size,
@@ -634,5 +741,41 @@ impl StreamState {
     pub(crate) fn get_num_bytes_in_reassembly_queue(&self) -> usize {
         // No lock is required as it reads the size with atomic load function.
         self.reassembly_queue.get_num_bytes()
+    }
+}
+
+#[cfg(test)]
+mod stats_tests {
+    use super::*;
+
+    #[test]
+    fn counters_saturate_and_share_payload_projection() {
+        let mut stats = DataChannelStats {
+            messages_sent: u64::MAX - 1,
+            bytes_sent: u64::MAX - 1,
+            messages_received: u64::MAX - 1,
+            bytes_received: u64::MAX - 1,
+            ..Default::default()
+        };
+        for ppi in [
+            PayloadProtocolIdentifier::Binary,
+            PayloadProtocolIdentifier::String,
+        ] {
+            stats.sent(ppi, 2);
+            stats.received(ppi, 2);
+        }
+        assert_eq!(stats.messages_sent, u64::MAX);
+        assert_eq!(stats.bytes_sent, u64::MAX);
+        assert_eq!(stats.messages_received, u64::MAX);
+        assert_eq!(stats.bytes_received, u64::MAX);
+        for ppi in [
+            PayloadProtocolIdentifier::Dcep,
+            PayloadProtocolIdentifier::Unknown,
+        ] {
+            let mut stats = DataChannelStats::default();
+            stats.sent(ppi, 10);
+            stats.received(ppi, 10);
+            assert_eq!(stats, DataChannelStats::default());
+        }
     }
 }

@@ -4895,6 +4895,7 @@ fn test_receive_capacity_detected_after_reading_last_complete_message() -> Resul
     a.set_state(AssociationState::Established);
     a.peer_last_tsn = 0;
     let mut complete = receive_capacity_fragment(1, true, true);
+    complete.payload_type = PayloadProtocolIdentifier::Binary;
     complete.user_data = Bytes::from_static(b"old");
     a.handle_data(&complete)?;
     for tsn in 2..=33 {
@@ -4906,7 +4907,19 @@ fn test_receive_capacity_detected_after_reading_last_complete_message() -> Resul
     assert!(!a.is_closed());
     assert!(a.stream(1)?.read()?.is_some());
     assert!(a.is_closed());
-    assert!(core::iter::from_fn(|| a.poll()).any(|event| matches!(
+    let events: Vec<_> = core::iter::from_fn(|| a.poll()).collect();
+    let final_stats = events
+        .iter()
+        .find_map(|event| match event {
+            Event::DataChannelStatsFinal(stats) if stats.stream_identifier == 1 => Some(stats),
+            _ => None,
+        })
+        .expect("receive-capacity closure preserves final stats");
+    assert_eq!(
+        (final_stats.messages_received, final_stats.bytes_received),
+        (1, 3)
+    );
+    assert!(events.iter().any(|event| matches!(
         event,
         Event::AssociationLost {
             reason: AssociationError::ReceiveBufferExhausted
@@ -5040,5 +5053,216 @@ fn test_receive_capacity_detected_when_last_readable_stream_stops() -> Result<()
             reason: AssociationError::ReceiveBufferExhausted
         }
     )));
+    Ok(())
+}
+
+#[test]
+fn test_data_channel_stats_acceptance_and_delivery() -> Result<()> {
+    let mut a = create_association(TransportConfig::default());
+    a.set_state(AssociationState::Established);
+    let ppi = PayloadProtocolIdentifier::Binary;
+    let mut stream = a.create_stream(12, false, ppi).unwrap();
+    let initial = stream.stats()?;
+    assert_eq!(initial.messages_sent, 0);
+    assert_eq!(initial, stream.stats()?);
+    stream.write(b"abc")?;
+    stream.write_chunk(&Bytes::from_static(b"xy"))?;
+    stream.write_sctp(&Bytes::from_static(b"z"), ppi)?;
+    stream.write_with_ppi("é".as_bytes(), PayloadProtocolIdentifier::String)?;
+    stream.write_with_ppi(&[0], PayloadProtocolIdentifier::BinaryEmpty)?;
+    stream.write_with_ppi(&[0], PayloadProtocolIdentifier::StringEmpty)?;
+    stream.write_with_ppi(b"control", PayloadProtocolIdentifier::Dcep)?;
+    stream.write_with_ppi(b"unknown", PayloadProtocolIdentifier::Unknown)?;
+    stream.write(b"")?;
+    let mut buffers = [
+        Bytes::new(),
+        Bytes::from_static(b"first"),
+        Bytes::from_static(b"second"),
+    ];
+    assert_eq!(stream.write_chunks(&mut buffers)?, 5);
+    assert_eq!(buffers[2], b"second"[..]);
+    let stats = stream.stats()?;
+    assert_eq!((stats.messages_sent, stats.bytes_sent), (7, 13));
+    assert!(stream.write(&vec![0; 1_000_000]).is_err());
+    assert_eq!(stats, stream.stats()?);
+
+    // Fragmentation, reordering and duplicates are accounted only at handoff.
+    let data = Bytes::from(vec![42; 3000]);
+    stream.write_sctp(&data, ppi)?;
+    let before_read = stream.stats()?;
+    let receiver = a.streams.get_mut(&12).unwrap();
+    let mut fragments = vec![];
+    for (i, part) in data.chunks(1000).enumerate() {
+        fragments.push(ChunkPayloadData {
+            tsn: i as u32 + 1,
+            stream_identifier: 12,
+            stream_sequence_number: 0,
+            beginning_fragment: i == 0,
+            ending_fragment: i == 2,
+            payload_type: ppi,
+            user_data: Bytes::copy_from_slice(part),
+            ..Default::default()
+        });
+    }
+    receiver.handle_data(&fragments[2])?;
+    receiver.handle_data(&fragments[0])?;
+    receiver.handle_data(&fragments[0])?;
+    assert!(a.stream(12).unwrap().read()?.is_none());
+    a.streams.get_mut(&12).unwrap().handle_data(&fragments[1])?;
+    let mut stream = a.stream(12).unwrap();
+    let mut message = stream.read()?.unwrap();
+    assert_eq!(message.next(1).unwrap().bytes.len(), 1);
+    let mut output = vec![0; 3000];
+    message.clone().read(&mut output)?;
+    message.read(&mut output)?;
+    assert!(stream.read()?.is_none());
+    let stats = stream.stats()?;
+    assert_eq!((stats.messages_received, stats.bytes_received), (1, 3000));
+    assert_eq!(stats.messages_sent, before_read.messages_sent);
+    stream.finish()?;
+    assert!(stream.write(b"rejected").is_err());
+    assert_eq!(stats, stream.stats()?);
+    Ok(())
+}
+
+#[test]
+fn test_data_channel_stats_retirement_reuse_and_loss() -> Result<()> {
+    let mut a = create_association(TransportConfig::default());
+    a.set_state(AssociationState::Established);
+    let initial = a
+        .create_stream(4, false, PayloadProtocolIdentifier::Binary)
+        .unwrap()
+        .stats()?;
+    a.streams
+        .get_mut(&4)
+        .unwrap()
+        .handle_data(&ChunkPayloadData {
+            tsn: 1,
+            stream_identifier: 4,
+            beginning_fragment: true,
+            ending_fragment: true,
+            payload_type: PayloadProtocolIdentifier::StringEmpty,
+            user_data: Bytes::from_static(&[0]),
+            ..Default::default()
+        })?;
+    a.retire_stream(4, 1);
+    assert!(a.stream(4).unwrap().read()?.is_some());
+    let mut finals = vec![];
+    while let Some(event) = a.poll() {
+        if let Event::DataChannelStatsFinal(stats) = event {
+            finals.push(stats);
+        }
+    }
+    assert_eq!(finals.len(), 1);
+    assert_eq!(finals[0].generation, initial.generation);
+    assert_eq!(
+        (finals[0].messages_received, finals[0].bytes_received),
+        (1, 0)
+    );
+    let fresh = a
+        .create_stream(4, false, PayloadProtocolIdentifier::Binary)
+        .unwrap()
+        .stats()?;
+    assert_ne!(fresh.generation, initial.generation);
+    assert_eq!(fresh.messages_received, 0);
+    a.close()?;
+    a.close()?;
+    while let Some(event) = a.poll() {
+        if let Event::DataChannelStatsFinal(stats) = event {
+            finals.push(stats);
+        }
+    }
+    assert_eq!(finals.len(), 2);
+    assert_eq!(finals[1], fresh);
+    Ok(())
+}
+
+#[test]
+fn test_data_channel_stats_receive_projection_and_isolation() -> Result<()> {
+    let mut a = create_association(TransportConfig::default());
+    a.set_state(AssociationState::Established);
+    a.create_stream(1, false, PayloadProtocolIdentifier::Binary)
+        .unwrap();
+    let untouched = a
+        .create_stream(2, false, PayloadProtocolIdentifier::Binary)
+        .unwrap()
+        .stats()?;
+    let mut other = create_association(TransportConfig::default());
+    let separate = other
+        .create_stream(1, false, PayloadProtocolIdentifier::Binary)
+        .unwrap()
+        .stats()?;
+    let payloads = [
+        (PayloadProtocolIdentifier::Binary, &b"abc"[..]),
+        (PayloadProtocolIdentifier::String, "é".as_bytes()),
+        (PayloadProtocolIdentifier::StringEmpty, &b"\0"[..]),
+        (PayloadProtocolIdentifier::BinaryEmpty, &b"\0"[..]),
+        (PayloadProtocolIdentifier::Dcep, &b"control"[..]),
+        (PayloadProtocolIdentifier::Unknown, &b"unknown"[..]),
+    ];
+    for (i, (ppi, data)) in payloads.into_iter().enumerate() {
+        a.streams
+            .get_mut(&1)
+            .unwrap()
+            .handle_data(&ChunkPayloadData {
+                tsn: i as u32 + 1,
+                stream_sequence_number: i as u16,
+                stream_identifier: 1,
+                beginning_fragment: true,
+                ending_fragment: true,
+                payload_type: ppi,
+                user_data: Bytes::copy_from_slice(data),
+                ..Default::default()
+            })?;
+        a.stream(1)?.read()?.unwrap();
+    }
+    let stats = a.stream(1)?.stats()?;
+    assert_eq!((stats.messages_received, stats.bytes_received), (4, 5));
+    assert_eq!(a.stream(2)?.stats()?, untouched);
+    assert_eq!(other.stream(1)?.stats()?, separate);
+    // A closed receive half rejects reads without changing cumulative totals.
+    a.stream(1)?.stop()?;
+    assert!(a.stream(1)?.read().is_err());
+    assert_eq!(a.stream(1)?.stats()?, stats);
+    Ok(())
+}
+
+#[test]
+fn test_data_channel_stats_failed_queue_and_abandoned_receive() -> Result<()> {
+    let mut a = create_association(TransportConfig::default());
+    let before = a
+        .create_stream(1, false, PayloadProtocolIdentifier::Binary)
+        .unwrap()
+        .stats()?;
+    // Queueing rejects a write before the association is established.
+    assert!(a.stream(1)?.write(b"not accepted").is_err());
+    assert_eq!(a.stream(1)?.stats()?, before);
+    a.set_state(AssociationState::Established);
+    a.streams
+        .get_mut(&1)
+        .unwrap()
+        .handle_data(&ChunkPayloadData {
+            tsn: 1,
+            stream_identifier: 1,
+            beginning_fragment: true,
+            ending_fragment: false,
+            payload_type: PayloadProtocolIdentifier::Binary,
+            user_data: Bytes::from_static(b"incomplete"),
+            ..Default::default()
+        })?;
+    assert!(a.stream(1)?.read()?.is_none());
+    a.streams
+        .get_mut(&1)
+        .unwrap()
+        .reassembly_queue
+        .forward_tsn_for_ordered(0);
+    assert!(a.stream(1)?.read()?.is_none());
+    assert_eq!(a.stream(1)?.stats()?, before);
+    a.next_stream_generation = u64::MAX;
+    assert!(
+        a.create_stream(2, false, PayloadProtocolIdentifier::Binary)
+            .is_none()
+    );
+    assert_eq!(a.stream(1)?.stats()?, before);
     Ok(())
 }

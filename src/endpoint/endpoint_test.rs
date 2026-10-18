@@ -868,6 +868,14 @@ fn test_assoc_reliable_retransmission() -> Result<()> {
         assert!(!q.is_readable(), "should no longer be readable");
     }
 
+    let sent = pair.client_stream(client_ch, si)?.stats()?;
+    let received = pair.server_stream(server_ch, si)?.stats()?;
+    assert_eq!((sent.messages_sent, sent.bytes_sent), (2, 7));
+    assert_eq!(
+        (received.messages_received, received.bytes_received),
+        (2, 7)
+    );
+
     close_association_pair(&mut pair, client_ch, server_ch, si);
 
     Ok(())

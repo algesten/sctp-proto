@@ -4708,3 +4708,209 @@ fn test_out_of_band_init_uses_configured_sctp_ports() {
     assert_eq!(6001, a.source_port);
     assert_eq!(6002, a.destination_port);
 }
+
+fn receive_capacity_fragment(tsn: u32, first: bool, last: bool) -> ChunkPayloadData {
+    ChunkPayloadData {
+        tsn,
+        stream_identifier: 1,
+        beginning_fragment: first,
+        ending_fragment: last,
+        user_data: Bytes::from(vec![0; 1024]),
+        ..Default::default()
+    }
+}
+
+fn receive_capacity_datagram(a: &mut Association, chunk: ChunkPayloadData) -> Result<()> {
+    let packet = a.create_packet(vec![Box::new(chunk)]).marshal()?;
+    a.handle_event(AssociationEvent(AssociationEventInner::Datagram(
+        Transmit {
+            now: Instant::now(),
+            remote: a.remote_addr(),
+            ecn: None,
+            local_ip: None,
+            payload: Payload::PartialDecode(crate::packet::PartialDecode::unmarshal(&packet)?),
+        },
+    )));
+    Ok(())
+}
+
+#[test]
+fn test_receive_capacity_reports_undrainable_message() -> Result<()> {
+    for unordered in [false, true] {
+        for initial_tsn in [0u32, u32::MAX - 16] {
+            let mut a = create_association(
+                TransportConfig::default().with_max_receive_buffer_size(32 * 1024),
+            );
+            a.set_state(AssociationState::Established);
+            a.peer_last_tsn = initial_tsn;
+            for index in 1..=32 {
+                let mut fragment =
+                    receive_capacity_fragment(initial_tsn.wrapping_add(index), index == 1, false);
+                fragment.unordered = unordered;
+                receive_capacity_datagram(&mut a, fragment)?;
+                if index < 32 {
+                    assert!(!a.is_closed());
+                    assert_eq!(a.get_my_receiver_window_credit(), (32 - index) * 1024);
+                    assert!(a.stream(1)?.read()?.is_none());
+                }
+            }
+            assert!(a.is_closed());
+            assert!(core::iter::from_fn(|| a.poll()).any(|event| matches!(
+                event,
+                Event::AssociationLost {
+                    reason: AssociationError::ReceiveBufferExhausted
+                }
+            )));
+            let packets = a.gather_outbound(Instant::now()).0;
+            assert_eq!(packets.len(), 1);
+            let packet = crate::packet::PartialDecode::unmarshal(&packets[0])?.finish()?;
+            let abort = packet.chunks[0]
+                .as_any()
+                .downcast_ref::<ChunkAbort>()
+                .unwrap();
+            assert_eq!(abort.error_causes[0].code, crate::chunk::OUT_OF_RESOURCE);
+            // Closing actually releases storage, rather than inventing credit.
+            assert_eq!(a.get_my_receiver_window_credit(), 32 * 1024);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_receive_capacity_zero_window_preserves_backpressure() -> Result<()> {
+    let mut a =
+        create_association(TransportConfig::default().with_max_receive_buffer_size(32 * 1024));
+    a.set_state(AssociationState::Established);
+    a.peer_last_tsn = 0;
+    for tsn in 1..=32 {
+        a.handle_data(&receive_capacity_fragment(tsn, tsn == 1, tsn == 32))?;
+    }
+    assert_eq!(a.get_my_receiver_window_credit(), 0);
+    a.ack_state = AckState::Immediate;
+    let packets = a.gather_outbound_sack_packets(vec![]);
+    let packet = crate::packet::PartialDecode::unmarshal(&packets[0])?.finish()?;
+    let sack = packet.chunks[0]
+        .as_any()
+        .downcast_ref::<ChunkSelectiveAck>()
+        .unwrap();
+    assert_eq!(sack.advertised_receiver_window_credit, 0);
+    assert_eq!(sack.cumulative_tsn_ack, 32);
+    let mut next = receive_capacity_fragment(33, true, true);
+    next.stream_identifier = 2;
+    for _ in 0..3 {
+        a.handle_data(&next)?;
+        assert_eq!(a.peer_last_tsn, 32);
+        assert_eq!(a.get_my_receiver_window_credit(), 0);
+        assert!(!a.is_closed());
+    }
+    assert!(a.stream(1)?.read()?.is_some());
+    assert_eq!(a.get_my_receiver_window_credit(), 32 * 1024);
+    a.handle_data(&next)?;
+    assert!(a.stream(2)?.read()?.is_some());
+    assert_eq!(a.get_my_receiver_window_credit(), 32 * 1024);
+    Ok(())
+}
+
+#[test]
+fn test_receive_capacity_gap_fill_and_duplicates() -> Result<()> {
+    let mut a =
+        create_association(TransportConfig::default().with_max_receive_buffer_size(32 * 1024));
+    a.peer_last_tsn = u32::MAX - 16;
+    let initial_tsn = a.peer_last_tsn;
+    // Lose the beginning fragment and reorder the ending fragment. Accepted
+    // duplicates do not consume extra storage or turn gap recovery into failure.
+    for index in (2..=33).rev() {
+        let chunk = receive_capacity_fragment(initial_tsn.wrapping_add(index), false, index == 33);
+        a.handle_data(&chunk)?;
+        let credit = a.get_my_receiver_window_credit();
+        a.handle_data(&chunk)?;
+        assert_eq!(a.get_my_receiver_window_credit(), credit);
+    }
+    assert_eq!(a.get_my_receiver_window_credit(), 0);
+    a.handle_data(&receive_capacity_fragment(
+        initial_tsn.wrapping_add(1),
+        true,
+        false,
+    ))?;
+    assert_eq!(a.peer_last_tsn, initial_tsn.wrapping_add(33));
+    assert_eq!(a.get_my_receiver_window_credit(), 0);
+    assert!(a.stream(1)?.read()?.is_some());
+    assert_eq!(a.get_my_receiver_window_credit(), 32 * 1024);
+    Ok(())
+}
+
+#[test]
+fn test_receive_capacity_shared_by_incomplete_streams() -> Result<()> {
+    let mut a =
+        create_association(TransportConfig::default().with_max_receive_buffer_size(32 * 1024));
+    a.set_state(AssociationState::Established);
+    a.peer_last_tsn = 0;
+    for tsn in 1..=32 {
+        let mut chunk = receive_capacity_fragment(tsn, tsn <= 2, false);
+        chunk.stream_identifier = (tsn % 2) as u16;
+        chunk.unordered = true;
+        receive_capacity_datagram(&mut a, chunk)?;
+    }
+    assert!(a.is_closed());
+    assert!(core::iter::from_fn(|| a.poll()).any(|event| matches!(
+        event,
+        Event::AssociationLost {
+            reason: AssociationError::ReceiveBufferExhausted
+        }
+    )));
+    Ok(())
+}
+
+#[test]
+fn test_receive_capacity_counts_retiring_and_deferred_data() -> Result<()> {
+    let mut a = association_with_retiring_boundary_data()?;
+    a.max_receive_buffer_size = 32 * 1024;
+    a.max_receive_message_size = 64 * 1024;
+    let mut successor = receive_capacity_fragment(2, true, false);
+    successor.user_data = Bytes::from(vec![0; 32 * 1024 - 3]);
+    a.handle_data(&successor)?;
+    assert_eq!(a.get_my_receiver_window_credit(), 0);
+    assert!(!a.deferred_reset_data.is_empty());
+    assert!(!a.is_closed());
+    // Reading the retiring generation releases only its three bytes. Moving
+    // the successor out of deferred storage must not create additional credit.
+    assert!(a.stream(1)?.read()?.is_some());
+    assert_eq!(a.get_my_receiver_window_credit(), 3);
+    assert!(a.deferred_reset_data.is_empty());
+    assert!(a.stream(1)?.read()?.is_none());
+    let mut tail = receive_capacity_fragment(3, false, false);
+    tail.user_data = Bytes::from_static(b"new");
+    assert_eq!(
+        a.handle_data(&tail).unwrap_err(),
+        Error::ErrReceiveBufferExhausted
+    );
+    assert_eq!(a.get_my_receiver_window_credit(), 0);
+    Ok(())
+}
+
+#[test]
+fn test_receive_capacity_detected_after_reading_last_complete_message() -> Result<()> {
+    let mut a =
+        create_association(TransportConfig::default().with_max_receive_buffer_size(32 * 1024));
+    a.set_state(AssociationState::Established);
+    a.peer_last_tsn = 0;
+    let mut complete = receive_capacity_fragment(1, true, true);
+    complete.user_data = Bytes::from_static(b"old");
+    a.handle_data(&complete)?;
+    for tsn in 2..=33 {
+        let mut partial = receive_capacity_fragment(tsn, tsn == 2, false);
+        partial.stream_identifier = 2;
+        a.handle_data(&partial)?;
+    }
+    assert_eq!(a.get_my_receiver_window_credit(), 0);
+    assert!(!a.is_closed());
+    assert!(a.stream(1)?.read()?.is_some());
+    assert!(a.is_closed());
+    assert!(core::iter::from_fn(|| a.poll()).any(|event| matches!(
+        event,
+        Event::AssociationLost {
+            reason: AssociationError::ReceiveBufferExhausted
+        }
+    )));
+    Ok(())
+}

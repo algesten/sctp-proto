@@ -168,6 +168,12 @@ impl<'a> Stream<'a> {
                 .finish_retiring_stream(self.stream_identifier)?;
         }
 
+        // A DATA chunk may exceed the last few bytes of receive credit. Reading
+        // the final complete message can therefore leave a full partial message.
+        if message.is_some() && self.association.receive_capacity_exhausted() {
+            self.association.abort_receive_capacity();
+        }
+
         Ok(message)
     }
 

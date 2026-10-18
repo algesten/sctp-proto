@@ -161,6 +161,8 @@ pub enum Error {
     ErrUnexpectedChuckPoppedOrdered,
     #[error("unexpected q state (should've been selected)")]
     ErrUnexpectedQState,
+    #[error("receive buffer exhausted during message reassembly")]
+    ErrReceiveBufferExhausted,
     #[error("try again")]
     ErrTryAgain,
 

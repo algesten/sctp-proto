@@ -67,6 +67,9 @@ mod timer;
 #[cfg(test)]
 mod association_test;
 
+#[cfg(test)]
+mod timed_reliability_test;
+
 /// Reasons why an association might be lost
 #[non_exhaustive]
 #[derive(Debug, Error, Clone, PartialEq)]
@@ -3715,6 +3718,7 @@ impl Association {
         mut raw_packets: Vec<Bytes>,
         now: Instant,
     ) -> Vec<Bytes> {
+        self.expire_inflight_messages(now);
         if self.will_retransmit_fast {
             self.will_retransmit_fast = false;
 
@@ -3917,6 +3921,7 @@ impl Association {
     /// out and retransmit outstanding data chunks that are not acked
     /// or abandoned yet.
     fn get_data_packets_to_retransmit(&mut self, now: Instant) -> Vec<Packet> {
+        self.expire_inflight_messages(now);
         let awnd = core::cmp::min(self.cwnd, self.rwnd);
         let mut chunks: Vec<ChunkPayloadData> = vec![];
         let mut bytes_to_send = 0;
@@ -3978,6 +3983,7 @@ impl Association {
     /// pop_pending_data_chunks_to_send pops chunks from the pending queues as many as
     /// the cwnd and rwnd allows to send.
     fn pop_pending_data_chunks_to_send(&mut self, now: Instant) -> Vec<ChunkPayloadData> {
+        self.expire_inflight_messages(now);
         let mut chunks = vec![];
         if self.outbound_queue.pending_len() != 0 {
             // RFC 4960 sec 6.1.  Transmission of DATA Chunks
@@ -4074,8 +4080,18 @@ impl Association {
         rsn
     }
 
-    /// Called only when a chunk is eligible for retransmission. Abandoning its
-    /// message also drops the unsent tail, so no fragment can outlive the policy.
+    /// Timed messages expire at their deadline, before any DATA is selected.
+    /// In particular, a blocked early chunk must not hide later expired DATA.
+    fn expire_inflight_messages(&mut self, now: Instant) {
+        if self.use_forward_tsn {
+            for tsn in self.outbound_queue.expired_inflight(now) {
+                self.abandon_if_needed(tsn, now);
+            }
+        }
+    }
+
+    /// Evaluate retry candidates or messages whose submission deadline expired.
+    /// Abandoning a message also drops its unsent tail.
     fn abandon_if_needed(&mut self, tsn: u32, now: Instant) -> bool {
         let Some(c) = self.outbound_queue.get(tsn) else {
             return false;

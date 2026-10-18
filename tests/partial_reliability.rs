@@ -538,3 +538,98 @@ fn unordered_abandonment_preserves_next_ordered_message() {
     }
     assert!(forwarded);
 }
+
+#[test]
+fn fragmented_timed_messages_expire_through_loss_and_reordering() {
+    use std::collections::{HashMap, VecDeque};
+    for unordered in [false, true] {
+        for size in [3000, 24000] {
+            let (mut a, mut b) = pairs(ReliabilityType::Rexmit);
+            a.assoc
+                .stream(0)
+                .unwrap()
+                .set_reliability_params(unordered, ReliabilityType::Timed, 10)
+                .unwrap();
+            let base = Instant::now();
+            a.assoc
+                .stream(0)
+                .unwrap()
+                .write_at(base, &vec![7; size])
+                .unwrap();
+            a.assoc
+                .stream(0)
+                .unwrap()
+                .set_reliability_params(unordered, ReliabilityType::Reliable, 0)
+                .unwrap();
+            a.assoc
+                .stream(0)
+                .unwrap()
+                .write(b"following message")
+                .unwrap();
+            let mut ab = VecDeque::<(u64, Bytes)>::new();
+            let mut ba = VecDeque::<(u64, Bytes)>::new();
+            let mut transmissions = HashMap::<u32, usize>::new();
+            let mut dropped = false;
+            let mut dropped_forward = false;
+            let mut forwarded = false;
+            let mut messages = Vec::new();
+            for ms in 0..10000u64 {
+                let now = base + Duration::from_millis(ms);
+                a.assoc.handle_timeout(now);
+                b.assoc.handle_timeout(now);
+                while ab.front().is_some_and(|(due, _)| *due <= ms) {
+                    let (_, packet) = ab.pop_front().unwrap();
+                    b.receive(now, a.addr, packet);
+                }
+                for packet in b.drain(now) {
+                    ba.push_back((ms + 50, packet));
+                }
+                messages.extend(b.messages());
+                while ba.front().is_some_and(|(due, _)| *due <= ms) {
+                    let (_, packet) = ba.pop_front().unwrap();
+                    a.receive(now, b.addr, packet);
+                }
+                // Reverse each outbound batch to exercise reordered fragments.
+                for packet in a.drain(now).into_iter().rev() {
+                    let types = chunks(&packet);
+                    let mut offset = 12;
+                    while offset + 4 <= packet.len() {
+                        let length =
+                            u16::from_be_bytes([packet[offset + 2], packet[offset + 3]]) as usize;
+                        if packet[offset] == 0 && length > 16 && packet[offset + 16] == 7 {
+                            let tsn = u32::from_be_bytes(
+                                packet[offset + 4..offset + 8].try_into().unwrap(),
+                            );
+                            *transmissions.entry(tsn).or_default() += 1;
+                            assert!(ms < 10, "expired timed DATA reached the wire at {ms}ms");
+                        }
+                        offset += (length + 3) & !3;
+                    }
+                    forwarded |= types.iter().any(|(ty, _)| *ty == 192);
+                    if !dropped && types.iter().any(|(ty, _)| *ty == 0) {
+                        dropped = true;
+                    } else if !dropped_forward && types.iter().any(|(ty, _)| *ty == 192) {
+                        dropped_forward = true;
+                    } else {
+                        ab.push_back((ms + 50, packet));
+                    }
+                }
+            }
+            assert!(forwarded && dropped_forward);
+            assert!(
+                transmissions.values().all(|n| *n == 1),
+                "timed message retransmitted after expiry: size={size}, unordered={unordered}"
+            );
+            assert_eq!(
+                messages,
+                vec![b"following message".to_vec()],
+                "size={size}, unordered={unordered}"
+            );
+            assert_eq!(
+                a.assoc.stream(0).unwrap().buffered_amount().unwrap(),
+                0,
+                "abandonment must release both pending and acknowledged prefix bytes"
+            );
+        }
+    }
+}

@@ -129,6 +129,24 @@ impl OutboundQueue {
         Some((stream, bytes + inflight_bytes))
     }
 
+    /// Expired messages with outstanding DATA or an unsent tail. Fully delivered
+    /// messages are excluded. Collect before abandonment mutates the queues so
+    /// expiry is independent of send limits.
+    pub(crate) fn expired_inflight(&self, now: Instant) -> Vec<u32> {
+        self.inflight
+            .sorted
+            .iter()
+            .copied()
+            .filter(|tsn| {
+                self.inflight.get(*tsn).is_some_and(|c| {
+                    !c.abandoned
+                        && c.deadline.is_some_and(|deadline| now >= deadline)
+                        && (!c.acked || self.pending.contains_message(c.message_id))
+                })
+            })
+            .collect()
+    }
+
     pub(crate) fn mark_all_to_retransmit(&mut self) {
         self.inflight.mark_all_to_retransmit();
     }

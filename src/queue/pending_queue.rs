@@ -148,6 +148,13 @@ impl PendingQueue {
         self.len() == 0
     }
 
+    pub(crate) fn contains_message(&self, message_id: u64) -> bool {
+        self.unordered_queue
+            .iter()
+            .chain(self.ordered_queue.iter())
+            .any(|chunk| chunk.message_id == message_id)
+    }
+
     pub(crate) fn contains_stream(&self, stream_identifier: u16) -> bool {
         self.unordered_queue
             .iter()

@@ -108,6 +108,33 @@ impl OutboundQueue {
         if chunk.abandoned {
             return Some((stream, 0));
         }
+        self.abandon_message(message_id, stream, next_tsn)
+    }
+
+    /// A cumulatively acknowledged prefix may no longer have an inflight anchor.
+    pub(crate) fn expire_pending_tail(
+        &mut self,
+        now: Instant,
+        next_tsn: &mut u32,
+    ) -> Option<(u16, u64, usize)> {
+        let chunk = self.pending.peek()?;
+        if chunk.beginning_fragment
+            || chunk.payload_type == crate::PayloadProtocolIdentifier::Dcep
+            || !chunk.deadline.is_some_and(|deadline| now >= deadline)
+        {
+            return None;
+        }
+        let message_id = chunk.message_id;
+        self.abandon_message(message_id, chunk.stream_identifier, next_tsn)
+            .map(|(id, bytes)| (id, message_id, bytes))
+    }
+
+    fn abandon_message(
+        &mut self,
+        message_id: u64,
+        stream: u16,
+        next_tsn: &mut u32,
+    ) -> Option<(u16, usize)> {
         let inflight_bytes = self.inflight.abandon_message(message_id);
         let mut terminal = None;
         let bytes = self.pending.remove_message(message_id, |mut chunk| {
@@ -127,6 +154,24 @@ impl OutboundQueue {
             self.inflight.push_no_check(chunk);
         }
         Some((stream, bytes + inflight_bytes))
+    }
+
+    /// Expired messages with outstanding DATA or an unsent tail. Fully delivered
+    /// messages are excluded. Collect before abandonment mutates the queues so
+    /// expiry is independent of send limits.
+    pub(crate) fn expired_inflight(&self, now: Instant) -> Vec<u32> {
+        self.inflight
+            .sorted
+            .iter()
+            .copied()
+            .filter(|tsn| {
+                self.inflight.get(*tsn).is_some_and(|c| {
+                    !c.abandoned
+                        && c.deadline.is_some_and(|deadline| now >= deadline)
+                        && (!c.acked || self.pending.contains_message(c.message_id))
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn mark_all_to_retransmit(&mut self) {

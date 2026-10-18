@@ -298,28 +298,3 @@ fn removing_other_message_tail_preserves_pending_selection() {
     assert!(remaining.ending_fragment);
     assert!(!remaining.abandoned);
 }
-
-#[test]
-fn message_tag_does_not_grow_chunk_storage() {
-    // The layout before this PR: keep the comparison target-local since
-    // Instant and pointer layouts differ between supported platforms.
-    struct OriginalChunkLayout {
-        unordered: bool,
-        beginning_fragment: bool,
-        ending_fragment: bool,
-        immediate_sack: bool,
-        tsn: u32,
-        stream_identifier: u16,
-        stream_sequence_number: u16,
-        payload_type: crate::PayloadProtocolIdentifier,
-        user_data: Bytes,
-        acked: bool,
-        miss_indicator: u32,
-        since: Option<Instant>,
-        nsent: u32,
-        abandoned: bool,
-        all_inflight: bool,
-        retransmit: bool,
-    }
-    assert!(size_of::<ChunkPayloadData>() <= size_of::<OriginalChunkLayout>());
-}

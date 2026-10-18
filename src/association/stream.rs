@@ -10,8 +10,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 use bytes::Bytes;
 use core::fmt;
+use core::time::Duration;
 use log::{debug, error, trace};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// Identifier for a stream within a particular association
 pub type StreamId = u16;

@@ -91,6 +91,16 @@ impl Default for TransportConfig {
 }
 
 impl TransportConfig {
+    /// Set the receive storage budget across all streams, including reset-deferred DATA.
+    ///
+    /// Reads deliver complete messages only. If this budget is exhausted with no
+    /// readable message and no TSN gaps that can still be filled, the association
+    /// fails with [`crate::AssociationError::ReceiveBufferExhausted`] and sends an
+    /// Out Of Resource ABORT. No partial message is delivered. This can happen
+    /// when a message exceeds the budget or multiple incomplete messages share it.
+    /// Messages retained on stopped read halves also consume this budget until reset.
+    /// Complete messages on readable streams apply ordinary receive-window backpressure.
+    /// The maximum receive-message size remains an independent limit.
     pub fn with_max_receive_buffer_size(mut self, value: u32) -> Self {
         self.max_receive_buffer_size = value;
         self

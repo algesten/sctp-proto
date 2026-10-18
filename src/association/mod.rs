@@ -76,6 +76,9 @@ pub enum AssociationError {
     /// The peer violated the SCTP specification as understood by this implementation
     #[error("transport error")]
     TransportError,
+    /// Receive storage filled with messages that the whole-message API cannot drain.
+    #[error("receive buffer exhausted during message reassembly")]
+    ReceiveBufferExhausted,
     /// The peer's SCTP stack aborted the association
     #[error("aborted by peer")]
     AssociationClosed,
@@ -812,13 +815,45 @@ impl Association {
 
                     if let Err(err) = self.handle_inbound(pkt, transmit.now) {
                         error!("handle_inbound got err: {}", err);
-                        let _ = self.close();
+                        if err == Error::ErrReceiveBufferExhausted {
+                            self.abort_receive_capacity();
+                        } else {
+                            let _ = self.close();
+                        }
                     }
                 } else {
                     trace!("discarding invalid partial_decode");
                 }
             } //TODO:
         }
+    }
+
+    fn receive_capacity_exhausted(&self) -> bool {
+        self.get_my_receiver_window_credit() == 0
+            && (!self.deferred_reset_data.is_empty()
+                || self
+                    .streams
+                    .values()
+                    .any(|s| s.get_num_bytes_in_reassembly_queue() > 0))
+            && self.payload_queue.is_empty()
+            && !self.streams.values().any(|s| {
+                matches!(
+                    s.state,
+                    RecvSendState::Readable | RecvSendState::ReadWritable
+                ) && s.reassembly_queue.is_readable()
+            })
+    }
+
+    fn abort_receive_capacity(&mut self) {
+        let _ = self.close_with_reason(AssociationError::ReceiveBufferExhausted);
+        let abort = ChunkAbort {
+            error_causes: vec![crate::chunk::ErrorCause {
+                code: crate::chunk::OUT_OF_RESOURCE,
+                raw: Bytes::new(),
+            }],
+        };
+        self.control_queue
+            .push_back(self.create_packet(vec![Box::new(abort)]));
     }
 
     /// Returns Association statistics
@@ -922,6 +957,10 @@ impl Association {
 
     /// Close ends the SCTP Association and cleans up any state
     pub fn close(&mut self) -> Result<()> {
+        self.close_with_reason(AssociationError::AssociationClosed)
+    }
+
+    fn close_with_reason(&mut self, reason: AssociationError) -> Result<()> {
         if self.state() != AssociationState::Closed {
             self.set_state(AssociationState::Closed);
 
@@ -949,9 +988,7 @@ impl Association {
             self.active_reconfig = None;
             self.will_retransmit_reconfig = false;
 
-            self.events.push_back(Event::AssociationLost {
-                reason: AssociationError::AssociationClosed,
-            });
+            self.events.push_back(Event::AssociationLost { reason });
 
             debug!("[{}] association closed", self.side);
             debug!(
@@ -2807,6 +2844,14 @@ impl Association {
         let stream_ids: Vec<StreamId> = self.deferred_forward_tsns.keys().copied().collect();
         for stream_identifier in stream_ids {
             self.apply_deferred_forward_tsns(stream_identifier);
+        }
+
+        // DATA and FORWARD-TSN can both close the final gap. Once every
+        // accepted TSN is cumulative, only new highest-TSN DATA could complete
+        // an unreadable message; RFC 9260 section 6.2 forbids admitting it at
+        // zero credit. Fail explicitly rather than pinning receive storage.
+        if self.receive_capacity_exhausted() {
+            return Err(Error::ErrReceiveBufferExhausted);
         }
 
         let has_packet_loss = !self.payload_queue.is_empty();

@@ -168,6 +168,12 @@ impl<'a> Stream<'a> {
                 .finish_retiring_stream(self.stream_identifier)?;
         }
 
+        // A DATA chunk may exceed the last few bytes of receive credit. Reading
+        // the final complete message can therefore leave a full partial message.
+        if message.is_some() && self.association.receive_capacity_exhausted() {
+            self.association.abort_receive_capacity();
+        }
+
         Ok(message)
     }
 
@@ -287,6 +293,8 @@ impl<'a> Stream<'a> {
 
     /// stop closes the read-direction of the stream.
     /// Future calls to read are not permitted after calling stop.
+    /// If stopping removes the last way to drain an exhausted receive buffer,
+    /// the association reports [`super::AssociationError::ReceiveBufferExhausted`].
     ///    
     /// NOTE: a stream closed without a queued reset never produces
     /// `StreamEvent::Finished` followed by `StreamEvent::ResetComplete` or
@@ -331,6 +339,10 @@ impl<'a> Stream<'a> {
         if retiring {
             self.association
                 .discard_retiring_streams(self.stream_identifier);
+        }
+
+        if self.association.receive_capacity_exhausted() {
+            self.association.abort_receive_capacity();
         }
 
         Ok(())

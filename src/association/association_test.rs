@@ -5426,3 +5426,59 @@ fn test_fast_retry_counts_toward_timer_retransmission_limit() {
         }
     }
 }
+
+#[test]
+fn abandoned_retry_message_releases_credit_without_ack_credit() {
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(0);
+    a.send_next_data_chunk(now).unwrap();
+    a.send_next_data_chunk(now).unwrap();
+    assert_eq!(a.stream(1).unwrap().buffered_amount().unwrap(), 10);
+    a.outbound_queue.mark_all_to_retransmit();
+    assert!(a.get_data_packets_to_retransmit(now).is_empty());
+    assert_eq!(a.outbound_queue.inflight_bytes(), 0);
+    assert_eq!(a.stream(1).unwrap().buffered_amount().unwrap(), 0);
+    assert_eq!(
+        a.events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                Event::Stream(StreamEvent::BufferedAmountLow { id: 1 })
+            ))
+            .count(),
+        1
+    );
+    let rto = a.rto_mgr.get_rto();
+    let (credit, _) = a
+        .process_selective_ack(
+            &ChunkSelectiveAck {
+                cumulative_tsn_ack: 3,
+                ..Default::default()
+            },
+            now + Duration::from_millis(200),
+        )
+        .unwrap();
+    assert!(credit.is_empty());
+    assert_eq!(a.rto_mgr.get_rto(), rto);
+    assert_eq!(a.outbound_queue.inflight_len(), 0);
+}
+
+#[test]
+fn retry_abandonment_does_not_credit_reused_stream() {
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(0);
+    a.send_next_data_chunk(now).unwrap();
+    // Model the old stream's removal while its retransmission metadata remains.
+    a.streams.remove(&1);
+    a.create_stream(1, false, PayloadProtocolIdentifier::Binary)
+        .unwrap();
+    a.stream(1).unwrap().write(b"new").unwrap();
+    a.outbound_queue.mark_all_to_retransmit();
+    assert!(a.get_data_packets_to_retransmit(now).is_empty());
+    assert_eq!(a.stream(1).unwrap().buffered_amount().unwrap(), 3);
+    assert_eq!(a.outbound_queue.pending_bytes(), 3);
+    assert!(a.events.iter().all(|event| !matches!(
+        event,
+        Event::Stream(StreamEvent::BufferedAmountLow { id: 1 })
+    )));
+}

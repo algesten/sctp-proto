@@ -3493,6 +3493,7 @@ impl Association {
                 raw_packets = self.gather_data_packets_to_retransmit(raw_packets, now);
                 raw_packets = self.gather_outbound_fast_retransmission_packets(raw_packets, now);
                 raw_packets = self.gather_outbound_sack_packets(raw_packets);
+                raw_packets = self.gather_outbound_forward_tsn_packets(raw_packets);
                 self.gather_outbound_shutdown_packets(raw_packets, now)
             }
             AssociationState::ShutdownAckSent => {
@@ -3756,6 +3757,10 @@ impl Association {
                 i += 1;
             }
 
+            to_fast_retrans.retain(|chunk| {
+                let data = chunk.as_any().downcast_ref::<ChunkPayloadData>().unwrap();
+                !self.outbound_queue.is_abandoned(data.tsn)
+            });
             if !to_fast_retrans.is_empty() {
                 if let Ok(raw) = self.create_packet(to_fast_retrans).marshal() {
                     raw_packets.push(raw);
@@ -4051,12 +4056,13 @@ impl Association {
         if c.payload_type == PayloadProtocolIdentifier::Dcep {
             return false;
         }
-        let Some(stream) = self.streams.get(&c.stream_identifier) else {
+        let Some((reliability_type, reliability_value)) = c.reliability.or_else(|| {
+            self.streams
+                .get(&c.stream_identifier)
+                .map(|stream| (stream.reliability_type, stream.reliability_value))
+        }) else {
             return false;
         };
-        let (reliability_type, reliability_value) = c
-            .reliability
-            .unwrap_or((stream.reliability_type, stream.reliability_value));
         let expired = match reliability_type {
             // nsent includes the original send; maxRTX counts only retries.
             ReliabilityType::Rexmit => c.nsent > reliability_value,

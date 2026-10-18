@@ -913,18 +913,24 @@ fn test_local_reset_does_not_overtake_pending_data() -> Result<()> {
         my_next_tsn: 1,
         ..Default::default()
     };
-    a.inflight_queue.push_no_check(ChunkPayloadData {
-        tsn: 1,
-        user_data: Bytes::from_static(b"inflight"),
-        ..Default::default()
-    });
-    a.pending_queue.push(ChunkPayloadData {
-        stream_identifier: 1,
-        beginning_fragment: true,
-        ending_fragment: true,
-        user_data: Bytes::from_static(b"pending"),
-        ..Default::default()
-    });
+    queue_inflight(
+        &mut a,
+        ChunkPayloadData {
+            tsn: 1,
+            user_data: Bytes::from_static(b"inflight"),
+            ..Default::default()
+        },
+    );
+    queue_pending(
+        &mut a,
+        ChunkPayloadData {
+            stream_identifier: 1,
+            beginning_fragment: true,
+            ending_fragment: true,
+            user_data: Bytes::from_static(b"pending"),
+            ..Default::default()
+        },
+    );
     a.send_reset_request(1)?;
 
     let _ = a.poll_transmit(Instant::now());
@@ -946,19 +952,25 @@ fn test_local_reset_is_not_blocked_by_unrelated_pending_data() -> Result<()> {
         mtu: 1400,
         ..Default::default()
     };
-    a.inflight_queue.push_no_check(ChunkPayloadData {
-        tsn: 1,
-        stream_identifier: unrelated_stream_id,
-        user_data: Bytes::from_static(b"inflight"),
-        ..Default::default()
-    });
-    a.pending_queue.push(ChunkPayloadData {
-        stream_identifier: unrelated_stream_id,
-        beginning_fragment: true,
-        ending_fragment: true,
-        user_data: Bytes::from_static(b"flow controlled"),
-        ..Default::default()
-    });
+    queue_inflight(
+        &mut a,
+        ChunkPayloadData {
+            tsn: 1,
+            stream_identifier: unrelated_stream_id,
+            user_data: Bytes::from_static(b"inflight"),
+            ..Default::default()
+        },
+    );
+    queue_pending(
+        &mut a,
+        ChunkPayloadData {
+            stream_identifier: unrelated_stream_id,
+            beginning_fragment: true,
+            ending_fragment: true,
+            user_data: Bytes::from_static(b"flow controlled"),
+            ..Default::default()
+        },
+    );
     a.send_reset_request(reset_stream_id)?;
 
     let _ = a.gather_outbound(Instant::now());
@@ -968,7 +980,7 @@ fn test_local_reset_is_not_blocked_by_unrelated_pending_data() -> Result<()> {
         "flow-controlled DATA on another stream must not starve this reset"
     );
     assert!(
-        !a.pending_queue.is_empty(),
+        a.outbound_queue.pending_len() != 0,
         "the test requires the unrelated DATA to remain flow controlled"
     );
     Ok(())
@@ -1074,14 +1086,17 @@ fn test_reciprocal_reset_covers_preexisting_pending_data() -> Result<()> {
         a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
             .is_some()
     );
-    a.pending_queue.push(ChunkPayloadData {
-        stream_identifier: stream_id,
-        stream_sequence_number: 4,
-        beginning_fragment: true,
-        ending_fragment: true,
-        user_data: Bytes::from_static(b"pending"),
-        ..Default::default()
-    });
+    queue_pending(
+        &mut a,
+        ChunkPayloadData {
+            stream_identifier: stream_id,
+            stream_sequence_number: 4,
+            beginning_fragment: true,
+            ending_fragment: true,
+            user_data: Bytes::from_static(b"pending"),
+            ..Default::default()
+        },
+    );
 
     // Receiving the peer's outgoing reset creates a reciprocal outgoing reset.
     // DATA accepted before that request must be assigned a TSN covered by the
@@ -1098,7 +1113,7 @@ fn test_reciprocal_reset_covers_preexisting_pending_data() -> Result<()> {
 
     let _ = a.gather_outbound(Instant::now());
 
-    let data_tsn = a.inflight_queue.get(1).unwrap().tsn;
+    let data_tsn = a.outbound_queue.get(1).unwrap().tsn;
     let reciprocal = a
         .reconfigs
         .get(&a.active_reconfig.unwrap())
@@ -3143,19 +3158,25 @@ fn test_blocked_reconfig_does_not_allow_later_rsn_to_overtake() {
         mtu: 1400,
         ..Default::default()
     };
-    a.pending_queue.push(ChunkPayloadData {
-        stream_identifier: 1,
-        beginning_fragment: true,
-        ending_fragment: true,
-        user_data: Bytes::from_static(b"pending"),
-        ..Default::default()
-    });
-    a.inflight_queue.push_no_check(ChunkPayloadData {
-        tsn: 0,
-        stream_identifier: 2,
-        user_data: Bytes::from_static(b"inflight"),
-        ..Default::default()
-    });
+    queue_inflight(
+        &mut a,
+        ChunkPayloadData {
+            tsn: 0,
+            stream_identifier: 2,
+            user_data: Bytes::from_static(b"inflight"),
+            ..Default::default()
+        },
+    );
+    queue_pending(
+        &mut a,
+        ChunkPayloadData {
+            stream_identifier: 1,
+            beginning_fragment: true,
+            ending_fragment: true,
+            user_data: Bytes::from_static(b"pending"),
+            ..Default::default()
+        },
+    );
     insert_queued_reset(&mut a, 7, 1);
     insert_queued_reset(&mut a, 8, 2);
 
@@ -3207,19 +3228,23 @@ fn association_with_inflight_data(cumulative_tsn_ack_point: u32, now: Instant) -
     };
 
     for stream_sequence_number in 0..3 {
-        a.inflight_queue.push_no_check(ChunkPayloadData {
-            tsn: cumulative_tsn_ack_point.wrapping_add(u32::from(stream_sequence_number) + 1),
-            stream_identifier: 1,
-            stream_sequence_number,
-            beginning_fragment: true,
-            ending_fragment: true,
-            payload_type: PayloadProtocolIdentifier::Binary,
-            user_data: Bytes::from_static(b"payload"),
-            nsent: 1,
-            since: Some(now),
-            all_inflight: true,
-            ..Default::default()
-        });
+        queue_inflight(
+            &mut a,
+            ChunkPayloadData {
+                tsn: cumulative_tsn_ack_point.wrapping_add(u32::from(stream_sequence_number) + 1),
+                stream_identifier: 1,
+                stream_sequence_number,
+                beginning_fragment: true,
+                ending_fragment: true,
+                payload_type: PayloadProtocolIdentifier::Binary,
+                user_data: Bytes::from_static(b"payload"),
+                nsent: 1,
+                since: Some(now),
+                ..Default::default()
+            },
+        );
+        let tsn = cumulative_tsn_ack_point.wrapping_add(u32::from(stream_sequence_number) + 1);
+        a.outbound_queue.get_mut(tsn).unwrap().since = Some(now);
     }
 
     a
@@ -3240,7 +3265,7 @@ fn test_data_retransmission_wraps_tsn() -> Result<()> {
     for cumulative_tsn in [10, u32::MAX - 1, u32::MAX] {
         let mut a = association_with_inflight_data(cumulative_tsn, now);
         let acked_tsn = cumulative_tsn.wrapping_add(2);
-        a.inflight_queue.mark_as_acked(acked_tsn);
+        a.outbound_queue.mark_as_acked(acked_tsn);
         a.on_retransmission_timeout(Timer::T3RTX, 1);
 
         let packets = a.get_data_packets_to_retransmit(now);
@@ -3252,11 +3277,11 @@ fn test_data_retransmission_wraps_tsn() -> Result<()> {
         ];
         assert_retransmitted_packet(&packet, &retransmitted_tsns);
         for tsn in retransmitted_tsns {
-            let chunk = a.inflight_queue.get(tsn).unwrap();
+            let chunk = a.outbound_queue.get(tsn).unwrap();
             assert!(!chunk.retransmit);
             assert_eq!(chunk.nsent, 2);
         }
-        assert_eq!(a.inflight_queue.get(acked_tsn).unwrap().nsent, 1);
+        assert_eq!(a.outbound_queue.get(acked_tsn).unwrap().nsent, 1);
         assert!(a.get_data_packets_to_retransmit(now).is_empty());
     }
     Ok(())
@@ -3287,7 +3312,7 @@ fn test_zero_window_probe_wraps_tsn() -> Result<()> {
         assert_retransmitted_packet(&packets[0], &[cumulative_tsn.wrapping_add(1)]);
         for offset in [2, 3] {
             let chunk = a
-                .inflight_queue
+                .outbound_queue
                 .get(cumulative_tsn.wrapping_add(offset))
                 .unwrap();
             assert!(chunk.retransmit);
@@ -3304,13 +3329,13 @@ fn test_fast_retransmission_wraps_tsn() -> Result<()> {
     for cumulative_tsn in [10, u32::MAX - 1, u32::MAX] {
         let mut a = association_with_inflight_data(cumulative_tsn, now);
         let acked_tsn = cumulative_tsn.wrapping_add(2);
-        a.inflight_queue.mark_as_acked(acked_tsn);
+        a.outbound_queue.mark_as_acked(acked_tsn);
         let retransmitted_tsns = [
             cumulative_tsn.wrapping_add(1),
             cumulative_tsn.wrapping_add(3),
         ];
         for tsn in retransmitted_tsns {
-            a.inflight_queue.get_mut(tsn).unwrap().miss_indicator = 3;
+            a.outbound_queue.get_mut(tsn).unwrap().miss_indicator = 3;
         }
         a.will_retransmit_fast = true;
 
@@ -3318,9 +3343,9 @@ fn test_fast_retransmission_wraps_tsn() -> Result<()> {
         assert_eq!(packets.len(), 1);
         assert_retransmitted_packet(&Packet::unmarshal(&packets[0])?, &retransmitted_tsns);
         for tsn in retransmitted_tsns {
-            assert_eq!(a.inflight_queue.get(tsn).unwrap().nsent, 2);
+            assert_eq!(a.outbound_queue.get(tsn).unwrap().nsent, 2);
         }
-        assert_eq!(a.inflight_queue.get(acked_tsn).unwrap().nsent, 1);
+        assert_eq!(a.outbound_queue.get(acked_tsn).unwrap().nsent, 1);
         assert!(!a.will_retransmit_fast);
         assert_eq!(a.stats.get_num_fast_retrans(), 2);
     }
@@ -3344,9 +3369,9 @@ fn test_cumulative_sack_wraps_tsn() -> Result<()> {
 
         assert_eq!(bytes_acked, HashMap::from([(1, 14)]));
         assert_eq!(htna, ack_tsn);
-        assert_eq!(a.inflight_queue.len(), 1);
+        assert_eq!(a.outbound_queue.inflight_len(), 1);
         assert!(
-            a.inflight_queue
+            a.outbound_queue
                 .get(cumulative_tsn.wrapping_add(3))
                 .is_some()
         );
@@ -3366,7 +3391,7 @@ fn test_gap_sack_wraps_tsn() -> Result<()> {
         };
         for offset in [2, 3] {
             let data = sender
-                .inflight_queue
+                .outbound_queue
                 .get(cumulative_tsn.wrapping_add(offset))
                 .unwrap()
                 .clone();
@@ -3377,10 +3402,10 @@ fn test_gap_sack_wraps_tsn() -> Result<()> {
 
         assert_eq!(bytes_acked, HashMap::from([(1, 14)]));
         assert_eq!(htna, cumulative_tsn.wrapping_add(3));
-        assert_eq!(sender.inflight_queue.get_num_bytes(), 7);
+        assert_eq!(sender.outbound_queue.inflight_bytes(), 7);
         for offset in [1, 2, 3] {
             let data = sender
-                .inflight_queue
+                .outbound_queue
                 .get(cumulative_tsn.wrapping_add(offset))
                 .unwrap();
             assert_eq!(data.acked, offset != 1);
@@ -3398,9 +3423,9 @@ fn test_fast_recovery_wraps_tsn() -> Result<()> {
             a.in_fast_recovery = in_fast_recovery;
             let htna = cumulative_tsn.wrapping_add(3);
             a.fast_recover_exit_point = htna;
-            a.inflight_queue.mark_as_acked(htna);
+            a.outbound_queue.mark_as_acked(htna);
             for offset in [1, 2] {
-                a.inflight_queue
+                a.outbound_queue
                     .get_mut(cumulative_tsn.wrapping_add(offset))
                     .unwrap()
                     .miss_indicator = 2;
@@ -3413,12 +3438,12 @@ fn test_fast_recovery_wraps_tsn() -> Result<()> {
             assert_eq!(a.fast_recover_exit_point, htna);
             for offset in [1, 2] {
                 let chunk = a
-                    .inflight_queue
+                    .outbound_queue
                     .get(cumulative_tsn.wrapping_add(offset))
                     .unwrap();
                 assert_eq!(chunk.miss_indicator, 3);
             }
-            assert_eq!(a.inflight_queue.get(htna).unwrap().miss_indicator, 0);
+            assert_eq!(a.outbound_queue.get(htna).unwrap().miss_indicator, 0);
         }
     }
     Ok(())
@@ -3432,10 +3457,10 @@ fn test_forward_tsn_wraparound() -> Result<()> {
             let mut a = association_with_inflight_data(cumulative_tsn, now);
             a.use_forward_tsn = true;
             for offset in [1, 2] {
-                a.inflight_queue
+                a.outbound_queue
                     .get_mut(cumulative_tsn.wrapping_add(offset))
                     .unwrap()
-                    .set_abandoned(true);
+                    .abandoned = true;
             }
 
             if from_timeout {
@@ -3555,17 +3580,21 @@ fn test_create_forward_tsn_forward_one_abandoned() -> Result<()> {
         ..Default::default()
     };
 
-    a.inflight_queue.push_no_check(ChunkPayloadData {
-        beginning_fragment: true,
-        ending_fragment: true,
-        tsn: 10,
-        stream_identifier: 1,
-        stream_sequence_number: 2,
-        user_data: Bytes::from_static(b"ABC"),
-        nsent: 1,
-        abandoned: true,
-        ..Default::default()
-    });
+    queue_inflight(
+        &mut a,
+        ChunkPayloadData {
+            beginning_fragment: true,
+            ending_fragment: true,
+            tsn: 10,
+            stream_identifier: 1,
+            stream_sequence_number: 2,
+            user_data: Bytes::from_static(b"ABC"),
+            nsent: 1,
+            ..Default::default()
+        },
+    );
+
+    a.outbound_queue.abandon(10, &mut a.my_next_tsn).unwrap();
 
     let fwdtsn = a.create_forward_tsn();
 
@@ -3585,39 +3614,49 @@ fn test_create_forward_tsn_forward_two_abandoned_with_the_same_si() -> Result<()
         ..Default::default()
     };
 
-    a.inflight_queue.push_no_check(ChunkPayloadData {
-        beginning_fragment: true,
-        ending_fragment: true,
-        tsn: 10,
-        stream_identifier: 1,
-        stream_sequence_number: 2,
-        user_data: Bytes::from_static(b"ABC"),
-        nsent: 1,
-        abandoned: true,
-        ..Default::default()
-    });
-    a.inflight_queue.push_no_check(ChunkPayloadData {
-        beginning_fragment: true,
-        ending_fragment: true,
-        tsn: 11,
-        stream_identifier: 1,
-        stream_sequence_number: 3,
-        user_data: Bytes::from_static(b"DEF"),
-        nsent: 1,
-        abandoned: true,
-        ..Default::default()
-    });
-    a.inflight_queue.push_no_check(ChunkPayloadData {
-        beginning_fragment: true,
-        ending_fragment: true,
-        tsn: 12,
-        stream_identifier: 2,
-        stream_sequence_number: 1,
-        user_data: Bytes::from_static(b"123"),
-        nsent: 1,
-        abandoned: true,
-        ..Default::default()
-    });
+    queue_inflight(
+        &mut a,
+        ChunkPayloadData {
+            beginning_fragment: true,
+            ending_fragment: true,
+            tsn: 10,
+            stream_identifier: 1,
+            stream_sequence_number: 2,
+            user_data: Bytes::from_static(b"ABC"),
+            nsent: 1,
+            ..Default::default()
+        },
+    );
+    queue_inflight(
+        &mut a,
+        ChunkPayloadData {
+            beginning_fragment: true,
+            ending_fragment: true,
+            tsn: 11,
+            stream_identifier: 1,
+            stream_sequence_number: 3,
+            user_data: Bytes::from_static(b"DEF"),
+            nsent: 1,
+            ..Default::default()
+        },
+    );
+    queue_inflight(
+        &mut a,
+        ChunkPayloadData {
+            beginning_fragment: true,
+            ending_fragment: true,
+            tsn: 12,
+            stream_identifier: 2,
+            stream_sequence_number: 1,
+            user_data: Bytes::from_static(b"123"),
+            nsent: 1,
+            ..Default::default()
+        },
+    );
+
+    a.outbound_queue.abandon(10, &mut a.my_next_tsn).unwrap();
+    a.outbound_queue.abandon(11, &mut a.my_next_tsn).unwrap();
+    a.outbound_queue.abandon(12, &mut a.my_next_tsn).unwrap();
 
     let fwdtsn = a.create_forward_tsn();
 
@@ -5265,4 +5304,384 @@ fn test_data_channel_stats_failed_queue_and_abandoned_receive() -> Result<()> {
     );
     assert_eq!(a.stream(1)?.stats()?, before);
     Ok(())
+}
+
+fn queue_pending(a: &mut Association, chunk: ChunkPayloadData) {
+    a.outbound_queue.push(vec![chunk]);
+}
+
+fn queue_inflight(a: &mut Association, mut chunk: ChunkPayloadData) {
+    // These fixtures insert one complete message through the real scheduler.
+    chunk.beginning_fragment = true;
+    chunk.ending_fragment = true;
+    let tsn = chunk.tsn;
+    queue_pending(a, chunk);
+    a.outbound_queue
+        .send_next(&mut { tsn }, Instant::now())
+        .unwrap();
+}
+
+fn fragmented_retransmission_fixture(limit: u32) -> Association {
+    let mut a = Association {
+        state: AssociationState::Established,
+        use_forward_tsn: true,
+        my_next_tsn: 1,
+        max_send_message_size: 100,
+        max_receive_message_size: 100,
+        max_payload_size: 4,
+        cwnd: 100,
+        rwnd: 100,
+        mtu: 1400,
+        ..Default::default()
+    };
+    a.create_stream(1, false, PayloadProtocolIdentifier::Binary)
+        .unwrap();
+    let mut stream = a.stream(1).unwrap();
+    stream
+        .set_reliability_params(false, ReliabilityType::Rexmit, limit)
+        .unwrap();
+    stream.write(b"abcdefghij").unwrap();
+    a
+}
+
+#[test]
+fn test_fast_retransmission_abandons_message_and_pending_tail() {
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(0);
+    a.send_next_data_chunk(now).unwrap();
+    a.send_next_data_chunk(now).unwrap();
+    for tsn in 1..=2 {
+        a.outbound_queue.get_mut(tsn).unwrap().miss_indicator = 3;
+    }
+    a.will_retransmit_fast = true;
+    assert!(
+        a.gather_outbound_fast_retransmission_packets(vec![], now)
+            .is_empty()
+    );
+    assert!(a.outbound_queue.is_abandoned(1));
+    assert!(a.outbound_queue.is_abandoned(2));
+    assert_eq!(a.outbound_queue.pending_len(), 0);
+    assert_eq!(a.stream(1).unwrap().buffered_amount().unwrap(), 0);
+    assert_eq!(a.my_next_tsn, 4);
+    let packets = a.gather_outbound_forward_tsn_packets(vec![]);
+    assert_eq!(packets.len(), 1);
+    let packet = Packet::unmarshal(&packets[0]).unwrap();
+    let forward = packet.chunks[0]
+        .as_any()
+        .downcast_ref::<ChunkForwardTsn>()
+        .unwrap();
+    assert_eq!(forward.new_cumulative_tsn, 3);
+    assert_eq!(forward.streams[0].identifier, 1);
+    assert_eq!(forward.streams[0].sequence, 0);
+}
+
+#[test]
+fn test_later_fragment_exhaustion_cancels_earlier_scheduled_retry() {
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(1);
+    a.send_next_data_chunk(now).unwrap();
+    a.send_next_data_chunk(now).unwrap();
+    // Chunks keep independent retry counts. Once one exhausts its allowance,
+    // even siblings already selected in this batch must be abandoned.
+    a.outbound_queue.get_mut(2).unwrap().nsent = 2;
+    a.outbound_queue.mark_all_to_retransmit();
+    assert!(a.get_data_packets_to_retransmit(now).is_empty());
+    assert!(a.outbound_queue.is_abandoned(1));
+    assert!(a.outbound_queue.is_abandoned(2));
+    assert_eq!(a.outbound_queue.pending_len(), 0);
+    assert_eq!(a.stream(1).unwrap().buffered_amount().unwrap(), 0);
+}
+
+#[test]
+fn test_fast_retry_counts_toward_timer_retransmission_limit() {
+    for limit in [1, 2] {
+        let now = Instant::now();
+        let mut a = fragmented_retransmission_fixture(limit);
+        for _ in 0..3 {
+            a.send_next_data_chunk(now).unwrap();
+        }
+        for tsn in 1..=3 {
+            a.outbound_queue.get_mut(tsn).unwrap().miss_indicator = 3;
+        }
+        a.will_retransmit_fast = true;
+        assert_eq!(
+            a.gather_outbound_fast_retransmission_packets(vec![], now)
+                .len(),
+            1
+        );
+        for tsn in 1..=3 {
+            assert_eq!(a.outbound_queue.get(tsn).unwrap().nsent, 2);
+            assert!(!a.outbound_queue.is_abandoned(tsn));
+        }
+        a.outbound_queue.mark_all_to_retransmit();
+        let packets = a.get_data_packets_to_retransmit(now);
+        assert_eq!(packets.len(), (limit - 1) as usize);
+        if limit == 2 {
+            a.outbound_queue.mark_all_to_retransmit();
+            assert!(a.get_data_packets_to_retransmit(now).is_empty());
+        }
+        for tsn in 1..=3 {
+            assert_eq!(a.outbound_queue.get(tsn).unwrap().nsent, limit + 1);
+            assert!(a.outbound_queue.is_abandoned(tsn));
+        }
+    }
+}
+
+#[test]
+fn abandoned_retry_message_releases_credit_without_ack_credit() {
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(0);
+    a.send_next_data_chunk(now).unwrap();
+    a.send_next_data_chunk(now).unwrap();
+    assert_eq!(a.stream(1).unwrap().buffered_amount().unwrap(), 10);
+    a.outbound_queue.mark_all_to_retransmit();
+    assert!(a.get_data_packets_to_retransmit(now).is_empty());
+    assert_eq!(a.outbound_queue.inflight_bytes(), 0);
+    assert_eq!(a.stream(1).unwrap().buffered_amount().unwrap(), 0);
+    assert_eq!(
+        a.events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                Event::Stream(StreamEvent::BufferedAmountLow { id: 1 })
+            ))
+            .count(),
+        1
+    );
+    let rto = a.rto_mgr.get_rto();
+    let (credit, _) = a
+        .process_selective_ack(
+            &ChunkSelectiveAck {
+                cumulative_tsn_ack: 3,
+                ..Default::default()
+            },
+            now + Duration::from_millis(200),
+        )
+        .unwrap();
+    assert!(credit.is_empty());
+    assert_eq!(a.rto_mgr.get_rto(), rto);
+    assert_eq!(a.outbound_queue.inflight_len(), 0);
+}
+
+#[test]
+fn retry_abandonment_does_not_credit_reused_stream() {
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(0);
+    a.send_next_data_chunk(now).unwrap();
+    // Model the old stream's removal while its retransmission metadata remains.
+    a.streams.remove(&1);
+    a.create_stream(1, false, PayloadProtocolIdentifier::Binary)
+        .unwrap();
+    a.stream(1).unwrap().write(b"new").unwrap();
+    a.outbound_queue.mark_all_to_retransmit();
+    assert!(a.get_data_packets_to_retransmit(now).is_empty());
+    assert_eq!(a.stream(1).unwrap().buffered_amount().unwrap(), 3);
+    assert_eq!(a.outbound_queue.pending_bytes(), 3);
+    assert!(a.events.iter().all(|event| !matches!(
+        event,
+        Event::Stream(StreamEvent::BufferedAmountLow { id: 1 })
+    )));
+}
+
+#[test]
+fn review_fast_abandonment_cancels_pending_fragments_in_same_poll() {
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(0);
+    a.send_next_data_chunk(now).unwrap();
+    // Three missing reports make the original a fast-recovery candidate.
+    // The congestion window also permits the pending tail in this poll.
+    a.outbound_queue.get_mut(1).unwrap().miss_indicator = 3;
+    a.will_retransmit_fast = true;
+    let (packets, _) = a.gather_outbound(now);
+    assert!(a.outbound_queue.is_abandoned(1));
+    for raw in packets {
+        let packet = Packet::unmarshal(&raw).unwrap();
+        for chunk in packet.chunks {
+            if let Some(data) = chunk.as_any().downcast_ref::<ChunkPayloadData>() {
+                assert!(
+                    !a.outbound_queue.is_abandoned(data.tsn),
+                    "poll emitted TSN {} after abandoning its whole message",
+                    data.tsn
+                );
+            }
+        }
+    }
+}
+
+fn check_old_generation_ack_credit(gap_ack: bool) {
+    use crate::chunk::chunk_selective_ack::GapAckBlock;
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(0);
+    a.send_next_data_chunk(now).unwrap();
+    // Same generation transition as retry_abandonment_does_not_credit_reused_stream.
+    a.streams.remove(&1);
+    a.create_stream(1, false, PayloadProtocolIdentifier::Binary)
+        .unwrap();
+    a.stream(1).unwrap().write(b"new").unwrap();
+    let sack = ChunkSelectiveAck {
+        cumulative_tsn_ack: if gap_ack { 0 } else { 1 },
+        gap_ack_blocks: if gap_ack {
+            vec![GapAckBlock { start: 1, end: 1 }]
+        } else {
+            vec![]
+        },
+        advertised_receiver_window_credit: 100,
+        ..Default::default()
+    };
+    a.handle_sack(&sack, now + Duration::from_millis(20))
+        .unwrap();
+    assert_eq!(
+        a.stream(1).unwrap().buffered_amount().unwrap(),
+        3,
+        "old generation ACK must not release new stream credit (gap={gap_ack})"
+    );
+    assert!(a.events.iter().all(|event| !matches!(
+        event,
+        Event::Stream(StreamEvent::BufferedAmountLow { id: 1 })
+    )));
+}
+
+#[test]
+fn review_old_generation_cumulative_ack_preserves_new_stream_credit() {
+    check_old_generation_ack_credit(false);
+}
+
+#[test]
+fn review_old_generation_gap_ack_preserves_new_stream_credit() {
+    check_old_generation_ack_credit(true);
+}
+
+#[test]
+fn cancelled_retry_batch_reuses_window_for_unrelated_message() {
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(1);
+    for _ in 0..3 {
+        a.send_next_data_chunk(now).unwrap();
+    }
+    a.stream(1).unwrap().write(b"live").unwrap();
+    a.send_next_data_chunk(now).unwrap();
+    a.outbound_queue.get_mut(2).unwrap().nsent = 2;
+    a.outbound_queue.mark_all_to_retransmit();
+    a.cwnd = 4;
+    let packets = a.get_data_packets_to_retransmit(now);
+    assert_eq!(
+        packets.len(),
+        1,
+        "cancelled siblings must release this batch's window"
+    );
+    assert_eq!(packets[0].chunks.len(), 1);
+    let data = packets[0].chunks[0]
+        .as_any()
+        .downcast_ref::<ChunkPayloadData>()
+        .unwrap();
+    assert_eq!(data.tsn, 4);
+    assert_eq!(&data.user_data[..], b"live");
+    assert_eq!(
+        a.outbound_queue.get(1).unwrap().nsent,
+        1,
+        "cancelled selection was never sent"
+    );
+}
+
+#[test]
+fn gap_ack_after_abandoned_prefix_restarts_outstanding_timer() {
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(0);
+    for _ in 0..3 {
+        a.send_next_data_chunk(now).unwrap();
+    }
+    assert!(a.abandon_if_needed(1, now));
+    a.stream(1).unwrap().write(b"live").unwrap();
+    a.send_next_data_chunk(now).unwrap();
+    a.timers.start(Timer::T3RTX, now, 1000);
+    let ack_time = now + Duration::from_millis(100);
+    a.handle_sack(
+        &ChunkSelectiveAck {
+            cumulative_tsn_ack: 0,
+            gap_ack_blocks: vec![crate::chunk::chunk_selective_ack::GapAckBlock {
+                start: 4,
+                end: 4,
+            }],
+            advertised_receiver_window_credit: 100,
+            ..Default::default()
+        },
+        ack_time,
+    )
+    .unwrap();
+    assert_eq!(
+        a.timers.get(Timer::T3RTX),
+        Some(ack_time + Duration::from_millis(a.rto_mgr.get_rto()))
+    );
+}
+
+#[test]
+fn late_ack_of_abandoned_data_resets_errors_but_duplicates_do_not() {
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(0);
+    a.send_next_data_chunk(now).unwrap();
+    assert!(a.abandon_if_needed(1, now));
+    a.timers = TimerTable::new(None, Some(1), 60000);
+    a.timers.start(Timer::T3RTX, now, 1);
+    assert_eq!(
+        a.timers
+            .is_expired(Timer::T3RTX, now + Duration::from_millis(1)),
+        (true, false, 1)
+    );
+    let sack = ChunkSelectiveAck {
+        cumulative_tsn_ack: 0,
+        gap_ack_blocks: vec![crate::chunk::chunk_selective_ack::GapAckBlock { start: 1, end: 1 }],
+        advertised_receiver_window_credit: 100,
+        ..Default::default()
+    };
+    a.handle_sack(&sack, now + Duration::from_millis(2))
+        .unwrap();
+    a.timers.start(Timer::T3RTX, now, 1);
+    assert_eq!(
+        a.timers
+            .is_expired(Timer::T3RTX, now + Duration::from_millis(2)),
+        (true, false, 1)
+    );
+    a.handle_sack(&sack, now + Duration::from_millis(3))
+        .unwrap();
+    a.timers.start(Timer::T3RTX, now, 1);
+    assert_eq!(
+        a.timers
+            .is_expired(Timer::T3RTX, now + Duration::from_millis(4)),
+        (true, true, 2)
+    );
+}
+
+#[test]
+fn forward_only_marker_ack_does_not_reset_peer_errors() {
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(0);
+    a.send_next_data_chunk(now).unwrap();
+    assert!(a.abandon_if_needed(1, now));
+    assert_eq!(a.outbound_queue.get(2).unwrap().nsent, 0);
+    a.timers = TimerTable::new(None, Some(1), 60000);
+    a.timers.start(Timer::T3RTX, now, 1);
+    assert_eq!(
+        a.timers
+            .is_expired(Timer::T3RTX, now + Duration::from_millis(1)),
+        (true, false, 1)
+    );
+    a.handle_sack(
+        &ChunkSelectiveAck {
+            cumulative_tsn_ack: 0,
+            gap_ack_blocks: vec![crate::chunk::chunk_selective_ack::GapAckBlock {
+                start: 2,
+                end: 2,
+            }],
+            advertised_receiver_window_credit: 100,
+            ..Default::default()
+        },
+        now + Duration::from_millis(2),
+    )
+    .unwrap();
+    a.timers.start(Timer::T3RTX, now, 1);
+    assert_eq!(
+        a.timers
+            .is_expired(Timer::T3RTX, now + Duration::from_millis(4)),
+        (true, true, 2)
+    );
 }

@@ -1264,26 +1264,30 @@ fn test_assoc_unreliable_rexmit_timed_ordered() -> Result<()> {
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
-    // When we set the reliability value to 0 [times], then it will cause
-    // the chunk to be abandoned immediately after the first transmission.
+    // A lost original expires before recovery; the following live message arrives.
     pair.client_stream(client_ch, si)?
-        .set_reliability_params(false, ReliabilityType::Timed, 0)?;
+        .set_reliability_params(false, ReliabilityType::Timed, 1)?;
     pair.server_stream(server_ch, si)?
-        .set_reliability_params(false, ReliabilityType::Timed, 0)?; // doesn't matter
+        .set_reliability_params(false, ReliabilityType::Timed, 1)?; // doesn't matter
 
     //br.drop_next_nwrites(0, 1).await; // drop the first packet (second one should be sacked)
 
     sbuf[0..4].copy_from_slice(&0u32.to_be_bytes());
-    let n = pair.client_stream(client_ch, si)?.write_sctp(
+    let now = pair.time;
+    let n = pair.client_stream(client_ch, si)?.write_sctp_at(
+        now,
         &Bytes::from(sbuf.clone()),
         PayloadProtocolIdentifier::Binary,
     )?;
     assert_eq!(sbuf.len(), n, "unexpected length of received data");
     pair.client.drive(pair.time, pair.server.addr);
     pair.client.outbound.clear();
+    pair.time += Duration::from_millis(1);
 
     sbuf[0..4].copy_from_slice(&1u32.to_be_bytes());
-    let n = pair.client_stream(client_ch, si)?.write_sctp(
+    let now = pair.time;
+    let n = pair.client_stream(client_ch, si)?.write_sctp_at(
+        now,
         &Bytes::from(sbuf.clone()),
         PayloadProtocolIdentifier::Binary,
     )?;
@@ -1338,26 +1342,30 @@ fn test_assoc_unreliable_rexmit_timed_unordered() -> Result<()> {
 
     establish_session_pair(&mut pair, client_ch, server_ch, si)?;
 
-    // When we set the reliability value to 0 [times], then it will cause
-    // the chunk to be abandoned immediately after the first transmission.
+    // A lost original expires before recovery; the following live message arrives.
     pair.client_stream(client_ch, si)?
-        .set_reliability_params(true, ReliabilityType::Timed, 0)?;
+        .set_reliability_params(true, ReliabilityType::Timed, 1)?;
     pair.server_stream(server_ch, si)?
-        .set_reliability_params(true, ReliabilityType::Timed, 0)?; // doesn't matter
+        .set_reliability_params(true, ReliabilityType::Timed, 1)?; // doesn't matter
 
     //br.drop_next_nwrites(0, 1).await; // drop the first packet (second one should be sacked)
 
     sbuf[0..4].copy_from_slice(&0u32.to_be_bytes());
-    let n = pair.client_stream(client_ch, si)?.write_sctp(
+    let now = pair.time;
+    let n = pair.client_stream(client_ch, si)?.write_sctp_at(
+        now,
         &Bytes::from(sbuf.clone()),
         PayloadProtocolIdentifier::Binary,
     )?;
     assert_eq!(sbuf.len(), n, "unexpected length of received data");
     pair.client.drive(pair.time, pair.server.addr);
     pair.client.outbound.clear();
+    pair.time += Duration::from_millis(1);
 
     sbuf[0..4].copy_from_slice(&1u32.to_be_bytes());
-    let n = pair.client_stream(client_ch, si)?.write_sctp(
+    let now = pair.time;
+    let n = pair.client_stream(client_ch, si)?.write_sctp_at(
+        now,
         &Bytes::from(sbuf.clone()),
         PayloadProtocolIdentifier::Binary,
     )?;

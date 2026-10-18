@@ -8,6 +8,8 @@ pub type Result<T> = core::result::Result<T, Error>;
 #[derive(Debug, Error, Eq, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Error {
+    #[error("timed messages require an explicit submission time; use a write*_at method")]
+    ErrTimedMessageRequiresTimestamp,
     #[error("raw is too small for a SCTP chunk")]
     ErrChunkHeaderTooSmall,
     #[error("not enough data left in SCTP packet to satisfy requested length")]

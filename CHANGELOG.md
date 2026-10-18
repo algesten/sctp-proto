@@ -1,6 +1,7 @@
 # Unreleased
 
   * Eliminate front-shifting in payload and reassembly queues #73
+  * Report receive-buffer exhaustion explicitly when incomplete messages cannot be drained #74
 
 # 0.10.6
 

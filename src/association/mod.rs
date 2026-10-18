@@ -830,6 +830,11 @@ impl Association {
 
     fn receive_capacity_exhausted(&self) -> bool {
         self.get_my_receiver_window_credit() == 0
+            && (!self.deferred_reset_data.is_empty()
+                || self
+                    .streams
+                    .values()
+                    .any(|s| s.get_num_bytes_in_reassembly_queue() > 0))
             && self.payload_queue.is_empty()
             && !self
                 .streams
@@ -2461,15 +2466,7 @@ impl Association {
             self.apply_deferred_forward_tsns(d.stream_identifier);
         }
 
-        let reply = self.handle_peer_last_tsn_and_acknowledgement(immediate_sack)?;
-        // Missing TSNs below a queued chunk can still fill gaps at zero credit.
-        // Once every accepted TSN is cumulative, only new highest-TSN DATA could
-        // complete an unreadable message; RFC 9260 section 6.2 forbids admitting
-        // that DATA at zero credit. Fail explicitly rather than pinning storage.
-        if (stream_handle_data || defer_stream_data) && self.receive_capacity_exhausted() {
-            return Err(Error::ErrReceiveBufferExhausted);
-        }
-        Ok(reply)
+        self.handle_peer_last_tsn_and_acknowledgement(immediate_sack)
     }
 
     fn handle_sack(&mut self, d: &ChunkSelectiveAck, now: Instant) -> Result<Vec<Packet>> {
@@ -2845,6 +2842,14 @@ impl Association {
         let stream_ids: Vec<StreamId> = self.deferred_forward_tsns.keys().copied().collect();
         for stream_identifier in stream_ids {
             self.apply_deferred_forward_tsns(stream_identifier);
+        }
+
+        // DATA and FORWARD-TSN can both close the final gap. Once every
+        // accepted TSN is cumulative, only new highest-TSN DATA could complete
+        // an unreadable message; RFC 9260 section 6.2 forbids admitting it at
+        // zero credit. Fail explicitly rather than pinning receive storage.
+        if self.receive_capacity_exhausted() {
+            return Err(Error::ErrReceiveBufferExhausted);
         }
 
         let has_packet_loss = !self.payload_queue.is_empty();

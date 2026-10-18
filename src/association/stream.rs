@@ -349,7 +349,8 @@ impl<'a> Stream<'a> {
         self.write_at(now, p)
     }
 
-    /// Submit buffers as one message at the caller's monotonic time.
+    /// Submit from buffers at the caller's monotonic time.
+    /// Consumes the same accepted prefix as [`Self::write_chunks`].
     pub fn write_chunks_at(&mut self, now: Instant, data: &mut [Bytes]) -> Result<usize> {
         self.write_source(
             &mut BytesArray::from_chunks(data),

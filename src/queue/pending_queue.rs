@@ -103,6 +103,34 @@ impl PendingQueue {
         self.n_bytes
     }
 
+    /// Remove a message without allocating a temporary collection. Selection
+    /// persists when removing a different message from the pending queues.
+    pub(crate) fn remove_message(
+        &mut self,
+        message_id: u64,
+        mut on_remove: impl FnMut(ChunkPayloadData),
+    ) -> usize {
+        if self.selected && self.peek().is_some_and(|c| c.message_id == message_id) {
+            self.selected = false;
+        }
+        let mut removed_bytes = 0;
+        let mut removed_chunks = 0;
+        for queue in [&mut self.ordered_queue, &mut self.unordered_queue] {
+            queue.retain_mut(|chunk| {
+                if chunk.message_id != message_id {
+                    return true;
+                }
+                removed_bytes += chunk.user_data.len();
+                removed_chunks += 1;
+                on_remove(core::mem::take(chunk));
+                false
+            });
+        }
+        self.n_bytes -= removed_bytes;
+        self.queue_len -= removed_chunks;
+        removed_bytes
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.queue_len
     }

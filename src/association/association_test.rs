@@ -4959,3 +4959,86 @@ fn test_receive_capacity_reports_exhaustion_after_forward_tsn_gap_closure() -> R
     )));
     Ok(())
 }
+
+#[test]
+fn test_receive_capacity_stopped_stream_cannot_supply_backpressure() -> Result<()> {
+    let mut a =
+        create_association(TransportConfig::default().with_max_receive_buffer_size(32 * 1024));
+    a.set_state(AssociationState::Established);
+    a.peer_last_tsn = 0;
+    receive_capacity_datagram(&mut a, receive_capacity_fragment(1, true, true))?;
+    a.stream(1)?.stop()?;
+    assert_eq!(a.stream(1)?.read().unwrap_err(), Error::ErrStreamClosed);
+    // A completed message on the stopped read half cannot release storage via
+    // the public API. The independent reliable message fills the remaining
+    // receive budget, and its ending fragment would be a new highest TSN.
+    for tsn in 2..=32 {
+        let mut chunk = receive_capacity_fragment(tsn, tsn == 2, false);
+        chunk.stream_identifier = 2;
+        receive_capacity_datagram(&mut a, chunk)?;
+    }
+    if !a.is_closed() {
+        assert_eq!(a.get_my_receiver_window_credit(), 0);
+        assert!(a.stream(2)?.read()?.is_none());
+        // The peer can have assigned its last TSN to the ending fragment
+        // before answering the reset. That reset cannot free the stopped
+        // stream until this new highest TSN is received.
+        let mut replies = vec![];
+        a.reset_streams_if_any(
+            &ParamOutgoingResetRequest {
+                reconfig_request_sequence_number: 1,
+                reconfig_response_sequence_number: 0,
+                sender_last_tsn: 33,
+                stream_identifiers: vec![1],
+            },
+            true,
+            &mut replies,
+        )?;
+        let mut ending = receive_capacity_fragment(33, false, true);
+        ending.stream_identifier = 2;
+        for _ in 0..3 {
+            receive_capacity_datagram(&mut a, ending.clone())?;
+            assert_eq!(a.peer_last_tsn, 32);
+            assert_eq!(a.get_my_receiver_window_credit(), 0);
+        }
+    }
+    assert!(
+        a.is_closed(),
+        "a stopped read half cannot make receive storage drainable"
+    );
+    assert!(core::iter::from_fn(|| a.poll()).any(|event| matches!(
+        event,
+        Event::AssociationLost {
+            reason: AssociationError::ReceiveBufferExhausted
+        }
+    )));
+    Ok(())
+}
+
+#[test]
+fn test_receive_capacity_detected_when_last_readable_stream_stops() -> Result<()> {
+    let mut a =
+        create_association(TransportConfig::default().with_max_receive_buffer_size(32 * 1024));
+    a.set_state(AssociationState::Established);
+    a.peer_last_tsn = 0;
+    receive_capacity_datagram(&mut a, receive_capacity_fragment(1, true, true))?;
+    for tsn in 2..=32 {
+        let mut chunk = receive_capacity_fragment(tsn, tsn == 2, false);
+        chunk.stream_identifier = 2;
+        receive_capacity_datagram(&mut a, chunk)?;
+    }
+    assert!(!a.is_closed());
+    assert_eq!(a.get_my_receiver_window_credit(), 0);
+    a.stream(1)?.stop()?;
+    assert!(
+        a.is_closed(),
+        "stop must detect storage the API can no longer drain"
+    );
+    assert!(core::iter::from_fn(|| a.poll()).any(|event| matches!(
+        event,
+        Event::AssociationLost {
+            reason: AssociationError::ReceiveBufferExhausted
+        }
+    )));
+    Ok(())
+}

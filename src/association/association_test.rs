@@ -5482,3 +5482,71 @@ fn retry_abandonment_does_not_credit_reused_stream() {
         Event::Stream(StreamEvent::BufferedAmountLow { id: 1 })
     )));
 }
+
+#[test]
+fn review_fast_abandonment_cancels_pending_fragments_in_same_poll() {
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(0);
+    a.send_next_data_chunk(now).unwrap();
+    // Three missing reports make the original a fast-recovery candidate.
+    // The congestion window also permits the pending tail in this poll.
+    a.outbound_queue.get_mut(1).unwrap().miss_indicator = 3;
+    a.will_retransmit_fast = true;
+    let (packets, _) = a.gather_outbound(now);
+    assert!(a.outbound_queue.is_abandoned(1));
+    for raw in packets {
+        let packet = Packet::unmarshal(&raw).unwrap();
+        for chunk in packet.chunks {
+            if let Some(data) = chunk.as_any().downcast_ref::<ChunkPayloadData>() {
+                assert!(
+                    !a.outbound_queue.is_abandoned(data.tsn),
+                    "poll emitted TSN {} after abandoning its whole message",
+                    data.tsn
+                );
+            }
+        }
+    }
+}
+
+fn check_old_generation_ack_credit(gap_ack: bool) {
+    use crate::chunk::chunk_selective_ack::GapAckBlock;
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(0);
+    a.send_next_data_chunk(now).unwrap();
+    // Same generation transition as retry_abandonment_does_not_credit_reused_stream.
+    a.streams.remove(&1);
+    a.create_stream(1, false, PayloadProtocolIdentifier::Binary)
+        .unwrap();
+    a.stream(1).unwrap().write(b"new").unwrap();
+    let sack = ChunkSelectiveAck {
+        cumulative_tsn_ack: if gap_ack { 0 } else { 1 },
+        gap_ack_blocks: if gap_ack {
+            vec![GapAckBlock { start: 1, end: 1 }]
+        } else {
+            vec![]
+        },
+        advertised_receiver_window_credit: 100,
+        ..Default::default()
+    };
+    a.handle_sack(&sack, now + Duration::from_millis(20))
+        .unwrap();
+    assert_eq!(
+        a.stream(1).unwrap().buffered_amount().unwrap(),
+        3,
+        "old generation ACK must not release new stream credit (gap={gap_ack})"
+    );
+    assert!(a.events.iter().all(|event| !matches!(
+        event,
+        Event::Stream(StreamEvent::BufferedAmountLow { id: 1 })
+    )));
+}
+
+#[test]
+fn review_old_generation_cumulative_ack_preserves_new_stream_credit() {
+    check_old_generation_ack_credit(false);
+}
+
+#[test]
+fn review_old_generation_gap_ack_preserves_new_stream_credit() {
+    check_old_generation_ack_credit(true);
+}

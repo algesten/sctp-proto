@@ -76,7 +76,7 @@ pub enum AssociationError {
     /// The peer violated the SCTP specification as understood by this implementation
     #[error("transport error")]
     TransportError,
-    /// Receive storage filled with incomplete messages that the whole-message API cannot drain.
+    /// Receive storage filled with messages that the whole-message API cannot drain.
     #[error("receive buffer exhausted during message reassembly")]
     ReceiveBufferExhausted,
     /// The peer's SCTP stack aborted the association
@@ -836,10 +836,12 @@ impl Association {
                     .values()
                     .any(|s| s.get_num_bytes_in_reassembly_queue() > 0))
             && self.payload_queue.is_empty()
-            && !self
-                .streams
-                .values()
-                .any(|s| s.reassembly_queue.is_readable())
+            && !self.streams.values().any(|s| {
+                matches!(
+                    s.state,
+                    RecvSendState::Readable | RecvSendState::ReadWritable
+                ) && s.reassembly_queue.is_readable()
+            })
     }
 
     fn abort_receive_capacity(&mut self) {

@@ -293,6 +293,8 @@ impl<'a> Stream<'a> {
 
     /// stop closes the read-direction of the stream.
     /// Future calls to read are not permitted after calling stop.
+    /// If stopping removes the last way to drain an exhausted receive buffer,
+    /// the association reports [`super::AssociationError::ReceiveBufferExhausted`].
     ///    
     /// NOTE: a stream closed without a queued reset never produces
     /// `StreamEvent::Finished` followed by `StreamEvent::ResetComplete` or
@@ -337,6 +339,10 @@ impl<'a> Stream<'a> {
         if retiring {
             self.association
                 .discard_retiring_streams(self.stream_identifier);
+        }
+
+        if self.association.receive_capacity_exhausted() {
+            self.association.abort_receive_capacity();
         }
 
         Ok(())

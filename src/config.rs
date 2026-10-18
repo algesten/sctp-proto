@@ -98,7 +98,8 @@ impl TransportConfig {
     /// fails with [`crate::AssociationError::ReceiveBufferExhausted`] and sends an
     /// Out Of Resource ABORT. No partial message is delivered. This can happen
     /// when a message exceeds the budget or multiple incomplete messages share it.
-    /// Complete unread messages instead apply ordinary receive-window backpressure.
+    /// Messages retained on stopped read halves also consume this budget until reset.
+    /// Complete messages on readable streams apply ordinary receive-window backpressure.
     /// The maximum receive-message size remains an independent limit.
     pub fn with_max_receive_buffer_size(mut self, value: u32) -> Self {
         self.max_receive_buffer_size = value;

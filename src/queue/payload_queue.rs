@@ -2,6 +2,7 @@ use crate::chunk::chunk_payload_data::ChunkPayloadData;
 use crate::chunk::chunk_selective_ack::GapAckBlock;
 use crate::util::*;
 
+use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
 use std::collections::HashMap;
@@ -10,7 +11,7 @@ use std::collections::HashMap;
 pub(crate) struct PayloadQueue {
     // length: usize,
     chunk_map: HashMap<u32, ChunkPayloadData>,
-    pub(crate) sorted: Vec<u32>,
+    pub(crate) sorted: VecDeque<u32>,
     dup_tsn: Vec<u32>,
     n_bytes: usize,
 }
@@ -21,7 +22,7 @@ impl PayloadQueue {
     }
 
     pub(crate) fn update_sorted_keys(&mut self) {
-        self.sorted.sort_by(|a, b| {
+        self.sorted.make_contiguous().sort_by(|a, b| {
             if sna32lt(*a, *b) {
                 core::cmp::Ordering::Less
             } else {
@@ -36,7 +37,7 @@ impl PayloadQueue {
 
     pub(crate) fn push_no_check(&mut self, p: ChunkPayloadData) {
         self.n_bytes += p.user_data.len();
-        self.sorted.push(p.tsn);
+        self.sorted.push_back(p.tsn);
         self.chunk_map.insert(p.tsn, p);
         //self.length += 1;
         self.update_sorted_keys();
@@ -54,7 +55,7 @@ impl PayloadQueue {
         }
 
         self.n_bytes += p.user_data.len();
-        self.sorted.push(p.tsn);
+        self.sorted.push_back(p.tsn);
         self.chunk_map.insert(p.tsn, p);
         //self.length += 1;
         self.update_sorted_keys();
@@ -65,7 +66,7 @@ impl PayloadQueue {
     /// pop pops only if the oldest chunk's TSN matches the given TSN.
     pub(crate) fn pop(&mut self, tsn: u32) -> Option<ChunkPayloadData> {
         if !self.sorted.is_empty() && tsn == self.sorted[0] {
-            self.sorted.remove(0);
+            self.sorted.pop_front();
             if let Some(c) = self.chunk_map.remove(&tsn) {
                 //self.length -= 1;
                 self.n_bytes = self.n_bytes.saturating_sub(c.user_data.len());
@@ -156,7 +157,7 @@ impl PayloadQueue {
     }
 
     pub(crate) fn get_last_tsn_received(&self) -> Option<&u32> {
-        self.sorted.last()
+        self.sorted.back()
     }
 
     pub(crate) fn mark_all_to_retrasmit(&mut self) {

@@ -1228,3 +1228,93 @@ fn test_reassembly_queue_max_message_size() {
         Ok(true)
     );
 }
+
+// Run with --release --ignored --nocapture --test-threads=1.
+#[test]
+#[ignore = "manual queue drain measurement"]
+fn measure_queue_drain() {
+    use core::hint::black_box;
+    use std::time::Instant;
+
+    for n in [128u32, 1024, 4096] {
+        for kind in ["payload", "ordered", "unordered"] {
+            let mut samples = Vec::new();
+            for _ in 0..21 {
+                let mut pq = PayloadQueue::new();
+                let mut rq = ReassemblyQueue::new(0, 65536);
+                for i in 0..n {
+                    let p = ChunkPayloadData {
+                        stream_sequence_number: i as u16,
+                        beginning_fragment: true,
+                        ending_fragment: true,
+                        unordered: kind == "unordered",
+                        ..make_payload(i, 16)
+                    };
+                    if kind == "payload" {
+                        pq.push_no_check(p);
+                    } else {
+                        rq.push(p).unwrap();
+                    }
+                }
+                let start = Instant::now();
+                for i in 0..n {
+                    if kind == "payload" {
+                        black_box(pq.pop(i).unwrap());
+                    } else {
+                        black_box(rq.read().unwrap());
+                    }
+                }
+                samples.push(start.elapsed().as_nanos());
+                assert_eq!(pq.get_num_bytes(), 0);
+                assert_eq!(rq.get_num_bytes(), 0);
+            }
+            samples.sort_unstable();
+            std::println!(
+                "{kind} n={n}: median={} ns min={} max={}",
+                samples[10],
+                samples[0],
+                samples[20]
+            );
+        }
+    }
+}
+
+#[test]
+fn test_queue_front_pop_then_reorder_across_wrap() -> Result<()> {
+    let mut pq = PayloadQueue::new();
+    let mut rq = ReassemblyQueue::new(0, 65536);
+    rq.next_ssn = u16::MAX - 1;
+    for tsn in [u32::MAX - 1, u32::MAX] {
+        pq.push_no_check(make_payload(tsn, 16));
+        rq.push(ChunkPayloadData {
+            stream_sequence_number: tsn as u16,
+            beginning_fragment: true,
+            ending_fragment: true,
+            ..make_payload(tsn, 16)
+        })?;
+    }
+    assert_eq!(pq.pop(u32::MAX - 1).unwrap().tsn, u32::MAX - 1);
+    assert_eq!(rq.read().unwrap().ssn, u16::MAX - 1);
+    for tsn in [1, 0] {
+        pq.push_no_check(make_payload(tsn, 16));
+        rq.push(ChunkPayloadData {
+            stream_sequence_number: tsn as u16,
+            beginning_fragment: true,
+            ending_fragment: true,
+            ..make_payload(tsn, 16)
+        })?;
+    }
+    assert_eq!(pq.get_last_tsn_received(), Some(&1));
+    let gaps = pq.get_gap_ack_blocks(u32::MAX - 1);
+    assert_eq!(gaps.len(), 1);
+    assert_eq!((gaps[0].start, gaps[0].end), (1, 3));
+    for tsn in [u32::MAX, 0, 1] {
+        assert_eq!(pq.pop(tsn).unwrap().tsn, tsn);
+        assert_eq!(rq.read().unwrap().ssn, tsn as u16);
+    }
+    assert!(pq.pop(2).is_none());
+    assert!(rq.read().is_none());
+    assert_eq!(pq.get_num_bytes(), 0);
+    assert_eq!(rq.get_num_bytes(), 0);
+    Ok(())
+}

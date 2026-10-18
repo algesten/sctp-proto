@@ -3960,3 +3960,32 @@ fn test_snap_association_drains_cleanly() {
         "remote_tag should be removed from association_ids_init after drain"
     );
 }
+
+#[test]
+#[ignore = "manual end-to-end transfer measurement"]
+fn measure_queue_transfer() {
+    for (name, transfer) in [
+        (
+            "unfragmented",
+            test_assoc_reliable_simple as fn() -> Result<()>,
+        ),
+        (
+            "fragmented",
+            test_assoc_reliable_ordered_fragmented_then_defragmented,
+        ),
+    ] {
+        let mut samples = Vec::new();
+        for _ in 0..21 {
+            let start = Instant::now();
+            transfer().unwrap();
+            samples.push(start.elapsed().as_nanos());
+        }
+        samples.sort_unstable();
+        std::println!(
+            "{name}: median={} ns min={} max={}",
+            samples[10],
+            samples[0],
+            samples[20]
+        );
+    }
+}

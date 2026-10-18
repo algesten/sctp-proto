@@ -36,9 +36,8 @@ use crate::queue::reassembly_queue::ReassemblyQueue;
 use crate::shared::{AssociationEventInner, AssociationId, EndpointEvent, EndpointEventInner};
 use crate::util::{sna16lt, sna32gt, sna32gte, sna32lt, sna32lte};
 use crate::{AssociationEvent, Payload, Side, Transmit};
-use stream::{
-    DataChannelStats, ReliabilityType, Stream, StreamEvent, StreamId, StreamResetError, StreamState,
-};
+use stream::DataChannelStats;
+use stream::{ReliabilityType, Stream, StreamEvent, StreamId, StreamResetError, StreamState};
 use timer::{ACK_INTERVAL, RtoManager, Timer, TimerTable};
 
 use crate::association::stream::RecvSendState;

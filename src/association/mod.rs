@@ -3988,7 +3988,25 @@ impl Association {
             //      is 0), the data sender can always have one DATA chunk in flight to
             //      the receiver if allowed by cwnd (see rule B, below).
 
-            while let Some(c) = self.outbound_queue.peek_pending() {
+            loop {
+                if self.use_forward_tsn {
+                    if let Some((id, unordered, bytes)) = self.outbound_queue.expire_pending(now) {
+                        if let Some(stream) = self.streams.get_mut(&id) {
+                            if !unordered {
+                                stream.sequence_number = stream.sequence_number.wrapping_sub(1);
+                            }
+                            if stream.on_buffer_released(bytes as i64) {
+                                self.events.push_back(Event::Stream(
+                                    StreamEvent::BufferedAmountLow { id },
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+                }
+                let Some(c) = self.outbound_queue.peek_pending() else {
+                    break;
+                };
                 let data_len = c.user_data.len();
 
                 if self.outbound_queue.inflight_bytes() + data_len > self.cwnd as usize {

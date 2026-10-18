@@ -298,3 +298,57 @@ fn removing_other_message_tail_preserves_pending_selection() {
     assert!(remaining.ending_fragment);
     assert!(!remaining.abandoned);
 }
+
+#[test]
+fn pending_expiry_deadlines_ssn_wrap_and_exemptions() {
+    use core::time::Duration;
+    let now = Instant::now();
+    for unordered in [false, true] {
+        for delay in [
+            Duration::ZERO,
+            Duration::from_millis(10),
+            Duration::from_secs(u32::MAX as u64),
+        ] {
+            let mut q = OutboundQueue::default();
+            let mut expired = message(1, unordered, 3);
+            for c in &mut expired {
+                c.deadline = Some(now + delay);
+                c.stream_sequence_number = u16::MAX;
+            }
+            q.push(expired);
+            q.push(message(1, unordered, 1));
+            if !delay.is_zero() {
+                assert!(q.expire_pending(now).is_none());
+            }
+            assert_eq!(q.expire_pending(now + delay), Some((1, unordered, 24)));
+            assert_eq!(q.pending_bytes(), 8);
+            assert!(q.expire_pending(now + delay).is_none());
+            let mut tsn = 99;
+            let fresh = q.send_next(&mut tsn, now + delay).unwrap();
+            assert_eq!(fresh.tsn, 99);
+            assert_eq!(tsn, 100);
+            assert_eq!(
+                fresh.stream_sequence_number,
+                if unordered { 0 } else { u16::MAX }
+            );
+        }
+    }
+    for exemption in 0..3 {
+        let mut q = OutboundQueue::default();
+        let mut chunks = message(1, false, 2);
+        for c in &mut chunks {
+            c.deadline = Some(now);
+            if exemption == 0 {
+                c.payload_type = crate::PayloadProtocolIdentifier::Dcep;
+            }
+            if exemption == 1 {
+                c.user_data.clear();
+            }
+        }
+        q.push(chunks);
+        if exemption == 2 {
+            q.send_next(&mut 10, now).unwrap();
+        }
+        assert!(q.expire_pending(now).is_none());
+    }
+}

@@ -1284,6 +1284,7 @@ fn test_pending_timed_expiry_window_stall() -> Result<()> {
                 pair.client_stream(client, 3)?.write(b"needs time"),
                 Err(Error::ErrTimedMessageRequiresTimestamp)
             );
+            while pair.client_conn_mut(client).poll().is_some() {}
             let old = vec![42; 3000];
             pair.client_stream(client, 3)?.write_at(now, &old)?;
             pair.client
@@ -1299,6 +1300,18 @@ fn test_pending_timed_expiry_window_stall() -> Result<()> {
             pair.client
                 .drive(now + Duration::from_millis(10), pair.server.addr);
             assert_eq!(pair.client_stream(client, 3)?.buffered_amount()?, 0);
+            pair.client
+                .drive(now + Duration::from_millis(11), pair.server.addr);
+            let mut low_events = 0;
+            while let Some(event) = pair.client_conn_mut(client).poll() {
+                if matches!(
+                    event,
+                    Event::Stream(StreamEvent::BufferedAmountLow { id: 3 })
+                ) {
+                    low_events += 1;
+                }
+            }
+            assert_eq!(low_events, 1, "expiry releases buffer credit exactly once");
             pair.time = now + Duration::from_millis(20);
             pair.client_conn_mut(client).cwnd = old_cwnd;
             pair.client_stream(client, 3)?.set_reliability_params(

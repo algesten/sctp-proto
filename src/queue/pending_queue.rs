@@ -99,6 +99,15 @@ impl PendingQueue {
         popped
     }
 
+    /// Close the SSN gap after removing an entirely unsent ordered message.
+    pub(crate) fn compact_ordered_ssns(&mut self, stream_identifier: u16) {
+        for chunk in &mut self.ordered_queue {
+            if chunk.stream_identifier == stream_identifier {
+                chunk.stream_sequence_number = chunk.stream_sequence_number.wrapping_sub(1);
+            }
+        }
+    }
+
     pub(crate) fn get_num_bytes(&self) -> usize {
         self.n_bytes
     }

@@ -109,6 +109,8 @@ pub struct ChunkPayloadData {
 
     /// Partial-reliability parameters used only by sender
     pub(crate) since: Option<Instant>,
+    pub(crate) reliability: Option<(crate::ReliabilityType, u32)>,
+    pub(crate) deadline: Option<Instant>,
     /// number of transmission made for this chunk
     pub(crate) nsent: u32,
 
@@ -134,6 +136,8 @@ impl Default for ChunkPayloadData {
             message_id: 0,
             abandoned: false,
             since: None,
+            reliability: None,
+            deadline: None,
             nsent: 0,
             retransmit: false,
         }
@@ -212,6 +216,8 @@ impl Chunk for ChunkPayloadData {
             message_id: 0,
             abandoned: false,
             since: None,
+            reliability: None,
+            deadline: None,
             nsent: 0,
             retransmit: false,
         })

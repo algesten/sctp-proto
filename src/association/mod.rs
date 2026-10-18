@@ -4054,12 +4054,13 @@ impl Association {
         let Some(stream) = self.streams.get(&c.stream_identifier) else {
             return false;
         };
-        let expired = match stream.reliability_type {
+        let (reliability_type, reliability_value) = c
+            .reliability
+            .unwrap_or((stream.reliability_type, stream.reliability_value));
+        let expired = match reliability_type {
             // nsent includes the original send; maxRTX counts only retries.
-            ReliabilityType::Rexmit => c.nsent > stream.reliability_value,
-            ReliabilityType::Timed => c.since.is_some_and(|since| {
-                now.duration_since(since).as_millis() >= u128::from(stream.reliability_value)
-            }),
+            ReliabilityType::Rexmit => c.nsent > reliability_value,
+            ReliabilityType::Timed => c.deadline.is_some_and(|deadline| now >= deadline),
             ReliabilityType::Reliable => false,
         };
         if !expired {

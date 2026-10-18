@@ -1,5 +1,7 @@
 # Unreleased
 
+  * Eliminate front-shifting in payload and reassembly queues #73
+
 # 0.10.6
 
   * Fix TSN wraparound panics and incorrect SACK gap offsets at sequence-number boundaries #65

@@ -320,6 +320,14 @@ impl<'a> Stream<'a> {
 
     /// Submit a message at the caller's monotonic time, including pending time in its lifetime.
     /// Timed messages expire at the deadline, including a zero lifetime at submission.
+    /// Use the same monotonic clock as association polling and timeouts. The lifetime includes
+    /// time waiting for congestion or receive-window credit, and the accepted policy remains
+    /// fixed when stream reliability settings change. Entirely unsent expired messages consume
+    /// no TSN or on-wire ordered sequence number.
+    ///
+    /// Untimestamped write methods return [`Error::ErrTimedMessageRequiresTimestamp`] for timed
+    /// user messages when partial reliability is negotiated. Reliable messages, DCEP, and the
+    /// non-negotiated reliable fallback can still use the untimestamped methods.
     pub fn write_at(&mut self, now: Instant, data: &[u8]) -> Result<usize> {
         self.write_with_ppi_at(now, data, self.get_default_payload_type()?)
     }

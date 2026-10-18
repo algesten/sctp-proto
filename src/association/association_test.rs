@@ -5550,3 +5550,138 @@ fn review_old_generation_cumulative_ack_preserves_new_stream_credit() {
 fn review_old_generation_gap_ack_preserves_new_stream_credit() {
     check_old_generation_ack_credit(true);
 }
+
+#[test]
+fn cancelled_retry_batch_reuses_window_for_unrelated_message() {
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(1);
+    for _ in 0..3 {
+        a.send_next_data_chunk(now).unwrap();
+    }
+    a.stream(1).unwrap().write(b"live").unwrap();
+    a.send_next_data_chunk(now).unwrap();
+    a.outbound_queue.get_mut(2).unwrap().nsent = 2;
+    a.outbound_queue.mark_all_to_retransmit();
+    a.cwnd = 4;
+    let packets = a.get_data_packets_to_retransmit(now);
+    assert_eq!(
+        packets.len(),
+        1,
+        "cancelled siblings must release this batch's window"
+    );
+    assert_eq!(packets[0].chunks.len(), 1);
+    let data = packets[0].chunks[0]
+        .as_any()
+        .downcast_ref::<ChunkPayloadData>()
+        .unwrap();
+    assert_eq!(data.tsn, 4);
+    assert_eq!(&data.user_data[..], b"live");
+    assert_eq!(
+        a.outbound_queue.get(1).unwrap().nsent,
+        1,
+        "cancelled selection was never sent"
+    );
+}
+
+#[test]
+fn gap_ack_after_abandoned_prefix_restarts_outstanding_timer() {
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(0);
+    for _ in 0..3 {
+        a.send_next_data_chunk(now).unwrap();
+    }
+    assert!(a.abandon_if_needed(1, now));
+    a.stream(1).unwrap().write(b"live").unwrap();
+    a.send_next_data_chunk(now).unwrap();
+    a.timers.start(Timer::T3RTX, now, 1000);
+    let ack_time = now + Duration::from_millis(100);
+    a.handle_sack(
+        &ChunkSelectiveAck {
+            cumulative_tsn_ack: 0,
+            gap_ack_blocks: vec![crate::chunk::chunk_selective_ack::GapAckBlock {
+                start: 4,
+                end: 4,
+            }],
+            advertised_receiver_window_credit: 100,
+            ..Default::default()
+        },
+        ack_time,
+    )
+    .unwrap();
+    assert_eq!(
+        a.timers.get(Timer::T3RTX),
+        Some(ack_time + Duration::from_millis(a.rto_mgr.get_rto()))
+    );
+}
+
+#[test]
+fn late_ack_of_abandoned_data_resets_errors_but_duplicates_do_not() {
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(0);
+    a.send_next_data_chunk(now).unwrap();
+    assert!(a.abandon_if_needed(1, now));
+    a.timers = TimerTable::new(None, Some(1), 60000);
+    a.timers.start(Timer::T3RTX, now, 1);
+    assert_eq!(
+        a.timers
+            .is_expired(Timer::T3RTX, now + Duration::from_millis(1)),
+        (true, false, 1)
+    );
+    let sack = ChunkSelectiveAck {
+        cumulative_tsn_ack: 0,
+        gap_ack_blocks: vec![crate::chunk::chunk_selective_ack::GapAckBlock { start: 1, end: 1 }],
+        advertised_receiver_window_credit: 100,
+        ..Default::default()
+    };
+    a.handle_sack(&sack, now + Duration::from_millis(2))
+        .unwrap();
+    a.timers.start(Timer::T3RTX, now, 1);
+    assert_eq!(
+        a.timers
+            .is_expired(Timer::T3RTX, now + Duration::from_millis(2)),
+        (true, false, 1)
+    );
+    a.handle_sack(&sack, now + Duration::from_millis(3))
+        .unwrap();
+    a.timers.start(Timer::T3RTX, now, 1);
+    assert_eq!(
+        a.timers
+            .is_expired(Timer::T3RTX, now + Duration::from_millis(4)),
+        (true, true, 2)
+    );
+}
+
+#[test]
+fn forward_only_marker_ack_does_not_reset_peer_errors() {
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(0);
+    a.send_next_data_chunk(now).unwrap();
+    assert!(a.abandon_if_needed(1, now));
+    assert_eq!(a.outbound_queue.get(2).unwrap().nsent, 0);
+    a.timers = TimerTable::new(None, Some(1), 60000);
+    a.timers.start(Timer::T3RTX, now, 1);
+    assert_eq!(
+        a.timers
+            .is_expired(Timer::T3RTX, now + Duration::from_millis(1)),
+        (true, false, 1)
+    );
+    a.handle_sack(
+        &ChunkSelectiveAck {
+            cumulative_tsn_ack: 0,
+            gap_ack_blocks: vec![crate::chunk::chunk_selective_ack::GapAckBlock {
+                start: 2,
+                end: 2,
+            }],
+            advertised_receiver_window_credit: 100,
+            ..Default::default()
+        },
+        now + Duration::from_millis(2),
+    )
+    .unwrap();
+    a.timers.start(Timer::T3RTX, now, 1);
+    assert_eq!(
+        a.timers
+            .is_expired(Timer::T3RTX, now + Duration::from_millis(4)),
+        (true, true, 2)
+    );
+}

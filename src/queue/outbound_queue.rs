@@ -125,6 +125,14 @@ impl OutboundQueue {
         self.pending.get_num_bytes()
     }
 
+    pub(crate) fn earliest_outstanding_tsn(&self) -> Option<u32> {
+        self.inflight.sorted.iter().copied().find(|tsn| {
+            self.inflight
+                .get(*tsn)
+                .is_some_and(|c| !c.acked && !c.abandoned)
+        })
+    }
+
     pub(crate) fn inflight_len(&self) -> usize {
         self.inflight.len()
     }

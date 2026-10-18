@@ -497,3 +497,44 @@ fn lost_prefix_sacks_do_not_strand_the_next_ordered_message() {
     assert_eq!(a.assoc.stream(0).unwrap().buffered_amount().unwrap(), 0);
     assert_eq!(received, vec![b"following message".to_vec()]);
 }
+
+#[test]
+fn unordered_abandonment_preserves_next_ordered_message() {
+    let (mut a, mut b) = pairs(ReliabilityType::Rexmit);
+    let base = Instant::now();
+    a.assoc.stream(0).unwrap().write(b"lost unordered").unwrap();
+    let mut forwarded = false;
+    for ms in 0..30000 {
+        let now = base + Duration::from_millis(ms);
+        a.assoc.handle_timeout(now);
+        for packet in a.drain(now) {
+            let types = chunks(&packet);
+            if types.iter().any(|(ty, _)| *ty == 0) {
+                continue;
+            }
+            forwarded |= types.iter().any(|(ty, _)| *ty == 192);
+            b.receive(now, a.addr, packet);
+        }
+        for packet in b.drain(now) {
+            a.receive(now, b.addr, packet);
+        }
+        if forwarded {
+            a.assoc
+                .stream(0)
+                .unwrap()
+                .set_reliability_params(false, ReliabilityType::Reliable, 0)
+                .unwrap();
+            a.assoc
+                .stream(0)
+                .unwrap()
+                .write(b"ordered successor")
+                .unwrap();
+            for packet in a.drain(now) {
+                b.receive(now, a.addr, packet);
+            }
+            assert_eq!(b.messages(), vec![b"ordered successor".to_vec()]);
+            break;
+        }
+    }
+    assert!(forwarded);
+}

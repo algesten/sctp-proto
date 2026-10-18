@@ -2996,6 +2996,8 @@ impl Association {
         now: Instant,
     ) -> Result<(HashMap<u16, i64>, u32)> {
         let mut bytes_acked_per_stream = HashMap::new();
+        let mut newly_acked_data = false;
+        let earliest_outstanding = self.outbound_queue.earliest_outstanding_tsn();
 
         // New ack point, so pop cumulatively ACKed chunks from the outbound queue.
         // We add 1 because the "currentAckPoint" has already been popped from the inflight queue
@@ -3005,17 +3007,8 @@ impl Association {
         //log::debug!("[{}] i={} d={}", self.name, i, d.cumulative_tsn_ack);
         while sna32lte(i, d.cumulative_tsn_ack) {
             if let Some(c) = self.outbound_queue.pop(i) {
+                newly_acked_data |= !c.acked && c.nsent > 0;
                 if !c.acked && !c.abandoned {
-                    // RFC 4096 sec 6.3.2.  Retransmission Timer Rules
-                    //   R3)  Whenever a SACK is received that acknowledges the DATA chunk
-                    //        with the earliest outstanding TSN for that address, restart the
-                    //        T3-rtx timer for that address with its current RTO (if there is
-                    //        still outstanding data on that address).
-                    if i == first_outstanding_tsn {
-                        // T3 timer needs to be reset. Stop it for now.
-                        self.timers.stop(Timer::T3RTX);
-                    }
-
                     let n_bytes_acked = c.user_data.len() as i64;
 
                     // Sum the number of bytes acknowledged per stream
@@ -3075,6 +3068,7 @@ impl Association {
                 let tsn = d.cumulative_tsn_ack.wrapping_add(i as u32);
 
                 let (is_existed, is_acked) = if let Some(c) = self.outbound_queue.get(tsn) {
+                    newly_acked_data |= !c.acked && c.nsent > 0;
                     (true, c.acked)
                 } else {
                     (false, false)
@@ -3127,6 +3121,18 @@ impl Association {
             }
         }
 
+        // Local retirement and duplicate SACKs are not new peer progress.
+        if newly_acked_data {
+            self.timers.reset_retrans(Timer::T3RTX);
+        }
+        // RFC 4960 R3 applies to the earliest outstanding DATA, even when
+        // abandoned TSNs precede it or it is acknowledged by a Gap ACK.
+        if earliest_outstanding.is_some_and(|tsn| {
+            sna32lte(tsn, d.cumulative_tsn_ack)
+                || self.outbound_queue.get(tsn).is_some_and(|c| c.acked)
+        }) {
+            self.timers.set(Timer::T3RTX, None);
+        }
         Ok((bytes_acked_per_stream, htna))
     }
 
@@ -3912,7 +3918,7 @@ impl Association {
     /// or abandoned yet.
     fn get_data_packets_to_retransmit(&mut self, now: Instant) -> Vec<Packet> {
         let awnd = core::cmp::min(self.cwnd, self.rwnd);
-        let mut chunks = vec![];
+        let mut chunks: Vec<ChunkPayloadData> = vec![];
         let mut bytes_to_send = 0;
         let mut done = false;
         let mut i = 0;
@@ -3928,6 +3934,8 @@ impl Association {
                 }
 
                 if self.abandon_if_needed(tsn, now) {
+                    chunks.retain(|c| !self.outbound_queue.is_abandoned(c.tsn));
+                    bytes_to_send = chunks.iter().map(|c| c.user_data.len()).sum();
                     i += 1;
                     continue;
                 }
@@ -3940,12 +3948,7 @@ impl Association {
                     break;
                 }
 
-                // reset the retransmit flag not to retransmit again before the next
-                // t3-rtx timer fires
-                c.retransmit = false;
                 bytes_to_send += c.user_data.len();
-
-                c.nsent += 1;
             } else {
                 break; // end of pending data
             }
@@ -3963,7 +3966,12 @@ impl Association {
 
         // A later fragment may exhaust the message's policy after an earlier
         // fragment was selected in this pass. Neither should be retransmitted.
-        chunks.retain(|c| !self.outbound_queue.is_abandoned(c.tsn));
+        for chunk in &mut chunks {
+            let c = self.outbound_queue.get_mut(chunk.tsn).unwrap();
+            c.retransmit = false;
+            c.nsent += 1;
+            chunk.nsent = c.nsent;
+        }
         self.bundle_data_chunks_into_packets(chunks)
     }
 
@@ -4111,6 +4119,11 @@ impl Association {
         let mut i = self.cumulative_tsn_ack_point.wrapping_add(1);
         while sna32lte(i, self.advanced_peer_tsn_ack_point) {
             if let Some(c) = self.outbound_queue.get(i) {
+                // RFC 3758 C4: unordered DATA advances only the TSN point.
+                if c.unordered {
+                    i = i.wrapping_add(1);
+                    continue;
+                }
                 if let Some(ssn) = stream_map.get(&c.stream_identifier) {
                     if sna16lt(*ssn, c.stream_sequence_number) {
                         // to report only once with greatest SSN

@@ -1,5 +1,7 @@
 # Unreleased
 
+  * Suppress expired timed DATA and recover abandoned fragmented messages across shutdown #78
+
   * Expire pending timed messages before TSN assignment without ordered delivery gaps #77
   * Eliminate front-shifting in payload and reassembly queues #73
   * Report receive-buffer exhaustion explicitly when incomplete messages cannot be drained #74

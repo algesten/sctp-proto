@@ -2519,12 +2519,11 @@ impl Association {
         }
 
         // Process selective ack
+        let outstanding_before = self.outbound_queue.inflight_bytes();
         let (bytes_acked_per_stream, htna) = self.process_selective_ack(d, now)?;
-
-        let mut total_bytes_acked = 0;
-        for n_bytes_acked in bytes_acked_per_stream.values() {
-            total_bytes_acked += *n_bytes_acked;
-        }
+        // Peer delivery earns congestion credit even after its stream was reset.
+        // Application credit below belongs only to the current stream generation.
+        let total_bytes_acked = (outstanding_before - self.outbound_queue.inflight_bytes()) as i64;
 
         let mut cum_tsn_ack_point_advanced = false;
         if sna32lt(self.cumulative_tsn_ack_point, d.cumulative_tsn_ack) {
@@ -3020,10 +3019,14 @@ impl Association {
                     let n_bytes_acked = c.user_data.len() as i64;
 
                     // Sum the number of bytes acknowledged per stream
-                    if let Some(amount) = bytes_acked_per_stream.get_mut(&c.stream_identifier) {
-                        *amount += n_bytes_acked;
-                    } else {
-                        bytes_acked_per_stream.insert(c.stream_identifier, n_bytes_acked);
+                    if !self
+                        .streams
+                        .get(&c.stream_identifier)
+                        .is_some_and(|stream| c.message_id < stream.first_message_id)
+                    {
+                        *bytes_acked_per_stream
+                            .entry(c.stream_identifier)
+                            .or_insert(0) += n_bytes_acked;
                     }
 
                     // RFC 4960 sec 6.3.1.  RTO Calculation
@@ -3085,10 +3088,14 @@ impl Association {
                 if let Some(c) = self.outbound_queue.get(tsn) {
                     if !is_acked && !c.abandoned {
                         // Sum the number of bytes acknowledged per stream
-                        if let Some(amount) = bytes_acked_per_stream.get_mut(&c.stream_identifier) {
-                            *amount += n_bytes_acked;
-                        } else {
-                            bytes_acked_per_stream.insert(c.stream_identifier, n_bytes_acked);
+                        if !self
+                            .streams
+                            .get(&c.stream_identifier)
+                            .is_some_and(|stream| c.message_id < stream.first_message_id)
+                        {
+                            *bytes_acked_per_stream
+                                .entry(c.stream_identifier)
+                                .or_insert(0) += n_bytes_acked;
                         }
 
                         trace!("[{}] tsn={} has been sacked", self.side, c.tsn);
@@ -3477,12 +3484,13 @@ impl Association {
         match state {
             AssociationState::Established => {
                 raw_packets = self.gather_data_packets_to_retransmit(raw_packets, now);
+                // Decide fast-recovery abandonment before selecting any pending tail.
+                raw_packets = self.gather_outbound_fast_retransmission_packets(raw_packets, now);
                 raw_packets = self.gather_outbound_data_and_reconfig_packets(raw_packets, now);
                 // A queued reciprocal reset may have been held back until the
                 // DATA it covers received TSNs above. Give it another chance in
                 // this same poll so DATA and RE-CONFIG can leave together.
                 raw_packets = self.gather_outbound_control_packets(raw_packets, now);
-                raw_packets = self.gather_outbound_fast_retransmission_packets(raw_packets, now);
                 raw_packets = self.gather_outbound_sack_packets(raw_packets);
                 raw_packets = self.gather_outbound_forward_tsn_packets(raw_packets);
                 (raw_packets, true)

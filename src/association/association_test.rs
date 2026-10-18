@@ -4914,3 +4914,48 @@ fn test_receive_capacity_detected_after_reading_last_complete_message() -> Resul
     )));
     Ok(())
 }
+
+#[test]
+fn test_receive_capacity_reports_exhaustion_after_forward_tsn_gap_closure() -> Result<()> {
+    let mut a =
+        create_association(TransportConfig::default().with_max_receive_buffer_size(32 * 1024));
+    a.set_state(AssociationState::Established);
+    a.use_forward_tsn = true;
+    a.peer_last_tsn = 0;
+    // TSN 1 is an abandoned message on stream 2. Stream 1's reliable message
+    // fills the receive budget while that missing TSN keeps the gap queue alive.
+    for tsn in 2..=33 {
+        receive_capacity_datagram(&mut a, receive_capacity_fragment(tsn, tsn == 2, false))?;
+    }
+    assert!(!a.is_closed());
+    assert_eq!(a.get_my_receiver_window_credit(), 0);
+    assert!(a.stream(1)?.read()?.is_none());
+    let forward = ChunkForwardTsn {
+        new_cumulative_tsn: 1,
+        streams: vec![ChunkForwardTsnStream {
+            identifier: 2,
+            sequence: 0,
+        }],
+    };
+    let packet = a.create_packet(vec![Box::new(forward)]).marshal()?;
+    a.handle_event(AssociationEvent(AssociationEventInner::Datagram(
+        Transmit {
+            now: Instant::now(),
+            remote: a.remote_addr(),
+            ecn: None,
+            local_ip: None,
+            payload: Payload::PartialDecode(crate::packet::PartialDecode::unmarshal(&packet)?),
+        },
+    )));
+    assert!(
+        a.is_closed(),
+        "FORWARD-TSN must reject the now-undrainable receive buffer"
+    );
+    assert!(core::iter::from_fn(|| a.poll()).any(|event| matches!(
+        event,
+        Event::AssociationLost {
+            reason: AssociationError::ReceiveBufferExhausted
+        }
+    )));
+    Ok(())
+}

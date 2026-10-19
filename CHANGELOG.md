@@ -1,5 +1,7 @@
 # Unreleased
 
+  * Keep timed-reliability writes compatible with existing APIs and start lifetimes from transmit polling #79
+
   * Suppress expired timed DATA and recover abandoned fragmented messages across shutdown #78
 
   * Expire pending timed messages before TSN assignment without ordered delivery gaps #77

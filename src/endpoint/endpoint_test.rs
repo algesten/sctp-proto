@@ -1280,13 +1280,11 @@ fn test_pending_timed_expiry_window_stall() -> Result<()> {
                 ReliabilityType::Timed,
                 10,
             )?;
-            assert_eq!(
-                pair.client_stream(client, 3)?.write(b"needs time"),
-                Err(Error::ErrTimedMessageRequiresTimestamp)
-            );
             while pair.client_conn_mut(client).poll().is_some() {}
             let old = vec![42; 3000];
-            pair.client_stream(client, 3)?.write_at(now, &old)?;
+            pair.client_stream(client, 3)?.write(&old)?;
+            // Start the lifetime while congestion credit still prevents transmission.
+            pair.client.drive(now, pair.server.addr);
             pair.client
                 .drive(now + Duration::from_millis(9), pair.server.addr);
             assert_eq!(pair.client_stream(client, 3)?.buffered_amount()?, old.len());

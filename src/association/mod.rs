@@ -4084,6 +4084,7 @@ impl Association {
     /// In particular, a blocked early chunk must not hide later expired DATA.
     fn expire_inflight_messages(&mut self, now: Instant) {
         if self.use_forward_tsn {
+            self.outbound_queue.start_timed_messages(now);
             let mut abandoned = false;
             for tsn in self.outbound_queue.expired_inflight(now) {
                 abandoned |= self.abandon_if_needed(tsn, now);
@@ -4102,7 +4103,7 @@ impl Association {
         }
     }
 
-    /// Evaluate retry candidates or messages whose submission deadline expired.
+    /// Evaluate retry candidates or messages whose lifetime expired.
     /// Abandoning a message also drops its unsent tail.
     fn abandon_if_needed(&mut self, tsn: u32, now: Instant) -> bool {
         let Some(c) = self.outbound_queue.get(tsn) else {

@@ -10,9 +10,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use bytes::Bytes;
 use core::fmt;
-use core::time::Duration;
 use log::{debug, error, trace};
-use std::time::Instant;
 
 /// Identifier for a stream within a particular association
 pub type StreamId = u16;
@@ -276,7 +274,7 @@ impl<'a> Stream<'a> {
 
     /// write_sctp writes len(p) bytes from p to the DTLS connection
     pub fn write_sctp(&mut self, p: &Bytes, ppi: PayloadProtocolIdentifier) -> Result<usize> {
-        self.write_source(&mut ByteSlice::from_slice(p), ppi, None)
+        self.write_source(&mut ByteSlice::from_slice(p), ppi)
     }
 
     /// Send data on the given stream.
@@ -292,7 +290,7 @@ impl<'a> Stream<'a> {
     ///
     /// Returns the number of bytes successfully written.
     pub fn write_with_ppi(&mut self, data: &[u8], ppi: PayloadProtocolIdentifier) -> Result<usize> {
-        self.write_source(&mut ByteSlice::from_slice(data), ppi, None)
+        self.write_source(&mut ByteSlice::from_slice(data), ppi)
     }
 
     /// write writes len(p) bytes from p with the default Payload Protocol Identifier
@@ -300,7 +298,6 @@ impl<'a> Stream<'a> {
         self.write_source(
             &mut ByteSlice::from_slice(p),
             self.get_default_payload_type()?,
-            None,
         )
     }
 
@@ -314,56 +311,6 @@ impl<'a> Stream<'a> {
         self.write_source(
             &mut BytesArray::from_chunks(data),
             self.get_default_payload_type()?,
-            None,
-        )
-    }
-
-    /// Submit a message at the caller's monotonic time, including pending time in its lifetime.
-    /// Timed messages expire at the deadline, including a zero lifetime at submission.
-    /// Use the same monotonic clock as association polling and timeouts. The lifetime includes
-    /// time waiting for congestion or receive-window credit, and the accepted policy remains
-    /// fixed when stream reliability settings change. Entirely unsent expired messages consume
-    /// no TSN or on-wire ordered sequence number.
-    ///
-    /// Untimestamped write methods return [`Error::ErrTimedMessageRequiresTimestamp`] for timed
-    /// user messages when partial reliability is negotiated. Reliable messages, DCEP, and the
-    /// non-negotiated reliable fallback can still use the untimestamped methods.
-    pub fn write_at(&mut self, now: Instant, data: &[u8]) -> Result<usize> {
-        self.write_with_ppi_at(now, data, self.get_default_payload_type()?)
-    }
-
-    /// Submit a message with an explicit protocol and submission time.
-    pub fn write_with_ppi_at(
-        &mut self,
-        now: Instant,
-        data: &[u8],
-        ppi: PayloadProtocolIdentifier,
-    ) -> Result<usize> {
-        self.write_source(&mut ByteSlice::from_slice(data), ppi, Some(now))
-    }
-
-    /// Submit a Bytes message with an explicit protocol and submission time.
-    pub fn write_sctp_at(
-        &mut self,
-        now: Instant,
-        p: &Bytes,
-        ppi: PayloadProtocolIdentifier,
-    ) -> Result<usize> {
-        self.write_with_ppi_at(now, p, ppi)
-    }
-
-    /// Submit a Bytes message at the caller's monotonic time.
-    pub fn write_chunk_at(&mut self, now: Instant, p: &Bytes) -> Result<usize> {
-        self.write_at(now, p)
-    }
-
-    /// Submit from buffers at the caller's monotonic time.
-    /// Consumes the same accepted prefix as [`Self::write_chunks`].
-    pub fn write_chunks_at(&mut self, now: Instant, data: &mut [Bytes]) -> Result<usize> {
-        self.write_source(
-            &mut BytesArray::from_chunks(data),
-            self.get_default_payload_type()?,
-            Some(now),
         )
     }
 
@@ -372,7 +319,6 @@ impl<'a> Stream<'a> {
         &mut self,
         source: &mut B,
         ppi: PayloadProtocolIdentifier,
-        now: Option<Instant>,
     ) -> Result<usize> {
         if !self.is_writable() {
             return Err(Error::ErrStreamClosed);
@@ -391,32 +337,12 @@ impl<'a> Stream<'a> {
             _ => {}
         };
 
-        if now.is_none()
-            && self.association.use_forward_tsn
-            && ppi != PayloadProtocolIdentifier::Dcep
-            && self
-                .association
-                .streams
-                .get(&self.stream_identifier)
-                .is_some_and(|s| s.reliability_type == ReliabilityType::Timed)
-        {
-            return Err(Error::ErrTimedMessageRequiresTimestamp);
-        }
-
         let (p, _) = source.pop_chunk(self.association.max_send_message_size() as usize);
 
         if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
             let (is_buffered_amount_high, mut chunks) = s.packetize(&p, ppi);
-            let deadline = if s.reliability_type == ReliabilityType::Timed {
-                now.and_then(|now| {
-                    now.checked_add(Duration::from_millis(s.reliability_value as u64))
-                })
-            } else {
-                None
-            };
             for chunk in &mut chunks {
                 chunk.reliability = Some((s.reliability_type, s.reliability_value));
-                chunk.deadline = deadline;
             }
             let queued = !chunks.is_empty();
             self.association.send_payload_data(chunks)?;
@@ -579,6 +505,10 @@ impl<'a> Stream<'a> {
     }
 
     /// set_reliability_params sets reliability parameters for this stream.
+    ///
+    /// Timed-message lifetimes start at the next [`Association::poll_transmit`], using its
+    /// caller-supplied time, and include waiting for send credit after that poll. Each
+    /// accepted message retains its reliability policy even if the stream settings change.
     pub fn set_reliability_params(
         &mut self,
         unordered: bool,

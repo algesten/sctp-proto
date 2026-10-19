@@ -17,6 +17,7 @@ pub(crate) struct OutboundQueue {
     pending: PendingQueue,
     inflight: PayloadQueue,
     next_message_id: u64,
+    next_unstarted_message_id: u64,
 }
 
 impl OutboundQueue {
@@ -39,6 +40,14 @@ impl OutboundQueue {
 
     pub(crate) fn peek_pending(&self) -> Option<&ChunkPayloadData> {
         self.pending.peek()
+    }
+
+    pub(crate) fn start_timed_messages(&mut self, now: Instant) {
+        if self.next_unstarted_message_id != self.next_message_id {
+            self.pending
+                .start_timed_messages(self.next_unstarted_message_id, now);
+            self.next_unstarted_message_id = self.next_message_id;
+        }
     }
 
     /// Discard an expired, entirely unsent head message without allocating a TSN.
@@ -67,6 +76,7 @@ impl OutboundQueue {
         next_tsn: &mut u32,
         now: Instant,
     ) -> Option<ChunkPayloadData> {
+        self.start_timed_messages(now);
         let c = self.pending.peek()?;
         let mut chunk = self.pending.pop(c.beginning_fragment, c.unordered)?;
         chunk.tsn = *next_tsn;

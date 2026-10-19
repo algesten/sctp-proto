@@ -1,6 +1,6 @@
 use super::*;
 
-fn timed_fixture(now: Instant, unordered: bool) -> Association {
+fn timed_fixture(unordered: bool) -> Association {
     let mut a = Association {
         state: AssociationState::Established,
         use_forward_tsn: true,
@@ -19,7 +19,7 @@ fn timed_fixture(now: Instant, unordered: bool) -> Association {
     stream
         .set_reliability_params(unordered, ReliabilityType::Timed, 10)
         .unwrap();
-    stream.write_at(now, b"abcdefghij").unwrap();
+    stream.write(b"abcdefghij").unwrap();
     a
 }
 
@@ -29,7 +29,7 @@ fn timed_recovery_obeys_exact_deadline() {
     for fast in [false, true] {
         for unordered in [false, true] {
             for delay in [9, 10, 20, 2_000] {
-                let mut a = timed_fixture(now, unordered);
+                let mut a = timed_fixture(unordered);
                 a.pop_pending_data_chunks_to_send(now);
                 for tsn in 1..=3 {
                     let c = a.outbound_queue.get_mut(tsn).unwrap();
@@ -59,7 +59,7 @@ fn timed_recovery_obeys_exact_deadline() {
 fn timed_expiry_is_not_hidden_by_window_or_fast_packet_limit() {
     let now = Instant::now();
     for fast in [false, true] {
-        let mut a = timed_fixture(now, false);
+        let mut a = timed_fixture(false);
         a.pop_pending_data_chunks_to_send(now);
         // An earlier reliable message exhausts the available send budget.
         let first = a.outbound_queue.get_mut(1).unwrap();
@@ -94,7 +94,7 @@ fn timed_expiry_is_not_hidden_by_window_or_fast_packet_limit() {
 fn timed_expiry_abandons_pending_tail_at_tsn_wrap_without_retry() {
     let now = Instant::now();
     for unordered in [false, true] {
-        let mut a = timed_fixture(now, unordered);
+        let mut a = timed_fixture(unordered);
         a.my_next_tsn = u32::MAX;
         a.cumulative_tsn_ack_point = u32::MAX - 1;
         a.advanced_peer_tsn_ack_point = u32::MAX - 1;
@@ -115,7 +115,7 @@ fn timed_expiry_abandons_pending_tail_at_tsn_wrap_without_retry() {
 fn timed_expiry_preserves_delivered_message_and_gap_acked_siblings() {
     let now = Instant::now();
     for all_delivered in [false, true] {
-        let mut a = timed_fixture(now, false);
+        let mut a = timed_fixture(false);
         a.pop_pending_data_chunks_to_send(now);
         let end = if all_delivered { 3 } else { 2 };
         for tsn in 1..=end {
@@ -145,7 +145,7 @@ fn timed_expiry_preserves_delivered_message_and_gap_acked_siblings() {
 fn timed_expiry_preserves_reliable_dcep_and_non_negotiated_traffic() {
     let now = Instant::now();
     for control in 0..3 {
-        let mut a = timed_fixture(now, false);
+        let mut a = timed_fixture(false);
         a.pop_pending_data_chunks_to_send(now);
         if control == 2 {
             a.use_forward_tsn = false;
@@ -173,7 +173,7 @@ fn timed_expiry_preserves_reliable_dcep_and_non_negotiated_traffic() {
 #[test]
 fn timed_expiry_uses_original_message_deadline_after_stream_changes() {
     let now = Instant::now();
-    let mut a = timed_fixture(now, false);
+    let mut a = timed_fixture(false);
     a.send_next_data_chunk(now).unwrap();
     a.stream(1)
         .unwrap()
@@ -199,7 +199,7 @@ fn timed_shutdown_retries_lost_forward_tsn() {
         AssociationState::ShutdownSent,
         AssociationState::ShutdownReceived,
     ] {
-        let mut a = timed_fixture(now, false);
+        let mut a = timed_fixture(false);
         a.gather_outbound(now);
         a.state = state;
         let later = now + Duration::from_secs(2);
@@ -235,7 +235,7 @@ fn timed_shutdown_retries_lost_forward_tsn() {
 #[test]
 fn timed_expiry_abandons_tail_after_entire_prefix_was_gap_acked() {
     let now = Instant::now();
-    let mut a = timed_fixture(now, false);
+    let mut a = timed_fixture(false);
     a.send_next_data_chunk(now).unwrap();
     let released = a.outbound_queue.mark_as_acked(1);
     a.streams
@@ -256,7 +256,7 @@ fn timed_expiry_abandons_tail_after_entire_prefix_was_gap_acked() {
 #[test]
 fn timed_expiry_retains_forward_recovery_after_prefix_cumulative_ack() {
     let now = Instant::now();
-    let mut a = timed_fixture(now, false);
+    let mut a = timed_fixture(false);
     a.send_next_data_chunk(now).unwrap();
     a.process_selective_ack(
         &ChunkSelectiveAck {
@@ -279,4 +279,47 @@ fn timed_expiry_retains_forward_recovery_after_prefix_cumulative_ack() {
     assert!(a.outbound_queue.is_abandoned(2));
     assert!(!a.gather_outbound_forward_tsn_packets(vec![]).is_empty());
     assert!(a.timers.get(Timer::T3RTX).is_some());
+}
+
+#[test]
+fn pending_timed_messages_keep_distinct_lifetimes_across_polls() {
+    let now = Instant::now();
+    let mut a = timed_fixture(false);
+    a.create_stream(2, false, PayloadProtocolIdentifier::Binary)
+        .unwrap();
+    let mut blocker = a.stream(2).unwrap();
+    blocker
+        .set_reliability_params(true, ReliabilityType::Reliable, 0)
+        .unwrap();
+    blocker.write(b"hold").unwrap();
+    a.cwnd = 4;
+    let chunks = a.pop_pending_data_chunks_to_send(now);
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].stream_identifier, 2);
+
+    a.stream(1).unwrap().write(b"new").unwrap();
+    assert!(
+        a.pop_pending_data_chunks_to_send(now + Duration::from_millis(5))
+            .is_empty()
+    );
+    assert_eq!(a.stream(1).unwrap().buffered_amount().unwrap(), 13);
+    assert!(
+        a.pop_pending_data_chunks_to_send(now + Duration::from_millis(10))
+            .is_empty()
+    );
+    assert_eq!(a.stream(1).unwrap().buffered_amount().unwrap(), 3);
+    assert_eq!(a.my_next_tsn, 2, "the unsent expired message needs no TSN");
+
+    a.cwnd = 100;
+    let chunks = a.pop_pending_data_chunks_to_send(now + Duration::from_millis(14));
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].user_data.as_ref(), b"new");
+    assert_eq!(chunks[0].stream_sequence_number, 0);
+    assert_eq!(chunks[0].deadline, Some(now + Duration::from_millis(15)));
+    assert!(
+        a.get_data_packets_to_retransmit(now + Duration::from_millis(15))
+            .is_empty()
+    );
+    assert!(a.outbound_queue.is_abandoned(2));
+    assert_eq!(a.stream(1).unwrap().buffered_amount().unwrap(), 0);
 }

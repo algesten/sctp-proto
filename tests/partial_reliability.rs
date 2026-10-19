@@ -540,6 +540,70 @@ fn unordered_abandonment_preserves_next_ordered_message() {
 }
 
 #[test]
+fn timed_streams_accept_existing_write_methods_after_idle() {
+    for unordered in [false, true] {
+        for method in 0..5 {
+            let (mut a, mut b) = pairs(ReliabilityType::Timed);
+            a.assoc
+                .stream(0)
+                .unwrap()
+                .set_reliability_params(unordered, ReliabilityType::Timed, 10)
+                .unwrap();
+            let base = Instant::now();
+            assert!(a.drain(base).is_empty());
+            let now = base + Duration::from_secs(3600);
+            let data = Bytes::from_static(b"timed message");
+            let mut stream = a.assoc.stream(0).unwrap();
+            let written = match method {
+                0 => stream.write(&data),
+                1 => stream.write_with_ppi(&data, PayloadProtocolIdentifier::Binary),
+                2 => stream.write_sctp(&data, PayloadProtocolIdentifier::Binary),
+                3 => stream.write_chunk(&data),
+                4 => stream.write_chunks(&mut [data.clone()]),
+                _ => unreachable!(),
+            };
+            assert_eq!(written.unwrap(), data.len());
+            for packet in a.drain(now) {
+                b.receive(now, a.addr, packet);
+            }
+            assert_eq!(b.messages(), vec![data.to_vec()]);
+        }
+    }
+}
+
+#[test]
+fn zero_lifetime_timed_writes_preserve_following_ordered_delivery() {
+    for unordered in [false, true] {
+        let (mut a, mut b) = pairs(ReliabilityType::Timed);
+        a.assoc
+            .stream(0)
+            .unwrap()
+            .set_reliability_params(unordered, ReliabilityType::Timed, 0)
+            .unwrap();
+        a.assoc.stream(0).unwrap().write(&vec![7; 3000]).unwrap();
+        a.assoc
+            .stream(0)
+            .unwrap()
+            .set_reliability_params(false, ReliabilityType::Reliable, 0)
+            .unwrap();
+        a.assoc
+            .stream(0)
+            .unwrap()
+            .write(b"following message")
+            .unwrap();
+        let now = Instant::now();
+        for packet in a.drain(now) {
+            b.receive(now, a.addr, packet);
+        }
+        assert_eq!(b.messages(), vec![b"following message".to_vec()]);
+        assert_eq!(
+            a.assoc.stream(0).unwrap().buffered_amount().unwrap(),
+            b"following message".len()
+        );
+    }
+}
+
+#[test]
 fn fragmented_timed_messages_expire_through_loss_and_reordering() {
     use std::collections::{HashMap, VecDeque};
     for unordered in [false, true] {
@@ -551,11 +615,7 @@ fn fragmented_timed_messages_expire_through_loss_and_reordering() {
                 .set_reliability_params(unordered, ReliabilityType::Timed, 10)
                 .unwrap();
             let base = Instant::now();
-            a.assoc
-                .stream(0)
-                .unwrap()
-                .write_at(base, &vec![7; size])
-                .unwrap();
+            a.assoc.stream(0).unwrap().write(&vec![7; size]).unwrap();
             a.assoc
                 .stream(0)
                 .unwrap()

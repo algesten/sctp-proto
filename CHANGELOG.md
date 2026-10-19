@@ -2,14 +2,12 @@
 
 # 0.10.7
 
-  * Keep timed-reliability writes compatible with existing APIs and start lifetimes from transmit polling #79
-
-  * Suppress expired timed DATA and recover abandoned fragmented messages across shutdown #78
-
+  * Keep timed-reliability writes compatible existing API #79
+  * Suppress expired timed DATA #78
   * Expire pending timed messages before TSN assignment without ordered delivery gaps #77
   * Eliminate front-shifting in payload and reassembly queues #73
-  * Report receive-buffer exhaustion explicitly when incomplete messages cannot be drained #74
-  * Add per-stream logical data-channel statistics and final snapshots across resets and association loss #75
+  * Report receive-buffer exhaustion when incomplete messages cannot be drained #74
+  * Add per-stream logical data-channel statistics #75
   * Correct PR-SCTP retry budgets, whole-message abandonment, and buffer release #76
 
 # 0.10.6

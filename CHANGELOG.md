@@ -1,5 +1,10 @@
 # Unreleased
 
+  * Hold an outgoing stream reset until the peer has acknowledged all DATA of the reset
+    streams, and carry the cumulative ack point as Sender's Last Assigned TSN, so the peer
+    performs the reset at once instead of deferring it. Keeps usrsctp peers (Firefox,
+    libdatachannel) out of their deferred-reset processing.
+
 # 0.10.7
 
   * Keep timed-reliability writes compatible existing API #79

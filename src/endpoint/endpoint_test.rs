@@ -25,7 +25,7 @@ use crate::chunk::chunk_shutdown_complete::ChunkShutdownComplete;
 use crate::chunk::{ErrorCauseProtocolViolation, PROTOCOL_VIOLATION};
 use crate::packet::{CommonHeader, Packet};
 use crate::param::param_outgoing_reset_request::ParamOutgoingResetRequest;
-use crate::param::param_reconfig_response::ParamReconfigResponse;
+use crate::param::param_reconfig_response::{ParamReconfigResponse, ReconfigResult};
 use crate::param::param_supported_address_types::ParamSupportedAddressTypes;
 use crate::param::param_type::ParamType;
 use assert_matches::assert_matches;
@@ -2620,36 +2620,19 @@ fn test_assoc_reset_inprogress_completed_via_tsn_advance_then_retransmit() -> Re
     // Withhold the DATA packets from the server (simulate loss).
     let withheld: Vec<_> = pair.server.inbound.drain(..).collect();
 
-    // Client initiates reset of stream 1.
-    pair.client_stream(client_ch, si)?.stop()?;
-
-    // Drive client to generate EOS data + RECONFIG packets.
-    pair.drive_client();
-
-    // Separate RECONFIG-bearing packets from DATA-only packets.
-    let (reconfig_packets, data_packets): (Vec<_>, Vec<_>) =
-        pair.server.inbound.drain(..).partition(|(_, _, raw)| {
-            let mut offset = 12usize;
-            while offset + 4 <= raw.len() {
-                if raw[offset] == 130 {
-                    return true;
-                }
-                let chunk_len = u16::from_be_bytes([raw[offset + 2], raw[offset + 3]]) as usize;
-                if chunk_len < 4 {
-                    break;
-                }
-                offset += (chunk_len + 3) & !3;
-            }
-            false
-        });
-
-    assert!(!reconfig_packets.is_empty(), "expected a RECONFIG packet");
+    // A reset of stream 1 sent ahead of the acknowledgement of that DATA, as
+    // a peer that does not wait for it would send it.
+    let reconfig_packet = (
+        pair.time,
+        None,
+        pair.client_conn_mut(client_ch)
+            .early_reset_request(vec![si])
+            .marshal()?,
+    );
 
     // Step 1: Deliver only the RECONFIG. Server hasn't seen the withheld
     // DATA so peer_last_tsn < sender_last_tsn → InProgress.
-    for pkt in &reconfig_packets {
-        pair.server.inbound.push_back(pkt.clone());
-    }
+    pair.server.inbound.push_back(reconfig_packet.clone());
     pair.drive_server();
 
     assert!(
@@ -2657,16 +2640,13 @@ fn test_assoc_reset_inprogress_completed_via_tsn_advance_then_retransmit() -> Re
         "stream should survive InProgress reset"
     );
 
-    // Step 2: Now deliver the withheld DATA + the other data packets.
+    // Step 2: Now deliver the withheld DATA.
     // The TSN-advance loop in handle_data will complete the pending
     // reconfig request (removing it from reconfig_requests).
     // Crucially, this does NOT go through handle_reconfig_param, so
     // max_completed_reconfig_rsn is only updated if the TSN-advance
     // path does it.
     for pkt in withheld {
-        pair.server.inbound.push_back(pkt);
-    }
-    for pkt in data_packets {
         pair.server.inbound.push_back(pkt);
     }
     pair.drive();
@@ -2696,9 +2676,7 @@ fn test_assoc_reset_inprogress_completed_via_tsn_advance_then_retransmit() -> Re
     // Step 4: Replay the original RECONFIG (simulating a late retransmission).
     // If the watermark was not updated during the TSN-advance completion,
     // this will bypass the dedup guard and destroy the new stream.
-    for pkt in reconfig_packets {
-        pair.server.inbound.push_back(pkt);
-    }
+    pair.server.inbound.push_back(reconfig_packet);
     pair.drive();
 
     // The new stream 1 must survive.
@@ -2734,38 +2712,19 @@ fn test_assoc_reset_inprogress_reconfig_retransmission() -> Result<()> {
     // Withhold the DATA packets from the server (simulate loss).
     let withheld: Vec<_> = pair.server.inbound.drain(..).collect();
 
-    // Client initiates reset of stream 1.
-    pair.client_stream(client_ch, si)?.stop()?;
+    // A reset of stream 1 sent ahead of the acknowledgement of that DATA, as
+    // a peer that does not wait for it would send it.
+    let reconfig_packet = (
+        pair.time,
+        None,
+        pair.client_conn_mut(client_ch)
+            .early_reset_request(vec![si])
+            .marshal()?,
+    );
 
-    // Drive client to generate EOS data + RECONFIG packets.
-    pair.drive_client();
-
-    // Separate RECONFIG-bearing packets from DATA-only packets.
-    // Chunk type is the first byte after the 12-byte common header.
-    let (reconfig_packets, data_packets): (Vec<_>, Vec<_>) =
-        pair.server.inbound.drain(..).partition(|(_, _, raw)| {
-            // Scan all chunks in the packet for CT_RECONFIG (130).
-            let mut offset = 12usize;
-            while offset + 4 <= raw.len() {
-                if raw[offset] == 130 {
-                    return true;
-                }
-                let chunk_len = u16::from_be_bytes([raw[offset + 2], raw[offset + 3]]) as usize;
-                if chunk_len < 4 {
-                    break;
-                }
-                offset += (chunk_len + 3) & !3; // pad to 4-byte boundary
-            }
-            false
-        });
-
-    assert!(!reconfig_packets.is_empty(), "expected a RECONFIG packet");
-
-    // Deliver only the RECONFIG packets. The server hasn't seen the withheld
+    // Deliver only the RECONFIG. The server hasn't seen the withheld
     // DATA so peer_last_tsn < sender_last_tsn → InProgress.
-    for pkt in &reconfig_packets {
-        pair.server.inbound.push_back(pkt.clone());
-    }
+    pair.server.inbound.push_back(reconfig_packet.clone());
     pair.drive_server();
 
     // Stream should still exist (reset is InProgress, not completed).
@@ -2776,13 +2735,8 @@ fn test_assoc_reset_inprogress_reconfig_retransmission() -> Result<()> {
 
     // Inject the RECONFIG again (simulating retransmission) together with
     // the withheld DATA so the TSN can finally advance.
-    for pkt in reconfig_packets {
-        pair.server.inbound.push_back(pkt);
-    }
+    pair.server.inbound.push_back(reconfig_packet);
     for pkt in withheld {
-        pair.server.inbound.push_back(pkt);
-    }
-    for pkt in data_packets {
         pair.server.inbound.push_back(pkt);
     }
 
@@ -2800,6 +2754,153 @@ fn test_assoc_reset_inprogress_reconfig_retransmission() -> Result<()> {
     assert!(
         pair.server_stream(server_ch, si).is_err(),
         "stream should retire after its boundary DATA is drained"
+    );
+
+    Ok(())
+}
+
+/// The Outgoing SSN Reset Requests and Re-configuration Response results in
+/// the packets queued for delivery to an endpoint.
+fn reconfig_traffic(
+    inbound: &VecDeque<(Instant, Option<EcnCodepoint>, Bytes)>,
+) -> (Vec<ParamOutgoingResetRequest>, Vec<ReconfigResult>) {
+    let mut requests = vec![];
+    let mut results = vec![];
+    for (_, _, raw) in inbound {
+        for chunk in Packet::unmarshal(raw).unwrap().chunks {
+            let Some(reconfig) = chunk.as_any().downcast_ref::<ChunkReconfig>() else {
+                continue;
+            };
+            for param in reconfig.param_a.iter().chain(reconfig.param_b.iter()) {
+                if let Some(request) = param.as_any().downcast_ref::<ParamOutgoingResetRequest>() {
+                    requests.push(request.clone());
+                }
+                if let Some(response) = param.as_any().downcast_ref::<ParamReconfigResponse>() {
+                    results.push(response.result);
+                }
+            }
+        }
+    }
+    (requests, results)
+}
+
+/// Stream ids whose reset the client reports complete.
+fn completed_resets(pair: &mut Pair, client_ch: AssociationHandle) -> Vec<u16> {
+    let mut ids: Vec<u16> = iter::from_fn(|| pair.client_conn_mut(client_ch).poll())
+        .filter_map(|event| match event {
+            Event::Stream(StreamEvent::ResetComplete { id }) => Some(id),
+            _ => None,
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// A lost DATA chunk must not make the peer defer the resets of streams closed
+/// back to back: the reset of the stream whose DATA is unacknowledged waits for
+/// the retransmission to be acknowledged, the other one leaves at once, and
+/// both carry a boundary the peer already has.
+#[test]
+fn test_assoc_reset_after_loss_is_never_deferred() -> Result<()> {
+    let lossy_si: u16 = 1;
+    let other_si: u16 = 2;
+
+    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    establish_session_pair(&mut pair, client_ch, server_ch, lossy_si)?;
+    establish_session_pair(&mut pair, client_ch, server_ch, other_si)?;
+
+    // Lose the DATA of one stream; the other stream's DATA is acknowledged.
+    let _ = pair.client_stream(client_ch, lossy_si)?.write_sctp(
+        &Bytes::from_static(b"lost"),
+        PayloadProtocolIdentifier::Binary,
+    )?;
+    pair.drive_client();
+    pair.server.inbound.clear();
+
+    // Close both streams back to back.
+    pair.client_stream(client_ch, lossy_si)?.close()?;
+    pair.client_stream(client_ch, other_si)?.close()?;
+    pair.drive_client();
+    let (requests, _) = reconfig_traffic(&pair.server.inbound);
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.stream_identifiers.clone())
+            .collect::<Vec<_>>(),
+        [vec![other_si]],
+        "only the stream without unacknowledged DATA may be reset right away"
+    );
+
+    // T3-rtx retransmits the lost DATA and the second reset follows its
+    // acknowledgement. The server performs every request at once.
+    let mut results = vec![];
+    loop {
+        let more = pair.step();
+        results.extend(reconfig_traffic(&pair.client.inbound).1);
+        if !more {
+            break;
+        }
+    }
+    assert!(
+        results.len() >= 2
+            && results
+                .iter()
+                .all(|r| *r == ReconfigResult::SuccessPerformed),
+        "every reset must be performed at once, never deferred: {results:?}"
+    );
+    assert_eq!(completed_resets(&mut pair, client_ch), [lossy_si, other_si]);
+
+    Ok(())
+}
+
+/// A reset of a stream whose unacknowledged DATA was abandoned (PR-SCTP) is
+/// released by the FORWARD-TSN exchange, which advances the ack point past
+/// the abandoned chunk.
+#[test]
+fn test_assoc_reset_follows_abandoned_data() -> Result<()> {
+    let si: u16 = 1;
+
+    let (mut pair, client_ch, server_ch) = create_association_pair(AckMode::NoDelay, 0)?;
+    establish_session_pair(&mut pair, client_ch, server_ch, si)?;
+    let datas_received = pair.server_conn_mut(server_ch).stats.get_num_datas();
+
+    // Abandoned after its first transmission, which is lost.
+    pair.client_stream(client_ch, si)?
+        .set_reliability_params(false, ReliabilityType::Rexmit, 0)?;
+    let _ = pair.client_stream(client_ch, si)?.write_sctp(
+        &Bytes::from_static(b"abandoned"),
+        PayloadProtocolIdentifier::Binary,
+    )?;
+    pair.drive_client();
+    pair.server.inbound.clear();
+
+    pair.client_stream(client_ch, si)?.close()?;
+    pair.drive_client();
+    assert!(
+        reconfig_traffic(&pair.server.inbound).0.is_empty(),
+        "the reset waits until the ack point covers the abandoned DATA"
+    );
+
+    let mut results = vec![];
+    loop {
+        let more = pair.step();
+        results.extend(reconfig_traffic(&pair.client.inbound).1);
+        if !more {
+            break;
+        }
+    }
+    assert!(
+        !results.is_empty()
+            && results
+                .iter()
+                .all(|r| *r == ReconfigResult::SuccessPerformed),
+        "the reset must be performed at once, never deferred: {results:?}"
+    );
+    assert_eq!(completed_resets(&mut pair, client_ch), [si]);
+    assert_eq!(
+        pair.server_conn_mut(server_ch).stats.get_num_datas(),
+        datas_received,
+        "the abandoned DATA is never delivered; FORWARD-TSN advanced the ack point"
     );
 
     Ok(())

@@ -1,6 +1,6 @@
 # Unreleased
 
-  * Avoid usrsctp connection aborts during stream resets #80
+  * Wait for data acknowledgements before resetting streams #80
 
 # 0.10.7
 

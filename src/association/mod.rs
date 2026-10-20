@@ -3377,6 +3377,11 @@ impl Association {
         // until the reciprocal is acknowledged (handle_reconfig_param) or
         // abandoned (on_retransmission_failure).
         if !sis_to_reset.is_empty() {
+            // The reciprocal also satisfies local closes still waiting for DATA
+            // acknowledgements. Keep one reset for this outgoing generation.
+            self.pending_reset_streams
+                .retain(|id| !sis_to_reset.contains(id));
+
             let rsn = self.generate_next_rsn();
             // Refreshed when the request is actually sent (refresh_unsent_reconfig).
             let tsn = self.cumulative_tsn_ack_point;

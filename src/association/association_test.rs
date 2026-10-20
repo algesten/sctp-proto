@@ -1129,6 +1129,78 @@ fn test_reciprocal_reset_covers_preexisting_pending_data() -> Result<()> {
 }
 
 #[test]
+fn test_peer_reset_subsumes_local_reset_waiting_for_data_ack() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association {
+        state: AssociationState::Established,
+        my_next_tsn: 2,
+        my_next_rsn: 1,
+        cwnd: 1400,
+        rwnd: 1400,
+        mtu: 1400,
+        ..Default::default()
+    };
+    assert!(
+        a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
+            .is_some()
+    );
+    queue_inflight(
+        &mut a,
+        ChunkPayloadData {
+            tsn: 1,
+            stream_identifier: stream_id,
+            user_data: Bytes::from_static(b"inflight"),
+            ..Default::default()
+        },
+    );
+    a.stream(stream_id)?.close()?;
+    let now = Instant::now();
+    let _ = a.gather_outbound(now);
+
+    // The peer independently closes the same stream before it has received
+    // our outgoing reset. Its request queues a reciprocal for our direction.
+    let request: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 7,
+        reconfig_response_sequence_number: 0,
+        sender_last_tsn: a.peer_last_tsn,
+        stream_identifiers: vec![stream_id],
+    });
+    let mut reply = vec![];
+    a.handle_reconfig_param(&request, &mut reply)?;
+    a.control_queue.extend(reply);
+    a.handle_sack(
+        &ChunkSelectiveAck {
+            cumulative_tsn_ack: 1,
+            advertised_receiver_window_credit: 1400,
+            ..Default::default()
+        },
+        now,
+    )?;
+
+    // Complete every concrete request produced by the simultaneous close.
+    // No later application reset has started, so ResetComplete must allow reuse.
+    while !a.reconfigs.is_empty() {
+        let _ = a.gather_outbound(now);
+        let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+            reconfig_response_sequence_number: a.active_reconfig.unwrap(),
+            result: ReconfigResult::SuccessPerformed,
+        });
+        a.handle_reconfig_param(&response, &mut vec![])?;
+    }
+    assert!(core::iter::from_fn(|| a.poll()).any(|event| matches!(
+        event,
+        Event::Stream(StreamEvent::ResetComplete { id }) if id == stream_id
+    )));
+    assert_eq!(
+        a.open_stream(stream_id, PayloadProtocolIdentifier::Binary)
+            .map(|_| ()),
+        Ok(()),
+        "a completed simultaneous close must not leave an older local reset queued"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_queued_reset_is_sent_when_pending_timed_data_expires() -> Result<()> {
     let now = Instant::now();
     let stream_id = 1;

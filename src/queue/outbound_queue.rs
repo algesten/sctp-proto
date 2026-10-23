@@ -192,6 +192,10 @@ impl OutboundQueue {
         self.pending.contains_stream(stream)
     }
 
+    pub(crate) fn contains_stream(&self, stream: u16) -> bool {
+        self.pending_contains_stream(stream) || self.inflight.contains_stream(stream)
+    }
+
     pub(crate) fn pending_len(&self) -> usize {
         self.pending.len()
     }

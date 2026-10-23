@@ -1248,20 +1248,41 @@ impl Association {
         }
     }
 
-    fn reconfig_has_pending_data(&self, rsn: u32) -> bool {
+    /// Whether DATA of this stream is still queued or not yet cumulatively
+    /// acknowledged by the peer.
+    fn stream_has_unacked_data(&self, stream_id: StreamId) -> bool {
+        self.outbound_queue.contains_stream(stream_id)
+    }
+
+    /// Whether DATA of the streams covered by an outgoing reset request is
+    /// still queued or not yet cumulatively acknowledged by the peer.
+    ///
+    /// An Outgoing SSN Reset Request is held while that is the case. Its
+    /// Sender's Last Assigned TSN stays the last TSN assigned (RFC 6525
+    /// section 5.1.2, A3), so the peer may still defer the request behind
+    /// DATA of other streams it has not received yet (section 5.2.2, E2).
+    /// The wait guarantees that no DATA of the reset streams themselves is
+    /// outstanding when the peer processes the request. usrsctp (Firefox,
+    /// libdatachannel) parks the DATA of every stream while a reset is
+    /// deferred and can later hand it to the wrong stream generation, which
+    /// aborts the association (sctplab/usrsctp#760). Closing a stream right
+    /// after writing to it, with that DATA lost, is the reported trigger.
+    fn reconfig_has_unacked_data(&self, rsn: u32) -> bool {
         self.reconfigs.get(&rsn).is_some_and(|c| {
             let stream_ids = Self::reconfig_stream_ids(c);
             if stream_ids.is_empty() {
-                self.outbound_queue.pending_len() != 0
+                self.outbound_queue.pending_len() != 0 || self.outbound_queue.inflight_len() != 0
             } else {
                 stream_ids
                     .iter()
-                    .any(|id| self.outbound_queue.pending_contains_stream(*id))
+                    .any(|id| self.stream_has_unacked_data(*id))
             }
         })
     }
 
     fn refresh_unsent_reconfig(&mut self, rsn: u32) -> Option<Packet> {
+        // Fixed at send time so it covers DATA that received a TSN after the
+        // request was queued (RFC 6525 section 5.1.2, A3).
         let sender_last_tsn = self.my_next_tsn.wrapping_sub(1);
         let reconfig = self
             .reconfigs
@@ -3357,7 +3378,13 @@ impl Association {
         // until the reciprocal is acknowledged (handle_reconfig_param) or
         // abandoned (on_retransmission_failure).
         if !sis_to_reset.is_empty() {
+            // The reciprocal also satisfies local closes still waiting for DATA
+            // acknowledgements. Keep one reset for this outgoing generation.
+            self.pending_reset_streams
+                .retain(|id| !sis_to_reset.contains(id));
+
             let rsn = self.generate_next_rsn();
+            // Refreshed when the request is actually sent (refresh_unsent_reconfig).
             let tsn = self.my_next_tsn.wrapping_sub(1);
             let reset_all = p.stream_identifiers.is_empty();
             self.reconfig_reset_streams
@@ -3496,9 +3523,8 @@ impl Association {
                 // Decide fast-recovery abandonment before selecting any pending tail.
                 raw_packets = self.gather_outbound_fast_retransmission_packets(raw_packets, now);
                 raw_packets = self.gather_outbound_data_and_reconfig_packets(raw_packets, now);
-                // A queued reciprocal reset may have been held back until the
-                // DATA it covers received TSNs above. Give it another chance in
-                // this same poll so DATA and RE-CONFIG can leave together.
+                // Pending timed DATA can expire without receiving a TSN. Release
+                // any reset it was holding back in this same poll.
                 raw_packets = self.gather_outbound_control_packets(raw_packets, now);
                 raw_packets = self.gather_outbound_sack_packets(raw_packets);
                 raw_packets = self.gather_outbound_forward_tsn_packets(raw_packets);
@@ -3546,8 +3572,9 @@ impl Association {
                 }
 
                 // The reset boundary cannot be fixed until all already-queued
-                // DATA for the affected streams has received a TSN.
-                if outgoing_rsn.is_some_and(|rsn| self.reconfig_has_pending_data(rsn)) {
+                // DATA for the affected streams has received a TSN, and the
+                // request waits until the peer has acknowledged that DATA.
+                if outgoing_rsn.is_some_and(|rsn| self.reconfig_has_unacked_data(rsn)) {
                     request_blocked = true;
                     buffered.push_back(p);
                     continue;
@@ -3653,22 +3680,19 @@ impl Association {
             && self.reconfigs.is_empty()
             && !self.pending_reset_streams.is_empty()
         {
-            // DATA on an unrelated stream must not starve a reset, nor should
-            // one busy stream hold back ready reset requests for other streams.
-            let outbound_queue = &self.outbound_queue;
-            let mut stream_ids = vec![];
-            self.pending_reset_streams.retain(|id| {
-                if outbound_queue.pending_contains_stream(*id) {
-                    true
-                } else {
-                    stream_ids.push(*id);
-                    false
-                }
-            });
-
+            // DATA on an unrelated stream must not starve a reset. A stream is
+            // ready once the peer has acknowledged all of its DATA.
+            let stream_ids: Vec<StreamId> = self
+                .pending_reset_streams
+                .iter()
+                .copied()
+                .filter(|id| !self.stream_has_unacked_data(*id))
+                .collect();
             if stream_ids.is_empty() {
                 return raw_packets;
             }
+            self.pending_reset_streams
+                .retain(|id| !stream_ids.contains(id));
 
             let rsn = self.generate_next_rsn();
             let tsn = self.my_next_tsn.wrapping_sub(1);
@@ -4421,6 +4445,26 @@ impl Association {
 
             _ => {}
         }
+    }
+
+    /// An Outgoing SSN Reset Request for `stream_ids`, as a peer that does
+    /// not wait for the DATA of those streams to be acknowledged sends it.
+    /// Tests use it to drive the receiving side's deferred (InProgress)
+    /// handling with the reset stream's own DATA missing, which this
+    /// implementation's own requests avoid: they only meet deferral when
+    /// DATA of another stream is still missing at the peer.
+    #[cfg(test)]
+    pub(crate) fn early_reset_request(&mut self, stream_ids: Vec<StreamId>) -> Packet {
+        let rsn = self.generate_next_rsn();
+        self.create_packet(vec![Box::new(ChunkReconfig {
+            param_a: Some(Box::new(ParamOutgoingResetRequest {
+                reconfig_request_sequence_number: rsn,
+                reconfig_response_sequence_number: self.peer_last_reconfig_rsn,
+                sender_last_tsn: self.my_next_tsn.wrapping_sub(1),
+                stream_identifiers: stream_ids,
+            })),
+            param_b: None,
+        })])
     }
 
     /// Whether no timers are running

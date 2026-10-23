@@ -1014,6 +1014,80 @@ fn test_reset_sender_last_tsn_wraps_at_zero() -> Result<()> {
     Ok(())
 }
 
+/// An association whose last assigned TSN (100, on stream 2) is still
+/// unacknowledged: the ack point is 99 and the next TSN to assign is 101.
+fn association_with_unacked_data_on_stream_2() -> Association {
+    let mut a = Association {
+        state: AssociationState::Established,
+        my_next_tsn: 101,
+        cumulative_tsn_ack_point: 99,
+        mtu: 1400,
+        ..Default::default()
+    };
+    queue_inflight(
+        &mut a,
+        ChunkPayloadData {
+            tsn: 100,
+            stream_identifier: 2,
+            user_data: Bytes::from_static(b"unacknowledged"),
+            ..Default::default()
+        },
+    );
+    a
+}
+
+fn sender_last_tsn(a: &Association, rsn: u32) -> u32 {
+    a.reconfigs
+        .get(&rsn)
+        .unwrap()
+        .param_a
+        .as_ref()
+        .and_then(|param| param.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+        .unwrap()
+        .sender_last_tsn
+}
+
+/// RFC 6525 section 5.1.2, A3: the Sender's Last Assigned TSN is the next
+/// TSN to assign minus one, even while DATA of another stream below it is
+/// still unacknowledged. The cumulative ack point is not a substitute.
+#[test]
+fn test_reset_sender_last_tsn_is_last_assigned_not_ack_point() -> Result<()> {
+    let idle_stream_id = 1;
+    let mut a = association_with_unacked_data_on_stream_2();
+    a.send_reset_request(idle_stream_id)?;
+
+    let _ = a.gather_outbound(Instant::now());
+
+    let rsn = a
+        .active_reconfig
+        .expect("unacknowledged DATA of another stream must not hold back this reset");
+    assert_eq!(
+        sender_last_tsn(&a, rsn),
+        100,
+        "RFC 6525 section 5.1.2, A3: the last assigned TSN, not the ack point"
+    );
+    Ok(())
+}
+
+/// The same requirement holds for a request that waited in the control queue
+/// and is refreshed when it is finally sent.
+#[test]
+fn test_queued_reset_sender_last_tsn_is_last_assigned_not_ack_point() -> Result<()> {
+    let idle_stream_id = 1;
+    let mut a = association_with_unacked_data_on_stream_2();
+    insert_queued_reset(&mut a, 7, idle_stream_id);
+
+    let _ = a.gather_outbound(Instant::now());
+
+    assert_eq!(a.active_reconfig, Some(7));
+    assert_eq!(
+        sender_last_tsn(&a, 7),
+        100,
+        "RFC 6525 section 5.1.2, A3: the last assigned TSN, not the ack point"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_reset_request_sequence_number_wraps() -> Result<()> {
     let stream_id = 1;
@@ -1100,7 +1174,8 @@ fn test_reciprocal_reset_covers_preexisting_pending_data() -> Result<()> {
 
     // Receiving the peer's outgoing reset creates a reciprocal outgoing reset.
     // DATA accepted before that request must be assigned a TSN covered by the
-    // reciprocal request's Sender's Last Assigned TSN boundary.
+    // reciprocal request's Sender's Last Assigned TSN boundary, so the request
+    // waits until the peer has acknowledged that DATA.
     let request: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
         reconfig_request_sequence_number: 7,
         reconfig_response_sequence_number: u32::MAX,
@@ -1111,9 +1186,35 @@ fn test_reciprocal_reset_covers_preexisting_pending_data() -> Result<()> {
     a.handle_reconfig_param(&request, &mut reply)?;
     a.control_queue.extend(reply);
 
-    let _ = a.gather_outbound(Instant::now());
+    let now = Instant::now();
+    let _ = a.gather_outbound(now);
 
     let data_tsn = a.outbound_queue.get(1).unwrap().tsn;
+    assert!(
+        a.active_reconfig.is_none(),
+        "the reciprocal reset must wait for the acknowledgement of DATA queued before the reset"
+    );
+    assert_eq!(a.control_queue.len(), 1);
+
+    // The DATA is in flight now. A further poll must still hold the request:
+    // the boundary needs the peer's acknowledgement, not only a TSN.
+    let _ = a.gather_outbound(now);
+    assert!(
+        a.active_reconfig.is_none(),
+        "the reciprocal reset must stay held while the DATA is in flight"
+    );
+    assert_eq!(a.control_queue.len(), 1);
+
+    a.handle_sack(
+        &ChunkSelectiveAck {
+            cumulative_tsn_ack: data_tsn,
+            advertised_receiver_window_credit: 1400,
+            ..Default::default()
+        },
+        now,
+    )?;
+    let _ = a.gather_outbound(now);
+
     let reciprocal = a
         .reconfigs
         .get(&a.active_reconfig.unwrap())
@@ -1122,10 +1223,119 @@ fn test_reciprocal_reset_covers_preexisting_pending_data() -> Result<()> {
         .as_ref()
         .and_then(|param| param.as_any().downcast_ref::<ParamOutgoingResetRequest>())
         .unwrap();
-    assert!(
-        sna32gte(reciprocal.sender_last_tsn, data_tsn),
+    assert_eq!(
+        reciprocal.sender_last_tsn, data_tsn,
         "the reciprocal reset boundary must cover DATA queued before the reset"
     );
+    Ok(())
+}
+
+#[test]
+fn test_peer_reset_subsumes_local_reset_waiting_for_data_ack() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association {
+        state: AssociationState::Established,
+        my_next_tsn: 2,
+        my_next_rsn: 1,
+        cwnd: 1400,
+        rwnd: 1400,
+        mtu: 1400,
+        ..Default::default()
+    };
+    assert!(
+        a.create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
+            .is_some()
+    );
+    queue_inflight(
+        &mut a,
+        ChunkPayloadData {
+            tsn: 1,
+            stream_identifier: stream_id,
+            user_data: Bytes::from_static(b"inflight"),
+            ..Default::default()
+        },
+    );
+    a.stream(stream_id)?.close()?;
+    let now = Instant::now();
+    let _ = a.gather_outbound(now);
+
+    // The peer independently closes the same stream before it has received
+    // our outgoing reset. Its request queues a reciprocal for our direction.
+    let request: Box<dyn Param + Send + Sync> = Box::new(ParamOutgoingResetRequest {
+        reconfig_request_sequence_number: 7,
+        reconfig_response_sequence_number: 0,
+        sender_last_tsn: a.peer_last_tsn,
+        stream_identifiers: vec![stream_id],
+    });
+    let mut reply = vec![];
+    a.handle_reconfig_param(&request, &mut reply)?;
+    a.control_queue.extend(reply);
+    a.handle_sack(
+        &ChunkSelectiveAck {
+            cumulative_tsn_ack: 1,
+            advertised_receiver_window_credit: 1400,
+            ..Default::default()
+        },
+        now,
+    )?;
+
+    // Complete every concrete request produced by the simultaneous close.
+    // No later application reset has started, so ResetComplete must allow reuse.
+    while !a.reconfigs.is_empty() {
+        let _ = a.gather_outbound(now);
+        let response: Box<dyn Param + Send + Sync> = Box::new(ParamReconfigResponse {
+            reconfig_response_sequence_number: a.active_reconfig.unwrap(),
+            result: ReconfigResult::SuccessPerformed,
+        });
+        a.handle_reconfig_param(&response, &mut vec![])?;
+    }
+    assert!(core::iter::from_fn(|| a.poll()).any(|event| matches!(
+        event,
+        Event::Stream(StreamEvent::ResetComplete { id }) if id == stream_id
+    )));
+    assert_eq!(
+        a.open_stream(stream_id, PayloadProtocolIdentifier::Binary)
+            .map(|_| ()),
+        Ok(()),
+        "a completed simultaneous close must not leave an older local reset queued"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_queued_reset_is_sent_when_pending_timed_data_expires() -> Result<()> {
+    let now = Instant::now();
+    let stream_id = 1;
+    let mut a = Association {
+        state: AssociationState::Established,
+        use_forward_tsn: true,
+        my_next_tsn: 1,
+        max_send_message_size: 100,
+        max_payload_size: 100,
+        cwnd: 1400,
+        rwnd: 1400,
+        mtu: 1400,
+        ..Default::default()
+    };
+    let mut stream = a
+        .create_stream(stream_id, false, PayloadProtocolIdentifier::Binary)
+        .unwrap();
+    stream.set_reliability_params(false, ReliabilityType::Timed, 0)?;
+    stream.write(b"expires before transmission")?;
+    insert_queued_reset(&mut a, 7, stream_id);
+
+    let (packets, _) = a.gather_outbound(now);
+
+    assert_eq!(a.outbound_queue.pending_len(), 0);
+    assert_eq!(a.outbound_queue.inflight_len(), 0);
+    assert_eq!(a.my_next_tsn, 1, "expired DATA must not receive a TSN");
+    assert!(
+        packets.iter().any(|raw| {
+            Association::packet_reconfig_request_rsn(&Packet::unmarshal(raw).unwrap()) == Some(7)
+        }),
+        "expiring pending DATA must release the queued reset in the same poll"
+    );
+    assert_eq!(a.active_reconfig, Some(7));
     Ok(())
 }
 
@@ -3158,15 +3368,6 @@ fn test_blocked_reconfig_does_not_allow_later_rsn_to_overtake() {
         mtu: 1400,
         ..Default::default()
     };
-    queue_inflight(
-        &mut a,
-        ChunkPayloadData {
-            tsn: 0,
-            stream_identifier: 2,
-            user_data: Bytes::from_static(b"inflight"),
-            ..Default::default()
-        },
-    );
     queue_pending(
         &mut a,
         ChunkPayloadData {
@@ -3180,7 +3381,8 @@ fn test_blocked_reconfig_does_not_allow_later_rsn_to_overtake() {
     insert_queued_reset(&mut a, 7, 1);
     insert_queued_reset(&mut a, 8, 2);
 
-    let _ = a.gather_outbound(Instant::now());
+    let now = Instant::now();
+    let _ = a.gather_outbound(now);
     assert!(
         a.active_reconfig.is_none(),
         "RSN 8 must not overtake RSN 7 while RSN 7 waits for its DATA boundary"
@@ -3189,7 +3391,23 @@ fn test_blocked_reconfig_does_not_allow_later_rsn_to_overtake() {
 
     a.cwnd = 1400;
     a.rwnd = 1400;
-    let _ = a.gather_outbound(Instant::now());
+    let _ = a.gather_outbound(now);
+    assert!(
+        a.active_reconfig.is_none(),
+        "RSN 8 must not overtake RSN 7 while RSN 7 waits for its DATA to be acknowledged"
+    );
+    assert_eq!(a.control_queue.len(), 2);
+
+    a.handle_sack(
+        &ChunkSelectiveAck {
+            cumulative_tsn_ack: 1,
+            advertised_receiver_window_credit: 1400,
+            ..Default::default()
+        },
+        now,
+    )
+    .unwrap();
+    let _ = a.gather_outbound(now);
     assert_eq!(a.active_reconfig, Some(7));
     assert_eq!(a.control_queue.len(), 1);
 }

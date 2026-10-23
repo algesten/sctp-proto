@@ -1,5 +1,7 @@
 # Unreleased
 
+  * Wait for data acknowledgements before resetting streams #80
+
 # 0.10.7
 
   * Keep timed-reliability writes compatible existing API #79

@@ -193,6 +193,12 @@ impl PayloadQueue {
         self.chunk_map.len()
     }
 
+    pub(crate) fn contains_stream(&self, stream_identifier: u16) -> bool {
+        self.chunk_map
+            .values()
+            .any(|chunk| chunk.stream_identifier == stream_identifier)
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }

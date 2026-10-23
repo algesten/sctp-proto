@@ -1257,15 +1257,16 @@ impl Association {
     /// Whether DATA of the streams covered by an outgoing reset request is
     /// still queued or not yet cumulatively acknowledged by the peer.
     ///
-    /// An Outgoing SSN Reset Request is held while that is the case and then
-    /// carries the cumulative ack point as its Sender's Last Assigned TSN,
-    /// rather than the last TSN assigned (RFC 6525 section 4.1). That is valid
-    /// because no DATA of the reset streams lies above the ack point, and the
-    /// peer's cumulative TSN already covers it, so the peer performs the reset
-    /// at once instead of deferring it (RFC 6525 section 5.2.2, E2). usrsctp
-    /// (Firefox, libdatachannel) holds back the DATA of every stream while a
-    /// reset is deferred and can hand it to the wrong stream generation, which
-    /// aborts the association.
+    /// An Outgoing SSN Reset Request is held while that is the case. Its
+    /// Sender's Last Assigned TSN stays the last TSN assigned (RFC 6525
+    /// section 5.1.2, A3), so the peer may still defer the request behind
+    /// DATA of other streams it has not received yet (section 5.2.2, E2).
+    /// The wait guarantees that no DATA of the reset streams themselves is
+    /// outstanding when the peer processes the request. usrsctp (Firefox,
+    /// libdatachannel) parks the DATA of every stream while a reset is
+    /// deferred and can later hand it to the wrong stream generation, which
+    /// aborts the association (sctplab/usrsctp#760). Closing a stream right
+    /// after writing to it, with that DATA lost, is the reported trigger.
     fn reconfig_has_unacked_data(&self, rsn: u32) -> bool {
         self.reconfigs.get(&rsn).is_some_and(|c| {
             let stream_ids = Self::reconfig_stream_ids(c);
@@ -1280,9 +1281,9 @@ impl Association {
     }
 
     fn refresh_unsent_reconfig(&mut self, rsn: u32) -> Option<Packet> {
-        // All DATA of the reset streams is acknowledged by now
-        // (`reconfig_has_unacked_data`), so the ack point covers it.
-        let sender_last_tsn = self.cumulative_tsn_ack_point;
+        // Fixed at send time so it covers DATA that received a TSN after the
+        // request was queued (RFC 6525 section 5.1.2, A3).
+        let sender_last_tsn = self.my_next_tsn.wrapping_sub(1);
         let reconfig = self
             .reconfigs
             .get(&rsn)
@@ -3384,7 +3385,7 @@ impl Association {
 
             let rsn = self.generate_next_rsn();
             // Refreshed when the request is actually sent (refresh_unsent_reconfig).
-            let tsn = self.cumulative_tsn_ack_point;
+            let tsn = self.my_next_tsn.wrapping_sub(1);
             let reset_all = p.stream_identifiers.is_empty();
             self.reconfig_reset_streams
                 .insert(rsn, sis_to_reset.clone());
@@ -3694,7 +3695,7 @@ impl Association {
                 .retain(|id| !stream_ids.contains(id));
 
             let rsn = self.generate_next_rsn();
-            let tsn = self.cumulative_tsn_ack_point;
+            let tsn = self.my_next_tsn.wrapping_sub(1);
             debug!(
                 "[{}] sending RECONFIG: rsn={} tsn={} streams={:?}",
                 self.side, rsn, tsn, stream_ids
@@ -4446,11 +4447,12 @@ impl Association {
         }
     }
 
-    /// An Outgoing SSN Reset Request for `stream_ids` bounded by the last
-    /// assigned TSN, as a peer that does not wait for its DATA to be
-    /// acknowledged sends it. Tests use it to drive the receiving side's
-    /// deferred (InProgress) handling, which this implementation's own
-    /// requests no longer trigger.
+    /// An Outgoing SSN Reset Request for `stream_ids`, as a peer that does
+    /// not wait for the DATA of those streams to be acknowledged sends it.
+    /// Tests use it to drive the receiving side's deferred (InProgress)
+    /// handling with the reset stream's own DATA missing, which this
+    /// implementation's own requests avoid: they only meet deferral when
+    /// DATA of another stream is still missing at the peer.
     #[cfg(test)]
     pub(crate) fn early_reset_request(&mut self, stream_ids: Vec<StreamId>) -> Packet {
         let rsn = self.generate_next_rsn();

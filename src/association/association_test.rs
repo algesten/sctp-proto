@@ -987,6 +987,108 @@ fn test_local_reset_is_not_blocked_by_unrelated_pending_data() -> Result<()> {
 }
 
 #[test]
+fn test_reset_sender_last_tsn_wraps_at_zero() -> Result<()> {
+    let stream_id = 1;
+    let mut a = Association {
+        state: AssociationState::Established,
+        my_next_tsn: 0,
+        ..Default::default()
+    };
+    a.send_reset_request(stream_id)?;
+
+    let _ = a.gather_outbound(Instant::now());
+
+    let reset = a
+        .reconfigs
+        .get(&a.active_reconfig.unwrap())
+        .unwrap()
+        .param_a
+        .as_ref()
+        .and_then(|param| param.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+        .unwrap();
+    assert_eq!(
+        reset.sender_last_tsn,
+        u32::MAX,
+        "the TSN preceding zero must wrap to u32::MAX"
+    );
+    Ok(())
+}
+
+/// An association whose last assigned TSN (100, on stream 2) is still
+/// unacknowledged: the ack point is 99 and the next TSN to assign is 101.
+fn association_with_unacked_data_on_stream_2() -> Association {
+    let mut a = Association {
+        state: AssociationState::Established,
+        my_next_tsn: 101,
+        cumulative_tsn_ack_point: 99,
+        mtu: 1400,
+        ..Default::default()
+    };
+    queue_inflight(
+        &mut a,
+        ChunkPayloadData {
+            tsn: 100,
+            stream_identifier: 2,
+            user_data: Bytes::from_static(b"unacknowledged"),
+            ..Default::default()
+        },
+    );
+    a
+}
+
+fn sender_last_tsn(a: &Association, rsn: u32) -> u32 {
+    a.reconfigs
+        .get(&rsn)
+        .unwrap()
+        .param_a
+        .as_ref()
+        .and_then(|param| param.as_any().downcast_ref::<ParamOutgoingResetRequest>())
+        .unwrap()
+        .sender_last_tsn
+}
+
+/// RFC 6525 section 5.1.2, A3: the Sender's Last Assigned TSN is the next
+/// TSN to assign minus one, even while DATA of another stream below it is
+/// still unacknowledged. The cumulative ack point is not a substitute.
+#[test]
+fn test_reset_sender_last_tsn_is_last_assigned_not_ack_point() -> Result<()> {
+    let idle_stream_id = 1;
+    let mut a = association_with_unacked_data_on_stream_2();
+    a.send_reset_request(idle_stream_id)?;
+
+    let _ = a.gather_outbound(Instant::now());
+
+    let rsn = a
+        .active_reconfig
+        .expect("unacknowledged DATA of another stream must not hold back this reset");
+    assert_eq!(
+        sender_last_tsn(&a, rsn),
+        100,
+        "RFC 6525 section 5.1.2, A3: the last assigned TSN, not the ack point"
+    );
+    Ok(())
+}
+
+/// The same requirement holds for a request that waited in the control queue
+/// and is refreshed when it is finally sent.
+#[test]
+fn test_queued_reset_sender_last_tsn_is_last_assigned_not_ack_point() -> Result<()> {
+    let idle_stream_id = 1;
+    let mut a = association_with_unacked_data_on_stream_2();
+    insert_queued_reset(&mut a, 7, idle_stream_id);
+
+    let _ = a.gather_outbound(Instant::now());
+
+    assert_eq!(a.active_reconfig, Some(7));
+    assert_eq!(
+        sender_last_tsn(&a, 7),
+        100,
+        "RFC 6525 section 5.1.2, A3: the last assigned TSN, not the ack point"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_reset_request_sequence_number_wraps() -> Result<()> {
     let stream_id = 1;
     let mut a = Association {

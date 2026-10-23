@@ -2796,12 +2796,29 @@ fn completed_resets(pair: &mut Pair, client_ch: AssociationHandle) -> Vec<u16> {
     ids
 }
 
-/// A lost DATA chunk must not make the peer defer the resets of streams closed
-/// back to back: the reset of the stream whose DATA is unacknowledged waits for
-/// the retransmission to be acknowledged, the other one leaves at once, and
-/// both carry a boundary the peer already has.
+/// The TSNs of the DATA chunks in the packets queued for delivery to an
+/// endpoint.
+fn data_tsns(inbound: &VecDeque<(Instant, Option<EcnCodepoint>, Bytes)>) -> Vec<u32> {
+    inbound
+        .iter()
+        .flat_map(|(_, _, raw)| Packet::unmarshal(raw).unwrap().chunks)
+        .filter_map(|chunk| {
+            chunk
+                .as_any()
+                .downcast_ref::<ChunkPayloadData>()
+                .map(|data| data.tsn)
+        })
+        .collect()
+}
+
+/// A lost DATA chunk holds back only the reset of its own stream. The reset
+/// of the other stream leaves at once and still carries the last assigned
+/// TSN (RFC 6525 section 5.1.2, A3), which is the lost chunk's TSN, so the
+/// peer defers it until the retransmission arrives (section 5.2.2, E2) and
+/// performs it then. The reset of the lossy stream follows the
+/// acknowledgement, and both complete.
 #[test]
-fn test_assoc_reset_after_loss_is_never_deferred() -> Result<()> {
+fn test_assoc_reset_after_loss_waits_only_for_the_lossy_stream() -> Result<()> {
     let lossy_si: u16 = 1;
     let other_si: u16 = 2;
 
@@ -2815,6 +2832,13 @@ fn test_assoc_reset_after_loss_is_never_deferred() -> Result<()> {
         PayloadProtocolIdentifier::Binary,
     )?;
     pair.drive_client();
+    let lost_tsns = data_tsns(&pair.server.inbound);
+    assert_eq!(
+        lost_tsns.len(),
+        1,
+        "the write must produce exactly one DATA chunk"
+    );
+    let lost_tsn = lost_tsns[0];
     pair.server.inbound.clear();
 
     // Close both streams back to back.
@@ -2830,9 +2854,14 @@ fn test_assoc_reset_after_loss_is_never_deferred() -> Result<()> {
         [vec![other_si]],
         "only the stream without unacknowledged DATA may be reset right away"
     );
+    assert_eq!(
+        requests[0].sender_last_tsn, lost_tsn,
+        "RFC 6525 section 5.1.2, A3: the last assigned TSN, not the ack point"
+    );
 
-    // T3-rtx retransmits the lost DATA and the second reset follows its
-    // acknowledgement. The server performs every request at once.
+    // T3-rtx retransmits the lost DATA. The server deferred the early reset
+    // behind it and performs it once it arrives; the second reset follows
+    // the acknowledgement.
     let mut results = vec![];
     loop {
         let more = pair.step();
@@ -2841,12 +2870,18 @@ fn test_assoc_reset_after_loss_is_never_deferred() -> Result<()> {
             break;
         }
     }
+    assert_eq!(
+        results.first(),
+        Some(&ReconfigResult::InProgress),
+        "the peer defers the early reset behind the lost DATA: {results:?}"
+    );
     assert!(
-        results.len() >= 2
-            && results
-                .iter()
-                .all(|r| *r == ReconfigResult::SuccessPerformed),
-        "every reset must be performed at once, never deferred: {results:?}"
+        results
+            .iter()
+            .filter(|r| **r == ReconfigResult::SuccessPerformed)
+            .count()
+            >= 2,
+        "both resets are performed once the lost DATA has arrived: {results:?}"
     );
     assert_eq!(completed_resets(&mut pair, client_ch), [lossy_si, other_si]);
 

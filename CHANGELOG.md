@@ -1,5 +1,7 @@
 # Unreleased
 
+# 0.10.8
+
   * Wait for data acknowledgements before resetting streams #80
 
 # 0.10.7

@@ -18,6 +18,9 @@ pub(crate) struct OutboundQueue {
     inflight: PayloadQueue,
     next_message_id: u64,
     next_unstarted_message_id: u64,
+    /// Whether a chunk with a deadline ever entered the flight queue. Until one
+    /// does, nothing in flight can expire and `expired_inflight` has no scan to make.
+    timed_inflight: bool,
 }
 
 impl OutboundQueue {
@@ -83,8 +86,15 @@ impl OutboundQueue {
         *next_tsn = next_tsn.wrapping_add(1);
         chunk.since = Some(now);
         chunk.nsent = 1;
-        self.inflight.push_no_check(chunk.clone());
+        self.push_inflight(chunk.clone());
         Some(chunk)
+    }
+
+    /// The one way into the flight queue. A chunk that has a deadline got it while
+    /// pending, so whether anything in flight can expire is known from here.
+    fn push_inflight(&mut self, chunk: ChunkPayloadData) {
+        self.timed_inflight |= chunk.deadline.is_some();
+        self.inflight.push_no_check(chunk);
     }
 
     pub(crate) fn get(&self, tsn: u32) -> Option<&ChunkPayloadData> {
@@ -161,7 +171,7 @@ impl OutboundQueue {
             chunk.ending_fragment = true;
             chunk.abandoned = true;
             chunk.retransmit = false;
-            self.inflight.push_no_check(chunk);
+            self.push_inflight(chunk);
         }
         Some((stream, bytes + inflight_bytes))
     }
@@ -170,6 +180,9 @@ impl OutboundQueue {
     /// messages are excluded. Collect before abandonment mutates the queues so
     /// expiry is independent of send limits.
     pub(crate) fn expired_inflight(&self, now: Instant) -> Vec<u32> {
+        if !self.timed_inflight {
+            return Vec::new();
+        }
         self.inflight
             .sorted
             .iter()

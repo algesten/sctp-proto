@@ -352,3 +352,30 @@ fn pending_expiry_deadlines_ssn_wrap_and_exemptions() {
         assert!(q.expire_pending(now).is_none());
     }
 }
+
+#[test]
+fn expiry_scan_starts_with_the_first_timed_chunk_in_flight() {
+    use core::time::Duration;
+    let now = Instant::now();
+    let mut q = OutboundQueue::default();
+    let mut next_tsn = 1;
+    // Reliable chunks alone in flight: nothing can expire, however late.
+    q.push(message(1, false, 2));
+    q.send_next(&mut next_tsn, now).unwrap();
+    q.send_next(&mut next_tsn, now).unwrap();
+    assert!(
+        q.expired_inflight(now + Duration::from_secs(3600))
+            .is_empty()
+    );
+
+    // A timed message sent behind them is found once its lifetime is over.
+    let mut timed = message(2, false, 1);
+    timed[0].reliability = Some((crate::ReliabilityType::Timed, 10));
+    q.push(timed);
+    q.send_next(&mut next_tsn, now).unwrap();
+    assert!(
+        q.expired_inflight(now + Duration::from_millis(9))
+            .is_empty()
+    );
+    assert_eq!(q.expired_inflight(now + Duration::from_millis(10)), [3]);
+}

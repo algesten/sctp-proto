@@ -31,10 +31,9 @@ fn timed_recovery_obeys_exact_deadline() {
             for delay in [9, 10, 20, 2_000] {
                 let mut a = timed_fixture(unordered);
                 a.pop_pending_data_chunks_to_send(now);
+                a.outbound_queue.mark_all_to_retransmit();
                 for tsn in 1..=3 {
-                    let c = a.outbound_queue.get_mut(tsn).unwrap();
-                    c.retransmit = true;
-                    c.miss_indicator = 3;
+                    a.outbound_queue.get_mut(tsn).unwrap().miss_indicator = 3;
                 }
                 let later = now + Duration::from_millis(delay);
                 let packets = if fast {
@@ -66,10 +65,9 @@ fn timed_expiry_is_not_hidden_by_window_or_fast_packet_limit() {
         first.deadline = None;
         first.reliability = Some((ReliabilityType::Reliable, 0));
         first.message_id = u64::MAX;
+        a.outbound_queue.mark_all_to_retransmit();
         for tsn in 1..=3 {
-            let c = a.outbound_queue.get_mut(tsn).unwrap();
-            c.retransmit = true;
-            c.miss_indicator = 3;
+            a.outbound_queue.get_mut(tsn).unwrap().miss_indicator = 3;
         }
         a.cwnd = 0;
         a.mtu = 0;
@@ -150,9 +148,9 @@ fn timed_expiry_preserves_reliable_dcep_and_non_negotiated_traffic() {
         if control == 2 {
             a.use_forward_tsn = false;
         }
+        a.outbound_queue.mark_all_to_retransmit();
         for tsn in 1..=3 {
             let c = a.outbound_queue.get_mut(tsn).unwrap();
-            c.retransmit = true;
             match control {
                 0 => {
                     c.reliability = Some((ReliabilityType::Reliable, 0));

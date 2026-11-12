@@ -1318,3 +1318,28 @@ fn test_queue_front_pop_then_reorder_across_wrap() -> Result<()> {
     assert_eq!(rq.get_num_bytes(), 0);
     Ok(())
 }
+
+#[test]
+fn test_payload_queue_keeps_tsn_order_whatever_the_arrival_order() {
+    // Late, early and wrapping TSNs through both ways in: the receiver's push
+    // and the sender's push_no_check.
+    let first = u32::MAX - 3;
+    let expected: Vec<u32> = (0..8).map(|i| first.wrapping_add(i)).collect();
+
+    let mut received = PayloadQueue::new();
+    let mut sent = PayloadQueue::new();
+    for offset in [3, 0, 6, 1, 7, 5, 2, 4] {
+        let tsn = first.wrapping_add(offset);
+        assert!(received.push(make_payload(tsn, 1), first.wrapping_sub(1)));
+        sent.push_no_check(make_payload(tsn, 1));
+    }
+    assert_eq!(
+        received.sorted.iter().copied().collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(sent.sorted.iter().copied().collect::<Vec<_>>(), expected);
+
+    // A duplicate is refused before it reaches the order.
+    assert!(!received.push(make_payload(first, 1), first.wrapping_sub(1)));
+    assert_eq!(received.sorted.len(), 8);
+}

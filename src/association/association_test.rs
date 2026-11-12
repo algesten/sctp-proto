@@ -5646,6 +5646,34 @@ fn test_fast_retry_counts_toward_timer_retransmission_limit() {
 }
 
 #[test]
+fn test_timer_retransmission_cut_short_by_window_resumes_on_next_pass() {
+    let now = Instant::now();
+    let mut a = fragmented_retransmission_fixture(10);
+    for _ in 0..3 {
+        a.send_next_data_chunk(now).unwrap();
+    }
+    let sent = |a: &Association| [1, 2, 3].map(|tsn| a.outbound_queue.get(tsn).unwrap().nsent);
+    // Before any T3-rtx timeout no chunk is marked: a pass selects nothing.
+    assert!(a.get_data_packets_to_retransmit(now).is_empty());
+
+    a.outbound_queue.mark_all_to_retransmit();
+    // The window takes the first chunk alone: the two others stay marked.
+    a.cwnd = 4;
+    assert_eq!(a.get_data_packets_to_retransmit(now).len(), 1);
+    assert_eq!(sent(&a), [2, 1, 1]);
+    a.cwnd = 100;
+    assert_eq!(a.get_data_packets_to_retransmit(now).len(), 1);
+    assert_eq!(sent(&a), [2, 2, 2]);
+    // Every marked chunk went out: a further pass has nothing left...
+    assert!(a.get_data_packets_to_retransmit(now).is_empty());
+    assert_eq!(sent(&a), [2, 2, 2]);
+    // ...until the next timeout marks them again.
+    a.outbound_queue.mark_all_to_retransmit();
+    assert_eq!(a.get_data_packets_to_retransmit(now).len(), 1);
+    assert_eq!(sent(&a), [3, 3, 3]);
+}
+
+#[test]
 fn abandoned_retry_message_releases_credit_without_ack_credit() {
     let now = Instant::now();
     let mut a = fragmented_retransmission_fixture(0);

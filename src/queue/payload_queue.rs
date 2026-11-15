@@ -21,14 +21,12 @@ impl PayloadQueue {
         PayloadQueue::default()
     }
 
-    pub(crate) fn update_sorted_keys(&mut self) {
-        self.sorted.make_contiguous().sort_by(|a, b| {
-            if sna32lt(*a, *b) {
-                core::cmp::Ordering::Less
-            } else {
-                core::cmp::Ordering::Greater
-            }
-        });
+    /// Keeps `sorted` in TSN order without sorting it again. A TSN past every queued
+    /// one, which is each TSN a sender assigns and each a receiver gets in order,
+    /// lands at the back; only a late TSN moves the ones after it.
+    fn insert_sorted(&mut self, tsn: u32) {
+        let at = self.sorted.partition_point(|queued| sna32lt(*queued, tsn));
+        self.sorted.insert(at, tsn);
     }
 
     pub(crate) fn can_push(&self, p: &ChunkPayloadData, cumulative_tsn: u32) -> bool {
@@ -37,10 +35,9 @@ impl PayloadQueue {
 
     pub(crate) fn push_no_check(&mut self, p: ChunkPayloadData) {
         self.n_bytes += p.user_data.len();
-        self.sorted.push_back(p.tsn);
+        self.insert_sorted(p.tsn);
         self.chunk_map.insert(p.tsn, p);
         //self.length += 1;
-        self.update_sorted_keys();
     }
 
     /// push pushes a payload data. If the payload data is already in our queue or
@@ -55,10 +52,9 @@ impl PayloadQueue {
         }
 
         self.n_bytes += p.user_data.len();
-        self.sorted.push_back(p.tsn);
+        self.insert_sorted(p.tsn);
         self.chunk_map.insert(p.tsn, p);
         //self.length += 1;
-        self.update_sorted_keys();
 
         true
     }

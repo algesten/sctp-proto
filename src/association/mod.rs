@@ -3946,6 +3946,11 @@ impl Association {
     /// or abandoned yet.
     fn get_data_packets_to_retransmit(&mut self, now: Instant) -> Vec<Packet> {
         self.expire_inflight_messages(now);
+        // Only a T3-rtx timeout marks chunks: until one does, the walk below
+        // over every chunk in flight would select none.
+        if !self.outbound_queue.has_marked_retransmits() {
+            return vec![];
+        }
         let awnd = core::cmp::min(self.cwnd, self.rwnd);
         let mut chunks: Vec<ChunkPayloadData> = vec![];
         let mut bytes_to_send = 0;
@@ -3979,6 +3984,9 @@ impl Association {
 
                 bytes_to_send += c.user_data.len();
             } else {
+                // Every chunk in flight was visited: the ones still marked
+                // are in `chunks`, unmarked below.
+                self.outbound_queue.retransmits_visited();
                 break; // end of pending data
             }
 

@@ -18,6 +18,12 @@ pub(crate) struct OutboundQueue {
     inflight: PayloadQueue,
     next_message_id: u64,
     next_unstarted_message_id: u64,
+    /// Whether a chunk with a deadline ever entered the flight queue. Until one
+    /// does, nothing in flight can expire and `expired_inflight` has no scan to make.
+    timed_inflight: bool,
+    /// Whether `mark_all_to_retransmit` marked chunks that the T3-rtx pass has yet
+    /// to visit. Nothing else marks one, so without it that pass selects nothing.
+    retransmit_marked: bool,
 }
 
 impl OutboundQueue {
@@ -83,8 +89,15 @@ impl OutboundQueue {
         *next_tsn = next_tsn.wrapping_add(1);
         chunk.since = Some(now);
         chunk.nsent = 1;
-        self.inflight.push_no_check(chunk.clone());
+        self.push_inflight(chunk.clone());
         Some(chunk)
+    }
+
+    /// The one way into the flight queue. A chunk that has a deadline got it while
+    /// pending, so whether anything in flight can expire is known from here.
+    fn push_inflight(&mut self, chunk: ChunkPayloadData) {
+        self.timed_inflight |= chunk.deadline.is_some();
+        self.inflight.push_no_check(chunk);
     }
 
     pub(crate) fn get(&self, tsn: u32) -> Option<&ChunkPayloadData> {
@@ -161,7 +174,7 @@ impl OutboundQueue {
             chunk.ending_fragment = true;
             chunk.abandoned = true;
             chunk.retransmit = false;
-            self.inflight.push_no_check(chunk);
+            self.push_inflight(chunk);
         }
         Some((stream, bytes + inflight_bytes))
     }
@@ -170,6 +183,9 @@ impl OutboundQueue {
     /// messages are excluded. Collect before abandonment mutates the queues so
     /// expiry is independent of send limits.
     pub(crate) fn expired_inflight(&self, now: Instant) -> Vec<u32> {
+        if !self.timed_inflight {
+            return Vec::new();
+        }
         self.inflight
             .sorted
             .iter()
@@ -185,7 +201,17 @@ impl OutboundQueue {
     }
 
     pub(crate) fn mark_all_to_retransmit(&mut self) {
+        self.retransmit_marked = true;
         self.inflight.mark_all_to_retransmit();
+    }
+
+    pub(crate) fn has_marked_retransmits(&self) -> bool {
+        self.retransmit_marked
+    }
+
+    /// The T3-rtx pass visited every chunk in flight: none stays marked.
+    pub(crate) fn retransmits_visited(&mut self) {
+        self.retransmit_marked = false;
     }
 
     pub(crate) fn pending_contains_stream(&self, stream: u16) -> bool {

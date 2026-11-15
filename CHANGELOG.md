@@ -1,5 +1,7 @@
 # Unreleased
 
+  * Reduce sender CPU usage by avoiding unnecessary flight queue scans and sorting #81
+
 # 0.10.8
 
   * Wait for data acknowledgements before resetting streams #80

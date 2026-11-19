@@ -1,6 +1,7 @@
 # Unreleased
 
   * Reduce sender CPU usage by avoiding unnecessary flight queue scans and sorting #81
+  * Pass the current time to `Endpoint::connect` instead of reading the system clock (breaking) #83
 
 # 0.10.8
 

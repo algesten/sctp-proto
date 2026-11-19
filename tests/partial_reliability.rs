@@ -66,12 +66,17 @@ fn pairs(reliability: ReliabilityType) -> (Peer, Peer) {
     let mut ep_b = Endpoint::new(Arc::new(EndpointConfig::new()), None);
     let (ha, mut a) = ep_a
         .connect(
+            Instant::now(),
             ClientConfig::new().with_snap(ta.clone(), tb.clone()),
             addr_b,
         )
         .unwrap();
     let (hb, mut b) = ep_b
-        .connect(ClientConfig::new().with_snap(tb, ta), addr_a)
+        .connect(
+            Instant::now(),
+            ClientConfig::new().with_snap(tb, ta),
+            addr_a,
+        )
         .unwrap();
     for assoc in [&mut a, &mut b] {
         assoc

@@ -65,7 +65,7 @@ impl RandomAssociationIdGenerator {
 
 impl AssociationIdGenerator for RandomAssociationIdGenerator {
     fn generate_aid(&mut self) -> AssociationId {
-        rand::random::<u32>()
+        crate::random::random_u32()
     }
 
     fn aid_lifetime(&self) -> Option<Duration> {

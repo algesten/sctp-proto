@@ -13,12 +13,15 @@ categories = ["network-programming", "asynchronous"]
 rust-version = "1.85"
 
 [features]
+default = ["rand"]
+# With no fill installed (`set_fill`), draws fall back to rand's thread RNG; without this feature they panic.
+rand = ["dep:rand"]
 # Expose internals for fuzz testing. Not part of the public API.
 _fuzz = []
 
 [dependencies]
 bytes = "1.5.0"
-rand = "0.9"
+rand = { version = "0.9", optional = true }
 rustc-hash = "2.1.1"
 slab = "0.4.9"
 thiserror = "2.0.18"

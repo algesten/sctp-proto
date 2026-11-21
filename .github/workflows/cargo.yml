@@ -30,6 +30,8 @@ jobs:
         run: cargo +${{steps.toolchain.outputs.name}} build
       - name: Test
         run: cargo +${{steps.toolchain.outputs.name}} test
+      - name: Test without rand
+        run: cargo +${{steps.toolchain.outputs.name}} test --no-default-features --test no_rand
 
   snowflake:
     runs-on: ubuntu-latest

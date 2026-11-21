@@ -41,6 +41,7 @@ use stream::{ReliabilityType, Stream, StreamEvent, StreamId, StreamResetError, S
 use timer::{ACK_INTERVAL, RtoManager, Timer, TimerTable};
 
 use crate::association::stream::RecvSendState;
+use crate::random::random_nonzero_u32;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::string::String;
@@ -49,11 +50,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 use bytes::Bytes;
 use core::net::{IpAddr, SocketAddr};
-use core::num::NonZeroU32;
 use core::str::FromStr;
 use core::time::Duration;
 use log::{debug, error, trace, warn};
-use rand::random;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 use std::time::Instant;
@@ -505,7 +504,7 @@ impl Association {
             Side::Client
         };
 
-        let tsn = random::<NonZeroU32>().get();
+        let tsn = random_nonzero_u32().get();
 
         let mut this = Self::new_common(
             config,

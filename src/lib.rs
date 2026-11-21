@@ -25,6 +25,15 @@
 //! [Event]: https://docs.rs/sctp-proto/latest/sctp_proto/enum.Event.html
 //! [Stream]: https://docs.rs/sctp-proto/latest/sctp_proto/struct.Stream.html
 //!
+//! ## Randomness
+//!
+//! Verification tags, initial TSNs, state cookies and association ids are random. By default they
+//! come from `rand`'s thread RNG. An embedder that must draw them from its own source installs it
+//! once with [set_fill]; with the default `rand` feature turned off, a draw with no fill installed
+//! panics.
+//!
+//! [set_fill]: https://docs.rs/sctp-proto/latest/sctp_proto/fn.set_fill.html
+//!
 //! ## Status
 //!
 //! This crate is maintained by the [str0m] project, which has been using it since
@@ -88,6 +97,9 @@ mod error;
 pub use crate::error::Error;
 
 mod packet;
+
+mod random;
+pub use crate::random::set_fill;
 
 mod shared;
 pub use crate::shared::{AssociationEvent, AssociationId, EcnCodepoint, EndpointEvent};

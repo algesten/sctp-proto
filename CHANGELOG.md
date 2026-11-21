@@ -1,6 +1,7 @@
 # Unreleased
 
   * Reduce sender CPU usage by avoiding unnecessary flight queue scans and sorting #81
+  * Add `set_fill` to supply the random source and make `rand` an optional (default) feature
 
 # 0.10.8
 

@@ -1,5 +1,7 @@
 # Unreleased
 
+# 0.10.9
+
   * Reduce sender CPU usage by avoiding unnecessary flight queue scans and sorting #81
 
 # 0.10.8

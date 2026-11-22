@@ -6,7 +6,6 @@ edition = "2024"
 description = "A pure Rust implementation of SCTP in Sans-IO style"
 license = "MIT OR Apache-2.0"
 documentation = "https://docs.rs/sctp-proto"
-homepage = "https://github.com/algesten/sctp-proto"
 repository = "https://github.com/algesten/sctp-proto"
 keywords = ["sctp"]
 categories = ["network-programming", "asynchronous"]

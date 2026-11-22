@@ -429,12 +429,11 @@ impl ClientConfig {
 /// the remote peer's token.
 pub fn generate_snap_token(config: &TransportConfig) -> Result<Bytes, crate::error::Error> {
     use crate::chunk::{Chunk, chunk_init::ChunkInit};
-    use core::num::NonZeroU32;
-    use rand::random;
+    use crate::random::random_nonzero_u32;
 
     let mut init = ChunkInit {
-        initiate_tag: random::<NonZeroU32>().get(),
-        initial_tsn: random::<NonZeroU32>().get(),
+        initiate_tag: random_nonzero_u32().get(),
+        initial_tsn: random_nonzero_u32().get(),
         num_outbound_streams: u16::MAX,
         num_inbound_streams: u16::MAX,
         advertised_receiver_window_credit: config.max_receive_buffer_size(),

@@ -186,6 +186,11 @@ impl Endpoint {
 
     /// Initiate an association.
     ///
+    /// `now` is the current time, on the same clock as the instants later passed to
+    /// the returned [`Association`]. Without SNAP, the INIT's T1-init retransmission
+    /// timer starts from it; a SNAP association skips the handshake and does not use
+    /// it. sctp-proto does not read the system clock itself.
+    ///
     /// If SNAP tokens (INIT chunks) are provided via [`ClientConfig::with_snap`],
     /// the association will skip the SCTP 4-way handshake (RFC 4960 Section 5.1)
     /// and immediately transition to the ESTABLISHED state.
@@ -206,6 +211,7 @@ impl Endpoint {
     /// See [draft-hancke-tsvwg-snap-01](https://datatracker.ietf.org/doc/draft-hancke-tsvwg-snap/).
     pub fn connect(
         &mut self,
+        now: Instant,
         config: ClientConfig,
         remote: SocketAddr,
     ) -> Result<(AssociationHandle, Association), ConnectError> {
@@ -238,7 +244,7 @@ impl Endpoint {
                     local_aid,
                     remote,
                     None,
-                    Instant::now(),
+                    now,
                     None,
                     config.transport,
                 ))

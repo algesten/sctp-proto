@@ -328,7 +328,10 @@ impl Pair {
 
     /// Just start connecting the client
     pub fn begin_connect(&mut self, config: ClientConfig) -> AssociationHandle {
-        let (client_ch, client_conn) = self.client.connect(config, self.server.addr).unwrap();
+        let (client_ch, client_conn) = self
+            .client
+            .connect(self.time, config, self.server.addr)
+            .unwrap();
         self.client.associations.insert(client_ch, client_conn);
         client_ch
     }
@@ -1333,7 +1336,51 @@ fn test_pending_timed_expiry_window_stall() -> Result<()> {
     Ok(())
 }
 
-//TODO: TestAssocT1InitTimer
+#[test]
+fn test_assoc_t1_init_timer() {
+    // Far from the system clock, so a timer started from it would show.
+    let t0 = Instant::now() + Duration::from_secs(3600);
+    let rto = Duration::from_millis(crate::config::RTO_INITIAL);
+    let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let remote: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+    let transport = TransportConfig::default().with_max_init_retransmits(Some(1));
+    let config = ClientConfig {
+        transport: Arc::new(transport),
+        ..Default::default()
+    };
+    let (_, mut assoc) = endpoint.connect(t0, config, remote).unwrap();
+
+    assert_eq!(assoc.poll_timeout(), Some(t0 + rto));
+    assert!(transmits_init(&mut assoc, t0));
+
+    // On expiry the INIT is sent again and the timer backs off.
+    let t1 = t0 + rto;
+    assoc.handle_timeout(t1);
+    assert!(transmits_init(&mut assoc, t1));
+    let t2 = t1 + 2 * rto;
+    assert_eq!(assoc.poll_timeout(), Some(t2));
+
+    // The next expiry is past max_init_retransmits: the handshake fails.
+    assoc.handle_timeout(t2);
+    assert_matches!(assoc.poll(), Some(Event::HandshakeFailed { .. }));
+}
+
+fn transmits_init(assoc: &mut Association, now: Instant) -> bool {
+    let Some(transmit) = assoc.poll_transmit(now) else {
+        return false;
+    };
+    let Payload::RawEncode(datagrams) = transmit.payload else {
+        panic!("expected RawEncode transmit");
+    };
+    datagrams.iter().any(|raw| {
+        let packet = Packet::unmarshal(raw).unwrap();
+        packet
+            .chunks
+            .iter()
+            .any(|c| c.as_any().downcast_ref::<ChunkInit>().is_some())
+    })
+}
+
 //TODO: TestAssocT1CookieTimer
 //TODO: TestAssocT3RtxTimer
 
@@ -3090,7 +3137,7 @@ fn test_connect_rejects_zero_sctp_port() {
 
             let mut endpoint = Endpoint::new(Arc::new(EndpointConfig::default()), None);
             assert_matches!(
-                endpoint.connect(config, remote),
+                endpoint.connect(Instant::now(), config, remote),
                 Err(ConnectError::InvalidSctpPort)
             );
         }
@@ -3116,7 +3163,7 @@ fn test_snap_connect_established_and_transmit_uses_peer_verification_tag() {
 
     let client_config = ClientConfig::new().with_snap(local_init_bytes, remote_init_bytes);
     let (_ch, mut assoc) = endpoint
-        .connect(client_config, remote_addr)
+        .connect(now, client_config, remote_addr)
         .expect("SNAP connect should succeed");
 
     assert_eq!(assoc.state(), AssociationState::Established);
@@ -3256,7 +3303,7 @@ fn test_snap_rejects_invalid_remote_bytes() {
 
     let local_init = generate_snap_token(&TransportConfig::default()).expect("local init");
     let client_config = ClientConfig::new().with_snap(local_init, Bytes::from_static(b"nope"));
-    let res = endpoint.connect(client_config, remote_addr);
+    let res = endpoint.connect(Instant::now(), client_config, remote_addr);
     assert!(
         matches!(
             res,
@@ -3276,7 +3323,7 @@ fn test_snap_rejects_invalid_local_bytes() {
 
     let remote_init = generate_snap_token(&TransportConfig::default()).expect("remote init");
     let client_config = ClientConfig::new().with_snap(Bytes::from_static(b"nope"), remote_init);
-    let res = endpoint.connect(client_config, remote_addr);
+    let res = endpoint.connect(Instant::now(), client_config, remote_addr);
     assert!(
         matches!(
             res,
@@ -3303,7 +3350,7 @@ fn test_snap_rejects_remote_init_ack() {
     let remote_bytes = remote_init_ack.marshal().expect("marshal remote INIT-ACK");
 
     let client_config = ClientConfig::new().with_snap(local_init, remote_bytes);
-    let res = endpoint.connect(client_config, remote_addr);
+    let res = endpoint.connect(Instant::now(), client_config, remote_addr);
     assert!(
         matches!(
             res,
@@ -3329,7 +3376,7 @@ fn test_snap_rejects_remote_init_with_zero_initiate_tag() {
     let remote_bytes = remote_init.marshal().expect("marshal remote INIT");
 
     let client_config = ClientConfig::new().with_snap(local_init, remote_bytes);
-    let res = endpoint.connect(client_config, remote_addr);
+    let res = endpoint.connect(Instant::now(), client_config, remote_addr);
     assert!(
         matches!(
             res,
@@ -3353,7 +3400,7 @@ fn test_snap_partial_config_falls_back_to_handshake() {
         ..Default::default()
     };
     let (_ch, assoc) = endpoint
-        .connect(client_config, remote_addr)
+        .connect(Instant::now(), client_config, remote_addr)
         .expect("partial SNAP config should fall back to handshake");
     assert_eq!(
         assoc.state(),
@@ -3368,7 +3415,7 @@ fn test_snap_partial_config_falls_back_to_handshake() {
         ..Default::default()
     };
     let (_ch, assoc) = endpoint
-        .connect(client_config, remote_addr)
+        .connect(Instant::now(), client_config, remote_addr)
         .expect("partial SNAP config should fall back to handshake");
     assert_eq!(
         assoc.state(),
@@ -3390,12 +3437,12 @@ fn test_snap_rejects_reused_local_init() {
 
     // First connect succeeds
     let cfg1 = ClientConfig::new().with_snap(local_init.clone(), remote1);
-    let res1 = endpoint.connect(cfg1, remote_addr);
+    let res1 = endpoint.connect(Instant::now(), cfg1, remote_addr);
     assert!(res1.is_ok(), "first SNAP connect should succeed");
 
     // Second connect with same local_init collides on local_aid
     let cfg2 = ClientConfig::new().with_snap(local_init, remote2);
-    let res2 = endpoint.connect(cfg2, remote_addr);
+    let res2 = endpoint.connect(Instant::now(), cfg2, remote_addr);
     assert!(
         matches!(
             res2,
@@ -3419,7 +3466,7 @@ fn test_snap_rejects_local_init_ack() {
     let local_bytes = local_init_ack.marshal().expect("marshal local INIT-ACK");
 
     let client_config = ClientConfig::new().with_snap(local_bytes, remote_init);
-    let res = endpoint.connect(client_config, remote_addr);
+    let res = endpoint.connect(Instant::now(), client_config, remote_addr);
     assert!(
         matches!(
             res,
@@ -3445,7 +3492,7 @@ fn test_snap_rejects_local_init_with_zero_initiate_tag() {
     let local_bytes = local_init.marshal().expect("marshal local INIT");
 
     let client_config = ClientConfig::new().with_snap(local_bytes, remote_init);
-    let res = endpoint.connect(client_config, remote_addr);
+    let res = endpoint.connect(Instant::now(), client_config, remote_addr);
     assert!(
         matches!(
             res,
@@ -3471,7 +3518,7 @@ fn test_snap_rejects_empty_bytes() {
 
     // Empty remote
     let cfg = ClientConfig::new().with_snap(valid.clone(), Bytes::new());
-    let res = endpoint.connect(cfg, remote_addr);
+    let res = endpoint.connect(Instant::now(), cfg, remote_addr);
     assert!(
         matches!(
             res,
@@ -3485,7 +3532,7 @@ fn test_snap_rejects_empty_bytes() {
 
     // Empty local
     let cfg = ClientConfig::new().with_snap(Bytes::new(), valid);
-    let res = endpoint.connect(cfg, remote_addr);
+    let res = endpoint.connect(Instant::now(), cfg, remote_addr);
     assert!(
         matches!(
             res,
@@ -3509,7 +3556,7 @@ fn test_snap_rejects_truncated_bytes() {
     let truncated = valid.slice(..10.min(valid.len()));
 
     let cfg = ClientConfig::new().with_snap(valid.clone(), truncated.clone());
-    let res = endpoint.connect(cfg, remote_addr);
+    let res = endpoint.connect(Instant::now(), cfg, remote_addr);
     assert!(
         matches!(
             res,
@@ -3522,7 +3569,7 @@ fn test_snap_rejects_truncated_bytes() {
     );
 
     let cfg = ClientConfig::new().with_snap(truncated, valid);
-    let res = endpoint.connect(cfg, remote_addr);
+    let res = endpoint.connect(Instant::now(), cfg, remote_addr);
     assert!(
         matches!(
             res,
@@ -3547,7 +3594,7 @@ fn test_snap_rejects_oversized_bytes() {
 
     // Oversized remote
     let cfg = ClientConfig::new().with_snap(valid.clone(), oversized.clone());
-    let res = endpoint.connect(cfg, remote_addr);
+    let res = endpoint.connect(Instant::now(), cfg, remote_addr);
     assert!(
         matches!(
             res,
@@ -3561,7 +3608,7 @@ fn test_snap_rejects_oversized_bytes() {
 
     // Oversized local
     let cfg = ClientConfig::new().with_snap(oversized, valid);
-    let res = endpoint.connect(cfg, remote_addr);
+    let res = endpoint.connect(Instant::now(), cfg, remote_addr);
     assert!(
         matches!(
             res,
@@ -3592,7 +3639,7 @@ fn test_snap_rejects_remote_init_zero_inbound_streams() {
     let remote_bytes = bad_remote.marshal().expect("marshal bad remote INIT");
 
     let cfg = ClientConfig::new().with_snap(local_init, remote_bytes);
-    let res = endpoint.connect(cfg, remote_addr);
+    let res = endpoint.connect(Instant::now(), cfg, remote_addr);
     assert!(
         matches!(
             res,
@@ -3624,7 +3671,7 @@ fn test_snap_rejects_remote_init_zero_outbound_streams() {
     let remote_bytes = bad_remote.marshal().expect("marshal bad remote INIT");
 
     let cfg = ClientConfig::new().with_snap(local_init, remote_bytes);
-    let res = endpoint.connect(cfg, remote_addr);
+    let res = endpoint.connect(Instant::now(), cfg, remote_addr);
     assert!(
         matches!(
             res,
@@ -3656,7 +3703,7 @@ fn test_snap_rejects_remote_init_small_arwnd() {
     let remote_bytes = bad_remote.marshal().expect("marshal bad remote INIT");
 
     let cfg = ClientConfig::new().with_snap(local_init, remote_bytes);
-    let res = endpoint.connect(cfg, remote_addr);
+    let res = endpoint.connect(Instant::now(), cfg, remote_addr);
     assert!(
         matches!(
             res,
@@ -3688,7 +3735,7 @@ fn test_snap_rejects_local_init_zero_inbound_streams() {
     let local_bytes = bad_local.marshal().expect("marshal bad local INIT");
 
     let cfg = ClientConfig::new().with_snap(local_bytes, remote_init);
-    let res = endpoint.connect(cfg, remote_addr);
+    let res = endpoint.connect(Instant::now(), cfg, remote_addr);
     assert!(
         matches!(
             res,
@@ -3720,7 +3767,7 @@ fn test_snap_rejects_local_init_small_arwnd() {
     let local_bytes = bad_local.marshal().expect("marshal bad local INIT");
 
     let cfg = ClientConfig::new().with_snap(local_bytes, remote_init);
-    let res = endpoint.connect(cfg, remote_addr);
+    let res = endpoint.connect(Instant::now(), cfg, remote_addr);
     assert!(
         matches!(
             res,
@@ -3795,7 +3842,7 @@ fn test_snap_rejects_wrong_chunk_type_bytes() {
     let sack_bytes = sack.marshal().expect("marshal SACK");
 
     let cfg = ClientConfig::new().with_snap(valid, sack_bytes);
-    let res = endpoint.connect(cfg, remote_addr);
+    let res = endpoint.connect(Instant::now(), cfg, remote_addr);
     assert!(
         matches!(
             res,
@@ -3815,7 +3862,7 @@ fn test_snap_rejects_both_sides_empty() {
     let remote_addr: SocketAddr = "127.0.0.1:5000".parse().unwrap();
 
     let cfg = ClientConfig::new().with_snap(Bytes::new(), Bytes::new());
-    let res = endpoint.connect(cfg, remote_addr);
+    let res = endpoint.connect(Instant::now(), cfg, remote_addr);
     assert!(
         matches!(res, Err(ConnectError::Snap(SnapError::ParseFailed { .. }))),
         "two empty byte slices should fail"
@@ -3833,7 +3880,7 @@ fn test_snap_rejects_random_garbage_bytes() {
     let garbage = Bytes::from(vec![0xAB; 50]);
 
     let cfg = ClientConfig::new().with_snap(valid.clone(), garbage.clone());
-    let res = endpoint.connect(cfg, remote_addr);
+    let res = endpoint.connect(Instant::now(), cfg, remote_addr);
     assert!(
         matches!(
             res,
@@ -3847,7 +3894,7 @@ fn test_snap_rejects_random_garbage_bytes() {
     );
 
     let cfg = ClientConfig::new().with_snap(garbage, valid);
-    let res = endpoint.connect(cfg, remote_addr);
+    let res = endpoint.connect(Instant::now(), cfg, remote_addr);
     assert!(
         matches!(
             res,
@@ -3869,7 +3916,7 @@ fn test_snap_identical_local_and_remote_init() {
     let token = generate_snap_token(&TransportConfig::default()).expect("token");
 
     let cfg = ClientConfig::new().with_snap(token.clone(), token);
-    let res = endpoint.connect(cfg, remote_addr);
+    let res = endpoint.connect(Instant::now(), cfg, remote_addr);
     assert!(
         matches!(res, Err(ConnectError::Snap(SnapError::AidCollision { .. }))),
         "same token for both sides should collide: got {:?}",
@@ -3901,10 +3948,14 @@ fn test_snap_end_to_end_bidirectional_data() {
     let mut ep_b = Endpoint::new(endpoint_config, None);
 
     let cfg_a = ClientConfig::new().with_snap(init_a.clone(), init_b.clone());
-    let (ch_a, mut assoc_a) = ep_a.connect(cfg_a, addr_b).expect("SNAP connect A");
+    let (ch_a, mut assoc_a) = ep_a
+        .connect(Instant::now(), cfg_a, addr_b)
+        .expect("SNAP connect A");
 
     let cfg_b = ClientConfig::new().with_snap(init_b, init_a);
-    let (ch_b, mut assoc_b) = ep_b.connect(cfg_b, addr_a).expect("SNAP connect B");
+    let (ch_b, mut assoc_b) = ep_b
+        .connect(Instant::now(), cfg_b, addr_a)
+        .expect("SNAP connect B");
 
     // Both should be established immediately.
     assert_eq!(assoc_a.state(), AssociationState::Established);
@@ -4003,7 +4054,9 @@ fn test_snap_association_drains_cleanly() {
         .initiate_tag;
 
     let cfg = ClientConfig::new().with_snap(local_init, remote_init);
-    let (ch, _assoc) = endpoint.connect(cfg, remote_addr).expect("SNAP connect");
+    let (ch, _assoc) = endpoint
+        .connect(Instant::now(), cfg, remote_addr)
+        .expect("SNAP connect");
 
     // Endpoint should have entries in both routing tables.
     assert!(

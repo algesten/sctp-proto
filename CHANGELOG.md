@@ -1,7 +1,7 @@
 # Unreleased
 
-  * Pass the current time to `Endpoint::connect` instead of reading the system clock (breaking) #83
-  * Add `set_fill` to supply the random source and make `rand` an optional (default) feature
+  * Pass the current time to `Endpoint::connect` (breaking) #83
+  * Add `set_fill` to supply the random source #84
 
 # 0.10.9
 

@@ -18,7 +18,7 @@ use crate::chunk::chunk_selective_ack::ChunkSelectiveAck;
 use crate::chunk::chunk_shutdown::ChunkShutdown;
 use crate::chunk::chunk_shutdown_ack::ChunkShutdownAck;
 use crate::chunk::chunk_shutdown_complete::ChunkShutdownComplete;
-use crate::chunk::chunk_type::CT_FORWARD_TSN;
+use crate::chunk::chunk_type::{CT_FORWARD_TSN, CT_I_DATA};
 use crate::config::COMMON_HEADER_SIZE;
 use crate::config::DATA_CHUNK_HEADER_SIZE;
 use crate::config::{ServerConfig, TransportConfig};
@@ -290,6 +290,8 @@ pub struct Association {
     cumulative_tsn_ack_point: u32,
     advanced_peer_tsn_ack_point: u32,
     use_forward_tsn: bool,
+    /// Set only after both peers advertise RFC 8260 I-DATA support.
+    use_interleaving: bool,
 
     pub(crate) rto_mgr: RtoManager,
     timers: TimerTable,
@@ -391,6 +393,7 @@ impl Default for Association {
             cumulative_tsn_ack_point: 0,
             advanced_peer_tsn_ack_point: 0,
             use_forward_tsn: false,
+            use_interleaving: false,
 
             rto_mgr: RtoManager::default(),
             timers: TimerTable::default(),
@@ -1561,6 +1564,7 @@ impl Association {
             context,
         );
 
+        let mut peer_interleaving = false;
         for param in params {
             if let Some(v) = param.as_any().downcast_ref::<ParamSupportedExtensions>() {
                 for t in &v.chunk_types {
@@ -1568,10 +1572,22 @@ impl Association {
                         debug!("[{}] use ForwardTSN (on {})", self.side, context);
                         self.use_forward_tsn = true;
                     }
+                    peer_interleaving |= *t == CT_I_DATA;
                 }
             }
         }
-        if !self.use_forward_tsn {
+        self.use_interleaving = peer_interleaving;
+        self.outbound_queue.set_interleaving(self.use_interleaving);
+        if self.use_interleaving {
+            // I-DATA's fixed header is four bytes larger than DATA's.
+            self.max_payload_size = self
+                .mtu
+                .saturating_sub(COMMON_HEADER_SIZE + DATA_CHUNK_HEADER_SIZE + 4);
+            for stream in self.streams.values_mut() {
+                stream.max_payload_size = self.max_payload_size;
+            }
+            debug!("[{}] using RFC 8260 I-DATA (on {})", self.side, context);
+        } else if !self.use_forward_tsn {
             warn!("[{}] not using ForwardTSN (on {})", self.side, context);
         }
     }
@@ -4030,7 +4046,12 @@ impl Association {
                     if let Some((id, unordered, bytes)) = self.outbound_queue.expire_pending(now) {
                         if let Some(stream) = self.streams.get_mut(&id) {
                             if !unordered {
-                                stream.sequence_number = stream.sequence_number.wrapping_sub(1);
+                                if self.use_interleaving {
+                                    stream.next_ordered_mid =
+                                        stream.next_ordered_mid.wrapping_sub(1);
+                                } else {
+                                    stream.sequence_number = stream.sequence_number.wrapping_sub(1);
+                                }
                             }
                             if stream.on_buffer_released(bytes as i64) {
                                 self.events.push_back(Event::Stream(

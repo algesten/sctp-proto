@@ -338,9 +338,10 @@ impl<'a> Stream<'a> {
         };
 
         let (p, _) = source.pop_chunk(self.association.max_send_message_size() as usize);
+        let interleaving = self.association.use_interleaving;
 
         if let Some(s) = self.association.streams.get_mut(&self.stream_identifier) {
-            let (is_buffered_amount_high, mut chunks) = s.packetize(&p, ppi);
+            let (is_buffered_amount_high, mut chunks) = s.packetize(&p, ppi, interleaving);
             for chunk in &mut chunks {
                 chunk.reliability = Some((s.reliability_type, s.reliability_value));
             }
@@ -664,6 +665,7 @@ impl StreamState {
         &mut self,
         raw: &Bytes,
         ppi: PayloadProtocolIdentifier,
+        interleaving: bool,
     ) -> (bool, Vec<ChunkPayloadData>) {
         let mut i = 0;
         let mut remaining = raw.len();
@@ -674,6 +676,20 @@ impl StreamState {
         let unordered = ppi != PayloadProtocolIdentifier::Dcep && self.unordered;
 
         let mut chunks = vec![];
+        let mid = if interleaving {
+            if unordered {
+                let mid = self.next_unordered_mid;
+                self.next_unordered_mid = self.next_unordered_mid.wrapping_add(1);
+                mid
+            } else {
+                let mid = self.next_ordered_mid;
+                self.next_ordered_mid = self.next_ordered_mid.wrapping_add(1);
+                mid
+            }
+        } else {
+            0
+        };
+        let mut fsn = 0;
 
         while remaining != 0 {
             // self.association.max_payload_size
@@ -692,20 +708,22 @@ impl StreamState {
                 immediate_sack: false,
                 payload_type: ppi,
                 stream_sequence_number: self.sequence_number,
+                message_identifier: mid,
+                fragment_sequence_number: fsn,
+                interleaved: interleaving,
                 ..Default::default()
             };
 
             chunks.push(chunk);
+            fsn = fsn.wrapping_add(1);
 
             remaining -= fragment_size;
             i += fragment_size;
         }
 
-        // RFC 4960 Sec 6.6
-        // Note: When transmitting ordered and unordered data, an endpoint does
-        // not increment its Stream Sequence Number when transmitting a DATA
-        // chunk with U flag set to 1.
-        if !unordered {
+        // Classic DATA increments SSN only for ordered messages. I-DATA has
+        // independent ordered/unordered MID counters allocated above.
+        if !interleaving && !unordered {
             self.sequence_number = self.sequence_number.wrapping_add(1);
         }
 

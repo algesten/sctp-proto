@@ -278,6 +278,8 @@ impl ChunkInit {
         // An implementation supporting this (Supported Extensions Parameter)
         // extension MUST list the ASCONF, the ASCONF-ACK, and the AUTH chunks
         // in its INIT and INIT-ACK parameters.
+        // I-DATA remains disabled until I-FORWARD-TSN partial-reliability
+        // handling is activated alongside it.
         self.params.push(Box::new(ParamSupportedExtensions {
             chunk_types: vec![CT_RECONFIG, CT_FORWARD_TSN],
         }));

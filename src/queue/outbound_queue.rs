@@ -72,10 +72,15 @@ impl OutboundQueue {
         }
         let stream = chunk.stream_identifier;
         let unordered = chunk.unordered;
+        let interleaved = chunk.interleaved;
         let message_id = chunk.message_id;
         let bytes = self.pending.remove_message(message_id, |_| {});
         if !unordered {
-            self.pending.compact_ordered_ssns(stream);
+            if interleaved {
+                self.pending.compact_ordered_mids(stream);
+            } else {
+                self.pending.compact_ordered_ssns(stream);
+            }
         }
         Some((stream, unordered, bytes))
     }

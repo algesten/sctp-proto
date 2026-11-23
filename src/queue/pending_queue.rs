@@ -123,10 +123,14 @@ impl PendingQueue {
             };
             let popped = queue.pop_front()?;
             let message_id = popped.message_id;
-            while queue
-                .front()
-                .is_some_and(|chunk| chunk.message_id == message_id)
-            {
+            // Count before rotating: with only one queued message its tail
+            // remains at the front after each push, so an open-ended loop
+            // would never terminate.
+            let tail_len = queue
+                .iter()
+                .take_while(|chunk| chunk.message_id == message_id)
+                .count();
+            for _ in 0..tail_len {
                 if let Some(chunk) = queue.pop_front() {
                     queue.push_back(chunk);
                 }
@@ -192,6 +196,17 @@ impl PendingQueue {
         for chunk in &mut self.ordered_queue {
             if chunk.stream_identifier == stream_identifier {
                 chunk.stream_sequence_number = chunk.stream_sequence_number.wrapping_sub(1);
+            }
+        }
+    }
+
+    /// Remove an unused ordered MID from the queue after its message expires
+    /// before receiving a TSN. Unlike classic SSN handling, I-DATA has no
+    /// Forward-TSN to communicate an identifier that never reached the wire.
+    pub(crate) fn compact_ordered_mids(&mut self, stream_identifier: u16) {
+        for chunk in &mut self.ordered_queue {
+            if chunk.interleaved && chunk.stream_identifier == stream_identifier {
+                chunk.message_identifier = chunk.message_identifier.wrapping_sub(1);
             }
         }
     }

@@ -117,6 +117,10 @@ pub enum Error {
     ErrChunkPayloadSmall,
     #[error("ChunkType is not of type PayloadData")]
     ErrChunkTypeNotPayloadData,
+    #[error("ChunkType is not of type I-DATA")]
+    ErrChunkTypeNotIData,
+    #[error("I-DATA beginning fragment must have FSN 0")]
+    ErrChunkIDataBeginningFsn,
     #[error("ChunkType is not of type Reconfig")]
     ErrChunkTypeNotReconfig,
     #[error("ChunkReconfig has invalid ParamA")]

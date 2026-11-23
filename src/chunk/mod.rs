@@ -9,10 +9,14 @@ pub(crate) mod chunk_forward_tsn;
 pub(crate) mod chunk_header;
 pub(crate) mod chunk_heartbeat;
 pub(crate) mod chunk_heartbeat_ack;
+pub(crate) mod chunk_i_data;
 pub(crate) mod chunk_i_forward_tsn;
 pub(crate) mod chunk_init;
 pub mod chunk_payload_data;
 pub(crate) mod chunk_reconfig;
+
+#[cfg(test)]
+mod chunk_i_data_test;
 pub(crate) mod chunk_selective_ack;
 pub(crate) mod chunk_shutdown;
 pub(crate) mod chunk_shutdown_ack;

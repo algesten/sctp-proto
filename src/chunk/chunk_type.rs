@@ -20,6 +20,7 @@ pub(crate) const CT_COOKIE_ECHO: ChunkType = ChunkType(10);
 pub(crate) const CT_COOKIE_ACK: ChunkType = ChunkType(11);
 pub(crate) const CT_CWR: ChunkType = ChunkType(13);
 pub(crate) const CT_SHUTDOWN_COMPLETE: ChunkType = ChunkType(14);
+pub(crate) const CT_I_DATA: ChunkType = ChunkType(64);
 pub(crate) const CT_RECONFIG: ChunkType = ChunkType(130);
 pub(crate) const CT_FORWARD_TSN: ChunkType = ChunkType(192);
 pub(crate) const CT_I_FORWARD_TSN: ChunkType = ChunkType(194);
@@ -42,6 +43,7 @@ impl fmt::Display for ChunkType {
             CT_COOKIE_ACK => "COOKIE-ACK",
             CT_CWR => "ECNE", // Explicit Congestion Notification Echo
             CT_SHUTDOWN_COMPLETE => "SHUTDOWN-COMPLETE",
+            CT_I_DATA => "I-DATA",
             CT_RECONFIG => "RECONFIG", // Re-configuration
             CT_FORWARD_TSN => "FORWARD-TSN",
             CT_I_FORWARD_TSN => "I-FORWARD-TSN",

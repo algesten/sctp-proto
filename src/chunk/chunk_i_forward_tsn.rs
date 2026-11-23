@@ -61,6 +61,11 @@ impl Chunk for ChunkIForwardTsn {
         if header.value_length() < NEW_CUMULATIVE_TSN_LENGTH {
             return Err(Error::ErrChunkTooShort);
         }
+        if (header.value_length() - NEW_CUMULATIVE_TSN_LENGTH) % I_FORWARD_TSN_STREAM_ENTRY_LENGTH
+            != 0
+        {
+            return Err(Error::ErrChunkTooShort);
+        }
 
         let reader = &mut buf.slice(CHUNK_HEADER_SIZE..value_end);
         let new_cumulative_tsn = reader.get_u32();

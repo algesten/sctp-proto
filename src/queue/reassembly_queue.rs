@@ -717,6 +717,35 @@ impl ReassemblyQueue {
         }
     }
 
+    /// Apply RFC 8260's ordered I-FORWARD-TSN MID update.
+    pub(crate) fn forward_i_tsn_for_ordered(&mut self, last_mid: u32) {
+        let dropped: usize = self
+            .ordered_i_data
+            .iter()
+            .filter(|set| sna32lte(set.mid, last_mid) && !set.is_complete())
+            .map(Chunks::len)
+            .sum();
+        self.ordered_i_data
+            .retain(|set| !sna32lte(set.mid, last_mid) || set.is_complete());
+        self.subtract_num_bytes(dropped);
+        if sna32lte(self.next_mid, last_mid) {
+            self.next_mid = last_mid.wrapping_add(1);
+        }
+    }
+
+    /// Drop incomplete unordered I-DATA messages skipped by I-FORWARD-TSN.
+    pub(crate) fn forward_i_tsn_for_unordered(&mut self, last_mid: u32) {
+        let dropped: usize = self
+            .unordered_i_data
+            .iter()
+            .filter(|set| sna32lte(set.mid, last_mid) && !set.is_complete())
+            .map(Chunks::len)
+            .sum();
+        self.unordered_i_data
+            .retain(|set| !sna32lte(set.mid, last_mid) || set.is_complete());
+        self.subtract_num_bytes(dropped);
+    }
+
     pub(crate) fn subtract_num_bytes(&mut self, n_bytes: usize) {
         if self.n_bytes >= n_bytes {
             self.n_bytes -= n_bytes;

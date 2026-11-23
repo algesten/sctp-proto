@@ -2758,25 +2758,45 @@ impl Association {
         self.payload_queue.pop_up_to(c.new_cumulative_tsn);
         self.peer_last_tsn = c.new_cumulative_tsn;
 
-        // Handle per-stream entries using the explicit unordered flag
-        for forwarded in &c.streams {
-            if forwarded.unordered {
-                self.apply_or_defer_unordered_forward_tsn(
-                    forwarded.identifier,
-                    c.new_cumulative_tsn,
-                );
-            } else {
-                // MID maps to SSN for ordered streams; truncate to u16
-                self.apply_or_defer_ordered_forward_tsn(
-                    forwarded.identifier,
-                    forwarded.mid as u16,
-                    c.new_cumulative_tsn,
-                );
+        if self.use_interleaving {
+            // RFC 8260 carries a 32-bit MID and explicitly identifies
+            // unordered streams; never reinterpret that MID as an SSN.
+            for forwarded in &c.streams {
+                if let Some(stream) = self.streams.get_mut(&forwarded.identifier) {
+                    if forwarded.unordered {
+                        stream
+                            .reassembly_queue
+                            .forward_i_tsn_for_unordered(forwarded.mid);
+                    } else {
+                        stream
+                            .reassembly_queue
+                            .forward_i_tsn_for_ordered(forwarded.mid);
+                    }
+                    if stream.reassembly_queue.is_readable() {
+                        self.events.push_back(Event::Stream(StreamEvent::Readable {
+                            id: forwarded.identifier,
+                        }));
+                    }
+                }
             }
+        } else {
+            // Compatibility for legacy associations and reset-deferred DATA.
+            for forwarded in &c.streams {
+                if forwarded.unordered {
+                    self.apply_or_defer_unordered_forward_tsn(
+                        forwarded.identifier,
+                        c.new_cumulative_tsn,
+                    );
+                } else {
+                    self.apply_or_defer_ordered_forward_tsn(
+                        forwarded.identifier,
+                        forwarded.mid as u16,
+                        c.new_cumulative_tsn,
+                    );
+                }
+            }
+            self.apply_unordered_forward_tsn_to_current_streams(c.new_cumulative_tsn);
         }
-
-        // Broadcast to all unordered streams
-        self.apply_unordered_forward_tsn_to_current_streams(c.new_cumulative_tsn);
 
         let mut reply = vec![];
         self.reevaluate_pending_reset_requests(&mut reply)?;

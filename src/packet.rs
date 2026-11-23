@@ -6,7 +6,6 @@ use crate::chunk::chunk_error::ChunkError;
 use crate::chunk::chunk_forward_tsn::ChunkForwardTsn;
 use crate::chunk::chunk_header::*;
 use crate::chunk::chunk_heartbeat::ChunkHeartbeat;
-use crate::chunk::chunk_i_data::ChunkIData;
 use crate::chunk::chunk_i_forward_tsn::ChunkIForwardTsn;
 use crate::chunk::chunk_init::ChunkInit;
 use crate::chunk::chunk_payload_data::ChunkPayloadData;
@@ -156,10 +155,9 @@ impl PartialDecode {
                 CT_HEARTBEAT => {
                     Box::new(ChunkHeartbeat::unmarshal(&self.remaining.slice(offset..))?)
                 }
-                CT_PAYLOAD_DATA => Box::new(ChunkPayloadData::unmarshal(
+                CT_PAYLOAD_DATA | CT_I_DATA => Box::new(ChunkPayloadData::unmarshal(
                     &self.remaining.slice(offset..),
                 )?),
-                CT_I_DATA => Box::new(ChunkIData::unmarshal(&self.remaining.slice(offset..))?),
                 CT_SACK => Box::new(ChunkSelectiveAck::unmarshal(
                     &self.remaining.slice(offset..),
                 )?),
@@ -255,8 +253,9 @@ impl Packet {
                 CT_COOKIE_ECHO => Box::new(ChunkCookieEcho::unmarshal(&raw.slice(offset..))?),
                 CT_COOKIE_ACK => Box::new(ChunkCookieAck::unmarshal(&raw.slice(offset..))?),
                 CT_HEARTBEAT => Box::new(ChunkHeartbeat::unmarshal(&raw.slice(offset..))?),
-                CT_PAYLOAD_DATA => Box::new(ChunkPayloadData::unmarshal(&raw.slice(offset..))?),
-                CT_I_DATA => Box::new(ChunkIData::unmarshal(&raw.slice(offset..))?),
+                CT_PAYLOAD_DATA | CT_I_DATA => {
+                    Box::new(ChunkPayloadData::unmarshal(&raw.slice(offset..))?)
+                }
                 CT_SACK => Box::new(ChunkSelectiveAck::unmarshal(&raw.slice(offset..))?),
                 CT_RECONFIG => Box::new(ChunkReconfig::unmarshal(&raw.slice(offset..))?),
                 CT_FORWARD_TSN => Box::new(ChunkForwardTsn::unmarshal(&raw.slice(offset..))?),

@@ -94,7 +94,13 @@ pub struct ChunkPayloadData {
 
     pub(crate) tsn: u32,
     pub(crate) stream_identifier: u16,
+    /// SSN used by classic DATA. It remains populated for classic fallback.
     pub(crate) stream_sequence_number: u16,
+    /// RFC 8260 I-DATA uses a 32-bit MID and an FSN for non-initial fragments.
+    pub(crate) message_identifier: u32,
+    pub(crate) fragment_sequence_number: u32,
+    /// Whether this is encoded as RFC 8260 I-DATA rather than classic DATA.
+    pub(crate) interleaved: bool,
     pub(crate) payload_type: PayloadProtocolIdentifier,
     pub(crate) user_data: Bytes,
 
@@ -129,6 +135,9 @@ impl Default for ChunkPayloadData {
             tsn: 0,
             stream_identifier: 0,
             stream_sequence_number: 0,
+            message_identifier: 0,
+            fragment_sequence_number: 0,
+            interleaved: false,
             payload_type: PayloadProtocolIdentifier::default(),
             user_data: Bytes::new(),
             acked: false,
@@ -168,7 +177,11 @@ impl Chunk for ChunkPayloadData {
         }
 
         ChunkHeader {
-            typ: CT_PAYLOAD_DATA,
+            typ: if self.interleaved {
+                CT_I_DATA
+            } else {
+                CT_PAYLOAD_DATA
+            },
             flags,
             value_length: self.value_length() as u16,
         }
@@ -176,8 +189,9 @@ impl Chunk for ChunkPayloadData {
 
     fn unmarshal(raw: &Bytes) -> Result<Self> {
         let header = ChunkHeader::unmarshal(raw)?;
+        let interleaved = header.typ == CT_I_DATA;
 
-        if header.typ != CT_PAYLOAD_DATA {
+        if !interleaved && header.typ != CT_PAYLOAD_DATA {
             return Err(Error::ErrChunkTypeNotPayloadData);
         }
 
@@ -186,18 +200,38 @@ impl Chunk for ChunkPayloadData {
         let beginning_fragment = (header.flags & PAYLOAD_DATA_BEGINING_FRAGMENT_BITMASK) != 0;
         let ending_fragment = (header.flags & PAYLOAD_DATA_ENDING_FRAGMENT_BITMASK) != 0;
 
-        if header.value_length() < PAYLOAD_DATA_HEADER_SIZE {
+        let fixed_header_size = if interleaved {
+            crate::chunk::chunk_i_data::I_DATA_HEADER_SIZE
+        } else {
+            PAYLOAD_DATA_HEADER_SIZE
+        };
+        if header.value_length() < fixed_header_size {
             return Err(Error::ErrChunkPayloadSmall);
         }
 
         let reader = &mut raw.slice(CHUNK_HEADER_SIZE..CHUNK_HEADER_SIZE + header.value_length());
-
         let tsn = reader.get_u32();
         let stream_identifier = reader.get_u16();
-        let stream_sequence_number = reader.get_u16();
-        let payload_type: PayloadProtocolIdentifier = reader.get_u32().into();
+        let sequence_or_reserved = reader.get_u16();
+        let (stream_sequence_number, message_identifier, fragment_sequence_number, payload_type) =
+            if interleaved {
+                let message_identifier = reader.get_u32();
+                let ppid_or_fsn = reader.get_u32();
+                (
+                    message_identifier as u16,
+                    message_identifier,
+                    if beginning_fragment { 0 } else { ppid_or_fsn },
+                    if beginning_fragment {
+                        ppid_or_fsn.into()
+                    } else {
+                        PayloadProtocolIdentifier::default()
+                    },
+                )
+            } else {
+                (sequence_or_reserved, 0, 0, reader.get_u32().into())
+            };
         let user_data = raw.slice(
-            CHUNK_HEADER_SIZE + PAYLOAD_DATA_HEADER_SIZE..CHUNK_HEADER_SIZE + header.value_length(),
+            CHUNK_HEADER_SIZE + fixed_header_size..CHUNK_HEADER_SIZE + header.value_length(),
         );
 
         Ok(ChunkPayloadData {
@@ -208,6 +242,9 @@ impl Chunk for ChunkPayloadData {
             tsn,
             stream_identifier,
             stream_sequence_number,
+            message_identifier,
+            fragment_sequence_number,
+            interleaved,
             payload_type,
             user_data,
 
@@ -228,8 +265,18 @@ impl Chunk for ChunkPayloadData {
 
         writer.put_u32(self.tsn);
         writer.put_u16(self.stream_identifier);
-        writer.put_u16(self.stream_sequence_number);
-        writer.put_u32(self.payload_type as u32);
+        if self.interleaved {
+            writer.put_u16(0);
+            writer.put_u32(self.message_identifier);
+            writer.put_u32(if self.beginning_fragment {
+                self.payload_type as u32
+            } else {
+                self.fragment_sequence_number
+            });
+        } else {
+            writer.put_u16(self.stream_sequence_number);
+            writer.put_u32(self.payload_type as u32);
+        }
         writer.extend_from_slice(&self.user_data);
 
         Ok(writer.len())
@@ -240,7 +287,11 @@ impl Chunk for ChunkPayloadData {
     }
 
     fn value_length(&self) -> usize {
-        PAYLOAD_DATA_HEADER_SIZE + self.user_data.len()
+        if self.interleaved {
+            crate::chunk::chunk_i_data::I_DATA_HEADER_SIZE + self.user_data.len()
+        } else {
+            PAYLOAD_DATA_HEADER_SIZE + self.user_data.len()
+        }
     }
 
     fn as_any(&self) -> &(dyn Any + Send + Sync) {

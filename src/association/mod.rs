@@ -34,7 +34,7 @@ use crate::queue::outbound_queue::OutboundQueue;
 use crate::queue::payload_queue::PayloadQueue;
 use crate::queue::reassembly_queue::ReassemblyQueue;
 use crate::shared::{AssociationEventInner, AssociationId, EndpointEvent, EndpointEventInner};
-use crate::util::{sna16lt, sna32gt, sna32gte, sna32lt, sna32lte};
+use crate::util::{get_padding_size, sna16lt, sna32gt, sna32gte, sna32lt, sna32lte};
 use crate::{AssociationEvent, Payload, Side, Transmit};
 use stream::DataChannelStats;
 use stream::{ReliabilityType, Stream, StreamEvent, StreamId, StreamResetError, StreamState};
@@ -4087,13 +4087,18 @@ impl Association {
             //   single packet.  Furthermore, DATA chunks being retransmitted MAY be
             //   bundled with new DATA chunks, as long as the resulting packet size
             //   does not exceed the path MTU.
-            if bytes_in_packet + c.user_data.len() as u32 > self.mtu {
+            //
+            // Count the whole chunk: its header, user data and the padding to a
+            // 4-byte boundary that Packet::marshal_to adds after it.
+            let len = c.user_data.len();
+            let data_chunk_size = DATA_CHUNK_HEADER_SIZE + (len + get_padding_size(len)) as u32;
+            if !chunks_to_send.is_empty() && bytes_in_packet + data_chunk_size > self.mtu {
                 packets.push(self.create_packet(chunks_to_send));
                 chunks_to_send = vec![];
                 bytes_in_packet = COMMON_HEADER_SIZE;
             }
 
-            bytes_in_packet += DATA_CHUNK_HEADER_SIZE + c.user_data.len() as u32;
+            bytes_in_packet += data_chunk_size;
             chunks_to_send.push(Box::new(c));
         }
 

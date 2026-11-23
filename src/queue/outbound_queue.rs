@@ -31,6 +31,10 @@ impl OutboundQueue {
         self.next_message_id
     }
 
+    pub(crate) fn set_interleaving(&mut self, enabled: bool) {
+        self.pending.set_interleaving(enabled);
+    }
+
     pub(crate) fn push(&mut self, chunks: Vec<ChunkPayloadData>) {
         if chunks.is_empty() {
             return;

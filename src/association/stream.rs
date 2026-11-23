@@ -611,7 +611,11 @@ pub struct StreamState {
     pub(crate) stream_identifier: StreamId,
     pub(crate) default_payload_type: PayloadProtocolIdentifier,
     pub(crate) reassembly_queue: ReassemblyQueue,
+    /// Classic DATA ordered-message counter.
     pub(crate) sequence_number: u16,
+    /// RFC 8260 keeps independent ordered and unordered MID spaces.
+    pub(crate) next_ordered_mid: u32,
+    pub(crate) next_unordered_mid: u32,
     pub(crate) state: RecvSendState,
     pub(crate) unordered: bool,
     pub(crate) reliability_type: ReliabilityType,
@@ -640,6 +644,8 @@ impl StreamState {
             default_payload_type,
             reassembly_queue: ReassemblyQueue::new(stream_identifier, max_receive_message_size),
             sequence_number: 0,
+            next_ordered_mid: 0,
+            next_unordered_mid: 0,
             state: RecvSendState::ReadWritable,
             unordered: false,
             reliability_type: ReliabilityType::Reliable,

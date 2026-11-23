@@ -16,11 +16,20 @@ pub(crate) struct PendingQueue {
     n_bytes: usize,
     selected: bool,
     unordered_is_selected: bool,
+    /// RFC 8260 mode: rotate the selected message's remaining fragments to
+    /// the back of its class queue after every transmitted fragment.
+    interleaving: bool,
+    prefer_unordered: bool,
 }
 
 impl PendingQueue {
     pub(crate) fn new() -> Self {
         PendingQueue::default()
+    }
+
+    pub(crate) fn set_interleaving(&mut self, enabled: bool) {
+        self.interleaving = enabled;
+        self.selected = false;
     }
 
     pub(crate) fn push(&mut self, c: ChunkPayloadData) {
@@ -55,6 +64,20 @@ impl PendingQueue {
     }
 
     pub(crate) fn peek(&self) -> Option<&ChunkPayloadData> {
+        if self.interleaving {
+            return match (self.unordered_queue.front(), self.ordered_queue.front()) {
+                (Some(unordered), Some(ordered)) => {
+                    if self.prefer_unordered {
+                        Some(unordered)
+                    } else {
+                        Some(ordered)
+                    }
+                }
+                (Some(unordered), None) => Some(unordered),
+                (None, Some(ordered)) => Some(ordered),
+                (None, None) => None,
+            };
+        }
         if self.selected {
             if self.unordered_is_selected {
                 return self.unordered_queue.front();
@@ -63,13 +86,7 @@ impl PendingQueue {
             }
         }
 
-        let c = self.unordered_queue.front();
-
-        if c.is_some() {
-            return c;
-        }
-
-        self.ordered_queue.front()
+        self.unordered_queue.front().or(self.ordered_queue.front())
     }
 
     pub(crate) fn pop(
@@ -77,6 +94,28 @@ impl PendingQueue {
         beginning_fragment: bool,
         unordered: bool,
     ) -> Option<ChunkPayloadData> {
+        if self.interleaving {
+            let queue = if unordered {
+                &mut self.unordered_queue
+            } else {
+                &mut self.ordered_queue
+            };
+            let popped = queue.pop_front()?;
+            let message_id = popped.message_id;
+            while queue
+                .front()
+                .is_some_and(|chunk| chunk.message_id == message_id)
+            {
+                if let Some(chunk) = queue.pop_front() {
+                    queue.push_back(chunk);
+                }
+            }
+            self.prefer_unordered = !unordered;
+            self.n_bytes -= popped.user_data.len();
+            self.queue_len -= 1;
+            return Some(popped);
+        }
+
         let popped = if self.selected {
             let popped = if self.unordered_is_selected {
                 self.unordered_queue.pop_front()

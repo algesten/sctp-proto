@@ -1,4 +1,6 @@
 #[cfg(test)]
+mod interleaving_test;
+#[cfg(test)]
 mod queue_test;
 
 pub(crate) mod outbound_queue;

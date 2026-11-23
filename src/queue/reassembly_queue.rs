@@ -38,8 +38,11 @@ pub struct Chunk {
 /// Chunks is a set of chunks that share the same SSN
 #[derive(Default, Debug, Clone)]
 pub struct Chunks {
-    /// used only with the ordered chunks
+    /// Used only with classic ordered DATA chunks.
     pub(crate) ssn: u16,
+    /// Used only with RFC 8260 I-DATA chunks.
+    pub(crate) mid: u32,
+    pub(crate) interleaved: bool,
     pub ppi: PayloadProtocolIdentifier,
     pub chunks: Vec<ChunkPayloadData>,
     offset: usize,
@@ -109,6 +112,24 @@ impl Chunks {
     ) -> Self {
         Chunks {
             ssn,
+            mid: 0,
+            interleaved: false,
+            ppi,
+            chunks,
+            offset: 0,
+            index: 0,
+        }
+    }
+
+    pub(crate) fn new_i_data(
+        mid: u32,
+        ppi: PayloadProtocolIdentifier,
+        chunks: Vec<ChunkPayloadData>,
+    ) -> Self {
+        Chunks {
+            ssn: 0,
+            mid,
+            interleaved: true,
             ppi,
             chunks,
             offset: 0,
@@ -129,6 +150,19 @@ impl Chunks {
         sort_chunks_by_tsn(&mut self.chunks);
 
         // Check if we now have a complete set
+        self.is_complete()
+    }
+
+    pub(crate) fn push_i_data(&mut self, chunk: ChunkPayloadData) -> bool {
+        if self
+            .chunks
+            .iter()
+            .any(|c| c.fragment_sequence_number == chunk.fragment_sequence_number)
+        {
+            return false;
+        }
+        self.chunks.push(chunk);
+        self.chunks.sort_by_key(|c| c.fragment_sequence_number);
         self.is_complete()
     }
 
@@ -155,22 +189,23 @@ impl Chunks {
             return false;
         }
 
-        // 3.
+        // I-DATA fragments are deliberately permitted to have non-consecutive
+        // TSNs; completeness is defined by the FSN sequence instead.
+        if self.interleaved {
+            return self.chunks[0].fragment_sequence_number == 0
+                && self
+                    .chunks
+                    .iter()
+                    .enumerate()
+                    .all(|(index, c)| c.fragment_sequence_number == index as u32);
+        }
+
+        // Classic DATA fragments must have contiguous TSNs.
         let mut last_tsn = 0u32;
         for (i, c) in self.chunks.iter().enumerate() {
-            if i > 0 {
-                // Fragments must have contiguous TSN
-                // From RFC 4960 Section 3.3.1:
-                //   When a user message is fragmented into multiple chunks, the TSNs are
-                //   used by the receiver to reassemble the message.  This means that the
-                //   TSNs for each fragment of a fragmented user message MUST be strictly
-                //   sequential.
-                if c.tsn != last_tsn.wrapping_add(1) {
-                    // mid or end fragment is missing
-                    return false;
-                }
+            if i > 0 && c.tsn != last_tsn.wrapping_add(1) {
+                return false;
             }
-
             last_tsn = c.tsn;
         }
 
@@ -204,6 +239,10 @@ pub(crate) struct ReassemblyQueue {
     pub(crate) ordered: VecDeque<Chunks>,
     pub(crate) unordered: VecDeque<Chunks>,
     pub(crate) unordered_chunks: Vec<ChunkPayloadData>,
+    /// I-DATA uses MID/FSN rather than TSN adjacency for reassembly.
+    pub(crate) next_mid: u32,
+    pub(crate) ordered_i_data: VecDeque<Chunks>,
+    pub(crate) unordered_i_data: VecDeque<Chunks>,
     pub(crate) n_bytes: usize,
     pub(crate) max_message_size: u32,
 }
@@ -221,6 +260,9 @@ impl ReassemblyQueue {
             ordered: VecDeque::new(),
             unordered: VecDeque::new(),
             unordered_chunks: vec![],
+            next_mid: 0,
+            ordered_i_data: VecDeque::new(),
+            unordered_i_data: VecDeque::new(),
             n_bytes: 0,
             max_message_size,
         }
@@ -230,6 +272,9 @@ impl ReassemblyQueue {
         if chunk.stream_identifier != self.si {
             return Ok(false);
         }
+        if chunk.interleaved {
+            return self.push_i_data(chunk);
+        }
 
         if chunk.unordered {
             // Check if adding this chunk would exceed limit for unordered
@@ -238,14 +283,10 @@ impl ReassemblyQueue {
                 return Err(Error::ErrInboundPacketTooLarge);
             }
 
-            // First, insert into unordered_chunks array
-            //atomic.AddUint64(&r.n_bytes, uint64(len(chunk.userData)))
             self.n_bytes += chunk.user_data.len();
             self.unordered_chunks.push(chunk);
             sort_chunks_by_tsn(&mut self.unordered_chunks);
 
-            // Scan unordered_chunks that are contiguous (in TSN)
-            // If found, append the complete set to the unordered array
             if let Some(cset) = self.find_complete_unordered_chunk_set() {
                 self.unordered.push_back(cset);
                 return Ok(true);
@@ -253,37 +294,77 @@ impl ReassemblyQueue {
 
             Ok(false)
         } else {
-            // Check if adding this chunk would exceed limit for ordered
             let projected_size = self.calculate_ordered_message_size(&chunk);
             if projected_size > self.max_message_size as usize {
                 return Err(Error::ErrInboundPacketTooLarge);
             }
-
-            // This is an ordered chunk
             if sna16lt(chunk.stream_sequence_number, self.next_ssn) {
                 return Ok(false);
             }
 
             self.n_bytes += chunk.user_data.len();
-
-            // Check if a chunkSet with the SSN already exists
             for s in &mut self.ordered {
                 if s.ssn == chunk.stream_sequence_number {
                     return Ok(s.push(chunk));
                 }
             }
 
-            // If not found, create a new chunkSet
             let mut cset = Chunks::new(chunk.stream_sequence_number, chunk.payload_type, vec![]);
-            let unordered = chunk.unordered;
             let ok = cset.push(chunk);
             self.ordered.push_back(cset);
-            if !unordered {
-                sort_chunks_by_ssn(self.ordered.make_contiguous());
-            }
-
+            sort_chunks_by_ssn(self.ordered.make_contiguous());
             Ok(ok)
         }
+    }
+
+    fn push_i_data(&mut self, chunk: ChunkPayloadData) -> Result<bool> {
+        let queue = if chunk.unordered {
+            &mut self.unordered_i_data
+        } else {
+            &mut self.ordered_i_data
+        };
+        if !chunk.unordered && sna32lt(chunk.message_identifier, self.next_mid) {
+            return Ok(false);
+        }
+
+        let mid = chunk.message_identifier;
+        let projected = queue
+            .iter()
+            .find(|set| set.mid == mid)
+            .map_or(0, Chunks::len)
+            + chunk.user_data.len();
+        if projected > self.max_message_size as usize {
+            return Err(Error::ErrInboundPacketTooLarge);
+        }
+
+        if let Some(set) = queue.iter_mut().find(|set| set.mid == mid) {
+            let accepted = !set
+                .chunks
+                .iter()
+                .any(|c| c.fragment_sequence_number == chunk.fragment_sequence_number);
+            if accepted {
+                self.n_bytes += chunk.user_data.len();
+            }
+            return Ok(set.push_i_data(chunk));
+        }
+
+        let ppi = chunk.payload_type;
+        let mut set = Chunks::new_i_data(mid, ppi, vec![]);
+        let complete = set.push_i_data(chunk);
+        self.n_bytes += set.len();
+        queue.push_back(set);
+        if !queue.front().is_some_and(|set| set.mid == mid) {
+            let mut sets: Vec<_> = queue.drain(..).collect();
+            sets.sort_by(|a, b| {
+                if sna32lt(a.mid, b.mid) {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            });
+            *queue = sets.into();
+        }
+        Ok(complete)
     }
 
     fn calculate_ordered_message_size(&self, new_chunk: &ChunkPayloadData) -> usize {
@@ -413,45 +494,62 @@ impl ReassemblyQueue {
     }
 
     pub(crate) fn is_readable(&self) -> bool {
-        // Check unordered first
-        if !self.unordered.is_empty() {
-            // The chunk sets in r.unordered should all be complete.
+        if self
+            .unordered_i_data
+            .front()
+            .is_some_and(Chunks::is_complete)
+        {
             return true;
         }
-
-        // Check ordered sets
-        if !self.ordered.is_empty() {
-            let cset = &self.ordered[0];
-            if cset.is_complete() && sna16lte(cset.ssn, self.next_ssn) {
-                return true;
-            }
+        if self
+            .ordered_i_data
+            .front()
+            .is_some_and(|set| set.is_complete() && sna32lte(set.mid, self.next_mid))
+        {
+            return true;
         }
-        false
+        if !self.unordered.is_empty() {
+            return true;
+        }
+        self.ordered
+            .front()
+            .is_some_and(|set| set.is_complete() && sna16lte(set.ssn, self.next_ssn))
     }
 
     pub(crate) fn read(&mut self) -> Option<Chunks> {
-        // Check unordered first
-        let chunks = if !self.unordered.is_empty() {
+        let chunks = if self
+            .unordered_i_data
+            .front()
+            .is_some_and(Chunks::is_complete)
+        {
+            self.unordered_i_data.pop_front()?
+        } else if let Some(set) = self.ordered_i_data.front() {
+            if !set.is_complete() || sna32gt(set.mid, self.next_mid) {
+                return None;
+            }
+            let mid = set.mid;
+            let result = self.ordered_i_data.pop_front()?;
+            if mid == self.next_mid {
+                self.next_mid = self.next_mid.wrapping_add(1);
+            }
+            result
+        } else if !self.unordered.is_empty() {
             self.unordered.pop_front()?
-        } else if !self.ordered.is_empty() {
-            // Now, check ordered
-            let chunks = &self.ordered[0];
-            if !chunks.is_complete() {
+        } else if let Some(set) = self.ordered.front() {
+            if !set.is_complete() || sna16gt(set.ssn, self.next_ssn) {
                 return None;
             }
-            if sna16gt(chunks.ssn, self.next_ssn) {
-                return None;
-            }
-            if chunks.ssn == self.next_ssn {
+            let ssn = set.ssn;
+            let result = self.ordered.pop_front()?;
+            if ssn == self.next_ssn {
                 self.next_ssn = self.next_ssn.wrapping_add(1);
             }
-            self.ordered.pop_front()?
+            result
         } else {
             return None;
         };
 
         self.subtract_num_bytes(chunks.len());
-
         Some(chunks)
     }
 

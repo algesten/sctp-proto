@@ -7,6 +7,33 @@ use std::time::Instant;
 /// pendingBaseQueue
 pub(crate) type PendingBaseQueue = VecDeque<ChunkPayloadData>;
 
+/// State used by classic DATA scheduling, which keeps one fragmented message
+/// selected until its final fragment is transmitted.
+#[derive(Debug, Default)]
+struct ClassicScheduler {
+    selected: bool,
+    unordered_is_selected: bool,
+}
+
+/// State used by RFC 8260 scheduling, which rotates a message's unsent tail
+/// after every fragment to permit other messages to make progress.
+#[derive(Debug, Default)]
+struct InterleavingScheduler {
+    prefer_unordered: bool,
+}
+
+#[derive(Debug)]
+enum Scheduler {
+    Classic(ClassicScheduler),
+    Interleaving(InterleavingScheduler),
+}
+
+impl Default for Scheduler {
+    fn default() -> Self {
+        Self::Classic(ClassicScheduler::default())
+    }
+}
+
 /// pendingQueue
 #[derive(Debug, Default)]
 pub(crate) struct PendingQueue {
@@ -14,12 +41,7 @@ pub(crate) struct PendingQueue {
     ordered_queue: PendingBaseQueue,
     queue_len: usize,
     n_bytes: usize,
-    selected: bool,
-    unordered_is_selected: bool,
-    /// RFC 8260 mode: rotate the selected message's remaining fragments to
-    /// the back of its class queue after every transmitted fragment.
-    interleaving: bool,
-    prefer_unordered: bool,
+    scheduler: Scheduler,
 }
 
 impl PendingQueue {
@@ -28,8 +50,11 @@ impl PendingQueue {
     }
 
     pub(crate) fn set_interleaving(&mut self, enabled: bool) {
-        self.interleaving = enabled;
-        self.selected = false;
+        self.scheduler = if enabled {
+            Scheduler::Interleaving(InterleavingScheduler::default())
+        } else {
+            Scheduler::Classic(ClassicScheduler::default())
+        };
     }
 
     pub(crate) fn push(&mut self, c: ChunkPayloadData) {
@@ -64,29 +89,25 @@ impl PendingQueue {
     }
 
     pub(crate) fn peek(&self) -> Option<&ChunkPayloadData> {
-        if self.interleaving {
-            return match (self.unordered_queue.front(), self.ordered_queue.front()) {
-                (Some(unordered), Some(ordered)) => {
-                    if self.prefer_unordered {
-                        Some(unordered)
-                    } else {
-                        Some(ordered)
-                    }
+        match &self.scheduler {
+            Scheduler::Classic(state) if state.selected => {
+                if state.unordered_is_selected {
+                    self.unordered_queue.front()
+                } else {
+                    self.ordered_queue.front()
                 }
-                (Some(unordered), None) => Some(unordered),
-                (None, Some(ordered)) => Some(ordered),
-                (None, None) => None,
-            };
-        }
-        if self.selected {
-            if self.unordered_is_selected {
-                return self.unordered_queue.front();
-            } else {
-                return self.ordered_queue.front();
+            }
+            Scheduler::Classic(_) => self.unordered_queue.front().or(self.ordered_queue.front()),
+            Scheduler::Interleaving(state) => {
+                match (self.unordered_queue.front(), self.ordered_queue.front()) {
+                    (Some(unordered), Some(_)) if state.prefer_unordered => Some(unordered),
+                    (Some(_), Some(ordered)) => Some(ordered),
+                    (Some(unordered), None) => Some(unordered),
+                    (None, Some(ordered)) => Some(ordered),
+                    (None, None) => None,
+                }
             }
         }
-
-        self.unordered_queue.front().or(self.ordered_queue.front())
     }
 
     pub(crate) fn pop(
@@ -94,7 +115,7 @@ impl PendingQueue {
         beginning_fragment: bool,
         unordered: bool,
     ) -> Option<ChunkPayloadData> {
-        if self.interleaving {
+        if matches!(self.scheduler, Scheduler::Interleaving(_)) {
             let queue = if unordered {
                 &mut self.unordered_queue
             } else {
@@ -110,21 +131,26 @@ impl PendingQueue {
                     queue.push_back(chunk);
                 }
             }
-            self.prefer_unordered = !unordered;
+            if let Scheduler::Interleaving(state) = &mut self.scheduler {
+                state.prefer_unordered = !unordered;
+            }
             self.n_bytes -= popped.user_data.len();
             self.queue_len -= 1;
             return Some(popped);
         }
 
-        let popped = if self.selected {
-            let popped = if self.unordered_is_selected {
+        let Scheduler::Classic(state) = &mut self.scheduler else {
+            unreachable!("interleaving scheduler returned above");
+        };
+        let popped = if state.selected {
+            let popped = if state.unordered_is_selected {
                 self.unordered_queue.pop_front()
             } else {
                 self.ordered_queue.pop_front()
             };
             if let Some(p) = &popped {
                 if p.ending_fragment {
-                    self.selected = false;
+                    state.selected = false;
                 }
             }
             popped
@@ -133,20 +159,20 @@ impl PendingQueue {
                 return None;
             }
             if unordered {
-                let popped = { self.unordered_queue.pop_front() };
+                let popped = self.unordered_queue.pop_front();
                 if let Some(p) = &popped {
                     if !p.ending_fragment {
-                        self.selected = true;
-                        self.unordered_is_selected = true;
+                        state.selected = true;
+                        state.unordered_is_selected = true;
                     }
                 }
                 popped
             } else {
-                let popped = { self.ordered_queue.pop_front() };
+                let popped = self.ordered_queue.pop_front();
                 if let Some(p) = &popped {
                     if !p.ending_fragment {
-                        self.selected = true;
-                        self.unordered_is_selected = false;
+                        state.selected = true;
+                        state.unordered_is_selected = false;
                     }
                 }
                 popped
@@ -181,8 +207,12 @@ impl PendingQueue {
         message_id: u64,
         mut on_remove: impl FnMut(ChunkPayloadData),
     ) -> usize {
-        if self.selected && self.peek().is_some_and(|c| c.message_id == message_id) {
-            self.selected = false;
+        let selected_message = self.peek().map(|chunk| chunk.message_id);
+        if let Scheduler::Classic(state) = &mut self.scheduler
+            && state.selected
+            && selected_message == Some(message_id)
+        {
+            state.selected = false;
         }
         let mut removed_bytes = 0;
         let mut removed_chunks = 0;

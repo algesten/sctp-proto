@@ -2,6 +2,7 @@
 
   * Pass the current time to `Endpoint::connect` (breaking) #83
   * Add `set_fill` to supply the random source #84
+  * Count DATA chunk headers and padding so bundled packets stay within the MTU #85
 
 # 0.10.9
 
